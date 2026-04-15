@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.5.0
+# VERSION: 1.5.2
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing critic_review, critic_followup and health_check tools
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import subprocess
 
 from mcp.server.fastmcp import FastMCP
 
@@ -262,6 +264,75 @@ async def reload_config_tool() -> str:
 
 
 # END_BLOCK_TOOL_RELOAD_CONFIG
+
+
+# START_BLOCK_TOOL_SELF_UPDATE
+@server.tool()
+async def self_update() -> str:
+    """Update the server from GitHub (git pull + pip install) and restart.
+
+    Pulls the latest code from the remote repository, reinstalls the package,
+    then restarts the MCP server. The MCP client will auto-restart the process.
+    Use this when a new version is pushed to GitHub and you want to update.
+    """
+    logger.info("[Server][self_update][TOOL_CALL] Starting self-update")
+
+    lines: list[str] = ["🔄 Self-update started..."]
+    repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    # Step 1: git pull
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull",
+            cwd=repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        git_out = stdout.decode().strip()
+        git_err = stderr.decode().strip()
+
+        if proc.returncode != 0:
+            return f"❌ git pull failed (code {proc.returncode}):\n{git_err or git_out}"
+
+        if "Already up to date" in git_out:
+            return f"✅ Already up to date. No changes to pull.\n{git_out}"
+
+        lines.append(f"📦 git pull:\n{git_out}")
+    except asyncio.TimeoutError:
+        return "❌ git pull timed out (60s)"
+    except Exception as exc:
+        return f"❌ git pull error: {exc}"
+
+    # Step 2: pip install -e .
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pip", "install", "-e", ".",
+            cwd=repo_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        pip_out = stdout.decode().strip()
+        pip_err = stderr.decode().strip()
+
+        if proc.returncode != 0:
+            return f"❌ pip install failed (code {proc.returncode}):\n{pip_err or pip_out}"
+
+        lines.append(f"📥 pip install: OK")
+    except asyncio.TimeoutError:
+        return "❌ pip install timed out (120s)"
+    except Exception as exc:
+        return f"❌ pip install error: {exc}"
+
+    # Step 3: restart (MCP client will auto-restart the process)
+    lines.append("🔄 Restarting server with new code...")
+    logger.info("[Server][self_update][EXIT] Update complete, restarting")
+    await close_client()
+    os._exit(0)
+
+
+# END_BLOCK_TOOL_SELF_UPDATE
 
 
 # START_BLOCK_TOOL_RESTART_SERVER

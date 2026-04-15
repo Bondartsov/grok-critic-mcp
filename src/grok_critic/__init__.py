@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/__init__.py
-# VERSION: 1.4.0
+# VERSION: 1.5.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Package public API exports
 #   SCOPE: Re-export main functions and classes for external use
@@ -24,6 +24,7 @@ from grok_critic.server import (
     critic_review,
     main,
     security_audit,
+    self_update,
     server,
 )
 
@@ -46,6 +47,7 @@ __all__ = [
     "load_config",
     "main",
     "security_audit",
+    "self_update",
     "server",
     "structured_review",
 ]

@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.5.0
+# VERSION: 1.5.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks

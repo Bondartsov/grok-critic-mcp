@@ -20,6 +20,7 @@ from grok_critic.server import (
     critic_review,
     reload_config_tool,
     restart_server,
+    self_update,
     server,
 )
 
@@ -34,6 +35,8 @@ class TestToolRegistration:
         assert "critic_followup" in tool_names
         assert "reload_config_tool" in tool_names
         assert "restart_server" in tool_names
+        assert "self_update" in tool_names
+        assert len(tools) == 8
 
     def test_critic_review_tool_has_params(self) -> None:
         tools = server._tool_manager.list_tools()
@@ -308,3 +311,56 @@ class TestRestartServerTool:
 
 
 # END_BLOCK_RESTART_SERVER_TOOL
+
+
+# START_BLOCK_SELF_UPDATE_TOOL
+class TestSelfUpdateTool:
+    async def test_already_up_to_date(self) -> None:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"Already up to date.", b""))
+        mock_proc.returncode = 0
+
+        with patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await self_update()
+            assert "Already up to date" in result
+
+    async def test_git_pull_fails(self) -> None:
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", b"fatal: not a git repository"))
+        mock_proc.returncode = 128
+
+        with patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await self_update()
+            assert "❌ git pull failed" in result
+            assert "128" in result
+
+    async def test_full_update_flow(self) -> None:
+        git_proc = AsyncMock()
+        git_proc.communicate = AsyncMock(return_value=(
+            b"Updating abdc10d..de15bb0\nFast-forward\n src/server.py | 5 +++--\n 1 file changed",
+            b"",
+        ))
+        git_proc.returncode = 0
+
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(
+            b"Successfully installed grok-critic-mcp-1.5.2",
+            b"",
+        ))
+        pip_proc.returncode = 0
+
+        call_count = 0
+
+        async def mock_subprocess(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return git_proc if call_count == 1 else pip_proc
+
+        with patch("grok_critic.server.asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("grok_critic.server.close_client", new_callable=AsyncMock), \
+             patch("grok_critic.server.os._exit") as mock_exit:
+            await self_update()
+            mock_exit.assert_called_once_with(0)
+
+
+# END_BLOCK_SELF_UPDATE_TOOL
