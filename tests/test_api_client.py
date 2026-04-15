@@ -228,7 +228,8 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "API key invalid" in result.error
+            assert "Auth error" in result.error
+            assert "Unauthorized" in result.error
 
     async def test_429_error(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(429, text="Too Many Requests")
@@ -249,6 +250,58 @@ class TestResponsesClientCall:
             result = await client.call("test")
             assert not result.success
             assert "Server error" in result.error
+
+    async def test_402_insufficient_funds(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(
+            402,
+            json={"error": {"code": "INSUFFICIENT_FUNDS", "message": "Недостаточно средств на балансе"}},
+        )
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "Payment required" in result.error
+            assert "Недостаточно средств" in result.error
+
+    async def test_502_provider_down(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(
+            502,
+            json={"error": {"code": "PROVIDER_ERROR", "message": "xAI provider unavailable"}},
+        )
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "Provider down" in result.error
+            assert "xAI provider unavailable" in result.error
+
+    async def test_503_no_providers(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(503, text="Service Unavailable")
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "No providers" in result.error
+
+    async def test_error_body_parsed(self, client: ResponsesClient) -> None:
+        """Polza.AI returns structured error: {"error": {"code": "...", "message": "..."}}"""
+        mock_response = httpx.Response(
+            429,
+            json={"error": {"code": "RATE_LIMIT", "message": "Too many requests for grok-4.20-multi-agent"}},
+        )
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "Too many requests for grok-4.20-multi-agent" in result.error
 
     async def test_timeout(self, client: ResponsesClient) -> None:
         with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:

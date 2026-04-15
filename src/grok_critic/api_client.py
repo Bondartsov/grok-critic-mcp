@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.5.0
+# VERSION: 1.5.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
@@ -251,31 +251,62 @@ class ResponsesClient:
         # END_BLOCK_SEND_WITH_RETRY
 
         # START_BLOCK_ERROR_HANDLING
+        # Polza.AI returns: {"error": {"code": "...", "message": "..."}}
+        api_error_msg = ""
+        try:
+            err_body = resp.json()
+            api_error_msg = err_body.get("error", {}).get("message", "")
+        except (json.JSONDecodeError, AttributeError):
+            api_error_msg = resp.text[:200] if resp.text else ""
+
         if resp.status_code == 401:
-            logger.error("[APIClient][call][ERROR] 401 — API key invalid")
+            msg = api_error_msg or "API key invalid"
+            logger.error("[APIClient][call][ERROR] 401 — %s", msg)
             return CritiqueResult(
                 text="", model=self._model, agent_count=agent_count,
-                effort=effort, review_id=review_id, error="API key invalid",
+                effort=effort, review_id=review_id, error=f"Auth error: {msg}",
+            )
+        if resp.status_code == 402:
+            msg = api_error_msg or "Insufficient funds"
+            logger.error("[APIClient][call][ERROR] 402 — %s", msg)
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id, error=f"Payment required: {msg}",
             )
         if resp.status_code == 429:
-            logger.error("[APIClient][call][ERROR] 429 — Rate limited (all retries exhausted)")
+            msg = api_error_msg or "Rate limit exceeded"
+            logger.error("[APIClient][call][ERROR] 429 — %s (all retries exhausted)", msg)
             return CritiqueResult(
                 text="", model=self._model, agent_count=agent_count,
-                effort=effort, review_id=review_id, error="Rate limited",
+                effort=effort, review_id=review_id, error=f"Rate limited: {msg}",
+            )
+        if resp.status_code == 502:
+            msg = api_error_msg or "Provider unavailable"
+            logger.error("[APIClient][call][ERROR] 502 — %s", msg)
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id, error=f"Provider down: {msg}",
+            )
+        if resp.status_code == 503:
+            msg = api_error_msg or "No providers available"
+            logger.error("[APIClient][call][ERROR] 503 — %s", msg)
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id, error=f"No providers: {msg}",
             )
         if resp.status_code >= 500:
-            logger.error("[APIClient][call][ERROR] %d — Server error", resp.status_code)
+            msg = api_error_msg or f"HTTP {resp.status_code}"
+            logger.error("[APIClient][call][ERROR] %d — %s", resp.status_code, msg)
             return CritiqueResult(
                 text="", model=self._model, agent_count=agent_count,
-                effort=effort, review_id=review_id,
-                error=f"Server error ({resp.status_code})",
+                effort=effort, review_id=review_id, error=f"Server error: {msg}",
             )
         if resp.status_code >= 400:
-            logger.error("[APIClient][call][ERROR] %d — %s", resp.status_code, resp.text[:200])
+            msg = api_error_msg or f"HTTP {resp.status_code}"
+            logger.error("[APIClient][call][ERROR] %d — %s", resp.status_code, msg)
             return CritiqueResult(
                 text="", model=self._model, agent_count=agent_count,
-                effort=effort, review_id=review_id,
-                error=f"HTTP {resp.status_code}",
+                effort=effort, review_id=review_id, error=f"Client error: {msg}",
             )
         # END_BLOCK_ERROR_HANDLING
 
