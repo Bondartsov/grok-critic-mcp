@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.6.1
+# VERSION: 1.7.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
@@ -339,6 +339,13 @@ class ResponsesClient:
         text = _extract_text(payload)
         input_tokens, output_tokens, total_tokens, cost_rub, cached_tokens, reasoning_tokens = _extract_usage(payload)
         cost_usd = _calculate_cost(input_tokens, output_tokens)
+
+        # Debug: log full usage payload to understand what Polza.AI actually returns
+        usage_raw = payload.get("usage", {})
+        logger.debug(
+            "[APIClient][call][USAGE_RAW] usage=%s",
+            {k: v for k, v in usage_raw.items()},
+        )
 
         logger.info(
             "[APIClient][call][CALL] Response received, text_len=%d tokens=%d cost_usd=%.6f cost_rub=%s cached=%d reasoning=%d",

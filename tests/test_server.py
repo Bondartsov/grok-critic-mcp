@@ -132,7 +132,7 @@ class TestCriticReviewTool:
             result = await critic_review(content="code")
             assert "Metadata" in result
             assert "agents=16" in result
-            assert "input=1\u2009240" in result
+            assert "input=1 240" in result
             assert "output=870" in result
             assert "rev_test1234" in result
             assert "$0.0124" in result
@@ -315,12 +315,18 @@ class TestRestartServerTool:
 
 # START_BLOCK_SELF_UPDATE_TOOL
 class TestSelfUpdateTool:
+    async def test_disabled_by_default(self) -> None:
+        result = await self_update()
+        assert "disabled" in result
+
     async def test_already_up_to_date(self) -> None:
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(return_value=(b"Already up to date.", b""))
         mock_proc.returncode = 0
 
-        with patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("grok_critic.server.config") as mock_cfg, \
+             patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
+            mock_cfg.allow_self_update = True
             result = await self_update()
             assert "Already up to date" in result
 
@@ -329,7 +335,9 @@ class TestSelfUpdateTool:
         mock_proc.communicate = AsyncMock(return_value=(b"", b"fatal: not a git repository"))
         mock_proc.returncode = 128
 
-        with patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
+        with patch("grok_critic.server.config") as mock_cfg, \
+             patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
+            mock_cfg.allow_self_update = True
             result = await self_update()
             assert "❌ git pull failed" in result
             assert "128" in result
@@ -356,9 +364,11 @@ class TestSelfUpdateTool:
             call_count += 1
             return git_proc if call_count == 1 else pip_proc
 
-        with patch("grok_critic.server.asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+        with patch("grok_critic.server.config") as mock_cfg, \
+             patch("grok_critic.server.asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
              patch("grok_critic.server.close_client", new_callable=AsyncMock), \
              patch("grok_critic.server.os._exit") as mock_exit:
+            mock_cfg.allow_self_update = True
             await self_update()
             mock_exit.assert_called_once_with(0)
 

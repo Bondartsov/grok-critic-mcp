@@ -38,6 +38,7 @@ class AppConfig(BaseSettings):
     log_file: str = Field(default="")  # пустой = stderr (MCP stdio не занимается)
     price_input_per_1m: float = Field(default=0.0)
     price_output_per_1m: float = Field(default=0.0)
+    allow_self_update: bool = Field(default=False)
 
     @field_validator("log_level")
     @classmethod

@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.6.1
+# VERSION: 1.7.0
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing critic_review, critic_followup and health_check tools
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import subprocess
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -31,14 +32,8 @@ logger = logging.getLogger("grok-critic.server")
 
 # START_BLOCK_FORMAT_METADATA
 def _fmt(n: int) -> str:
-    """Format number with thin-space thousands separator: 123456 → '123 456'."""
-    s = str(abs(n))
-    groups: list[str] = []
-    while s:
-        groups.insert(0, s[-3:])
-        s = s[:-3]
-    result = "\u2009".join(groups)  # thin space U+2009
-    return f"-{result}" if n < 0 else result
+    """Format number with space thousands separator: 123456 → '123 456'."""
+    return f"{n:,}".replace(",", " ")
 
 
 def _format_metadata(result) -> str:
@@ -75,6 +70,26 @@ def _format_result(result) -> str:
 # END_BLOCK_FORMAT_METADATA
 
 
+# START_BLOCK_READ_FILE
+def _read_file_content(file_path: str) -> tuple[str, str | None]:
+    """Read file content for review. Returns (content, error_message)."""
+    try:
+        path = Path(file_path).resolve()
+        if not path.exists():
+            return "", f"File not found: {path}"
+        if not path.is_file():
+            return "", f"Not a file: {path}"
+        content = path.read_text(encoding="utf-8", errors="replace")
+        if not content.strip():
+            return "", f"File is empty: {path}"
+        return content, None
+    except Exception as exc:
+        return "", f"Cannot read file: {exc}"
+
+
+# END_BLOCK_READ_FILE
+
+
 # START_BLOCK_SERVER_INIT
 server = FastMCP("grok-critic")
 
@@ -89,6 +104,7 @@ async def critic_review(
     context: str | None = None,
     agent_count: int | None = None,
     focus_areas: str | None = None,
+    file_path: str | None = None,
 ) -> str:
     """Perform a critical code review using grok-4.20-multi-agent.
 
@@ -97,7 +113,16 @@ async def critic_review(
         context: Optional context about the code (project, language, purpose).
         agent_count: Number of reasoning agents (4=low, 16=high effort). Defaults to config value.
         focus_areas: Comma-separated focus areas (e.g. 'security,performance').
+        file_path: Optional path to a file to review (server reads it, overrides content).
     """
+    if file_path:
+        file_content, err = _read_file_content(file_path)
+        if err:
+            return f"❌ {err}"
+        content = file_content
+        if context is None:
+            context = f"File: {file_path}"
+
     logger.info(
         "[Server][critic_review][TOOL_CALL] content_len=%d agent_count=%s",
         len(content),
@@ -181,6 +206,7 @@ async def architecture_review(
     content: str,
     context: str | None = None,
     agent_count: int | None = None,
+    file_path: str | None = None,
 ) -> str:
     """Specialized architecture review: patterns, dependencies, scalability, risks.
 
@@ -188,7 +214,16 @@ async def architecture_review(
         content: Architecture description, diagram, or code to review.
         context: Optional project context (tech stack, constraints, team size).
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
+        file_path: Optional path to a file to review (server reads it, overrides content).
     """
+    if file_path:
+        file_content, err = _read_file_content(file_path)
+        if err:
+            return f"❌ {err}"
+        content = file_content
+        if context is None:
+            context = f"File: {file_path}"
+
     logger.info(
         "[Server][architecture_review][TOOL_CALL] content_len=%d agent_count=%s",
         len(content),
@@ -213,6 +248,7 @@ async def security_audit(
     content: str,
     context: str | None = None,
     agent_count: int | None = None,
+    file_path: str | None = None,
 ) -> str:
     """Specialized security audit: injection, auth, secrets, infrastructure.
 
@@ -220,7 +256,16 @@ async def security_audit(
         content: Code or configuration to audit for security vulnerabilities.
         context: Optional context (framework, deployment, threat model).
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
+        file_path: Optional path to a file to audit (server reads it, overrides content).
     """
+    if file_path:
+        file_content, err = _read_file_content(file_path)
+        if err:
+            return f"❌ {err}"
+        content = file_content
+        if context is None:
+            context = f"File: {file_path}"
+
     logger.info(
         "[Server][security_audit][TOOL_CALL] content_len=%d agent_count=%s",
         len(content),
@@ -282,6 +327,9 @@ async def self_update() -> str:
     Use this when a new version is pushed to GitHub and you want to update.
     """
     logger.info("[Server][self_update][TOOL_CALL] Starting self-update")
+
+    if not config.allow_self_update:
+        return "❌ self_update is disabled. Set POLZA_ALLOW_SELF_UPDATE=true in .env and reload_config."
 
     lines: list[str] = ["🔄 Self-update started..."]
     repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
