@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.1.0
+# VERSION: 1.4.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging

@@ -1,22 +1,24 @@
-<TechnologyStack VERSION="0.2.0">
+<TechnologyStack VERSION="1.4.0">
   <Runtime>Python 3.11+</Runtime>
   <Language>Python 3.11+</Language>
-  <Framework>FastMCP (mcp Python SDK) 1.x</Framework>
+  <Framework>FastMCP (mcp Python SDK) 1.6+</Framework>
 
   <Dependencies>
-    <dep name="mcp" version=">=1.0.0" purpose="FastMCP framework for MCP server implementation" />
-    <dep name="httpx" version=">=0.27.0" purpose="Async HTTP client for Responses API calls" />
+    <dep name="mcp" version=">=1.6.0" purpose="FastMCP framework for MCP server implementation" />
+    <dep name="httpx" version=">=0.27.0" purpose="Async HTTP client for Responses API calls with persistent AsyncClient" />
     <dep name="python-dotenv" version=">=1.0.0" purpose="Load .env file for API key configuration" />
-    <dep name="pydantic" version=">=2.0.0" purpose="Input validation and settings management" />
+    <dep name="pydantic" version=">=2.0.0" purpose="Input validation and data models" />
+    <dep name="pydantic-settings" version=">=2.0.0" purpose="Settings management with env var loading and validation" />
   </Dependencies>
 
   <VersionConstraints>
-    <constraint lib="mcp" min="1.0.0" max="1.x" reason="FastMCP API changed significantly between 0.x and 1.x" />
+    <constraint lib="mcp" min="1.6.0" max="1.x" reason="FastMCP API changed significantly between 0.x and 1.x; 1.6+ required for current tool decorator features" />
     <constraint lib="python" min="3.11" reason="Uses match/case and modern type hints" />
+    <constraint lib="pydantic-settings" min="2.0.0" reason="Required for AppConfig with env_prefix POLZA_" />
   </VersionConstraints>
 
   <Tooling>
-    <tool name="package-manager" value="uv" version="0.x" />
+    <tool name="package-manager" value="pip" version="pip" note="pip install -e . for editable install" />
     <tool name="linter" value="ruff" version="0.x" />
     <tool name="formatter" value="ruff format" version="0.x" />
     <tool name="test-runner" value="pytest" version="8.x" />
@@ -25,18 +27,18 @@
 
   <Testing>
     <module-level>
-      <command>pytest tests/test_config.py tests/test_critic.py -v</command>
-      <focus>Fast deterministic unit checks with mocked API responses</focus>
+      <command>pytest tests/test_config.py tests/test_critic.py tests/test_api_client.py tests/test_server.py -v</command>
+      <focus>Fast deterministic unit checks with mocked API responses (85 tests total)</focus>
     </module-level>
     <wave-level>
       <command>pytest tests/ -v --timeout=30</command>
-      <focus>Integration checks with real-like API interaction patterns</focus>
+      <focus>Integration checks with realistic mock data</focus>
     </wave-level>
     <phase-level>
       <command>pytest tests/ -v --timeout=60</command>
-      <focus>Full test suite including edge cases and error handling</focus>
+      <focus>Full test suite including edge cases, retry logic, content limits, and error handling</focus>
     </phase-level>
-    <mocking-policy>Use httpx mock transports for API tests. Never call real API in tests.</mocking-policy>
+    <mocking-policy>Use httpx mock transports for API tests. Never call real API in tests. Mock CritiqueResult for server tests.</mocking-policy>
   </Testing>
 
   <Observability>
@@ -47,6 +49,6 @@
   </Observability>
 
   <DeliveryShape>
-    <shape>Single Python package installed via uv/pip. Runs as MCP stdio server invoked by Kilo Code. No HTTP server, no Docker, no database.</shape>
+    <shape>Single Python package installed via pip install -e . Runs as MCP stdio server invoked by Kilo Code. No HTTP server, no Docker, no database. Deployed on VM (10.61.11.54:/opt/grok-critic-mcp/repo) via systemd service.</shape>
   </DeliveryShape>
 </TechnologyStack>

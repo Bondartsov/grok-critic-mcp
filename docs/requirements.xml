@@ -1,13 +1,13 @@
-<RequirementsAnalysis VERSION="0.2.0">
+<RequirementsAnalysis VERSION="1.4.0">
   <Project>
     <name>grok-critic-mcp</name>
-    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет tool critic_review для критического ревью кода, архитектуры и решений.</annotation>
-    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, Responses API</keywords>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 7 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server. Используется как субагент "Критик" в Kilo Code.</annotation>
+    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP</keywords>
   </Project>
 
   <Actors>
-    <actor-KiloAgent>Агент Kilo Code (orchestrator, code, architect), вызывающий tool critic_review через MCP протокол.</actor-KiloAgent>
-    <actor-PolzaAI>Полza.AI API endpoint, проксирующий xAI Responses API для grok-4.20-multi-agent.</actor-PolzaAI>
+    <actor-KiloAgent>Агент Kilo Code (orchestrator, code, architect), вызывающий MCP tools через MCP протокол.</actor-KiloAgent>
+    <actor-PolzaAI>Polza.AI API endpoint, проксирующий xAI Responses API для grok-4.20-multi-agent.</actor-PolzaAI>
     <actor-GrokMultiAgent>Внутренние субагенты grok-4.20-multi-agent (4 или 16 агентов), выполняющие анализ.</actor-GrokMultiAgent>
   </Actors>
 
@@ -18,7 +18,7 @@
       <Goal>Получить критический анализ с конкретными замечаниями и рекомендациями</Goal>
       <Preconditions>MCP сервер запущен и зарегистрирован в kilo.json. API ключ Polza.AI доступен.</Preconditions>
       <AcceptanceCriteria>
-        1. MCP tool доступен в Kilo Code через Task tool
+        1. MCP tool доступен в Kilo Code
         2. Запрос корректно транслируется в Responses API формат
         3. Ответ содержит структурированный анализ: критические проблемы, рекомендации, замечания, похвальное
         4. Ошибки API обрабатываются gracefully с информативными сообщениями
@@ -34,47 +34,108 @@
       <Preconditions>MCP сервер запущен</Preconditions>
       <AcceptanceCriteria>
         1. Параметр agent_count поддерживается (4 или 16)
-        2. reasoning.effort автоматически устанавливается в соответствии с agent_count
-        3. Ответ для 16 агентов существенно глубже, чем для 4
+        2. reasoning.effort автоматически устанавливается (low/high)
+        3. Динамический timeout: 4 агента → 90s, 16 агентов → из конфига (default 300s)
       </AcceptanceCriteria>
       <Priority>medium</Priority>
       <RelatedFlows>DF-001</RelatedFlows>
-    </UC-003>
+    </UC-002>
 
     <UC-003>
       <Actor>KiloAgent</Actor>
-      <Action>Вызывает MCP tool для проверки connectivity и конфигурации</Action>
-      <Goal>Убедиться что сервер работает и API ключ валиден</Goal>
+      <Action>Вызывает MCP tool check_health для проверки connectivity и конфигурации</Action>
+      <Goal>Убедиться что сервер работает, конфиг валиден, API ключ задан</Goal>
       <Preconditions>MCP сервер запущен</Preconditions>
-      <AcceptanceCriteria>Tool health_check возвращает статус и информацию о конфигурации</AcceptanceCriteria>
+      <AcceptanceCriteria>Tool check_health возвращает статус, конфигурацию и расчёт стоимости за 1M токенов</AcceptanceCriteria>
       <Priority>medium</Priority>
     </UC-003>
+
+    <UC-004>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool architecture_review с описанием/диаграммой архитектуры</Action>
+      <Goal>Получить специализированный анализ архитектуры: паттерны, зависимости, масштабируемость, риски</Goal>
+      <Preconditions>MCP сервер запущен</Preconditions>
+      <AcceptanceCriteria>
+        1. Используется специализированный архитектурный system prompt
+        2. Ответ покрывает: паттерны проектирования, связи между компонентами, масштабируемость, риски
+      </AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-001</RelatedFlows>
+    </UC-004>
+
+    <UC-005>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool security_audit с кодом/конфигурацией для аудита безопасности</Action>
+      <Goal>Получить специализированный анализ безопасности: injection, auth, secrets, infrastructure</Goal>
+      <Preconditions>MCP сервер запущен</Preconditions>
+      <AcceptanceCriteria>
+        1. Используется специализированный security system prompt
+        2. Ответ классифицирует находки по severity: 🔴 Critical, 🟡 High, 🟠 Medium, 🔵 Low
+        3. Каждая находка содержит: описание, локация, рекомендация по исправлению
+      </AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-001</RelatedFlows>
+    </UC-005>
+
+    <UC-006>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool critic_followup для уточняющего вопроса по предыдущему ревью</Action>
+      <Goal>Уточнить или оспорить замечания критика в рамках multi-turn диалога</Goal>
+      <Preconditions>Выполнен предыдущий review (есть previous_review текст)</Preconditions>
+      <AcceptanceCriteria>
+        1. Followup включает полный текст предыдущего ревью как контекст
+        2. Ответ строится на основе предыдущего анализа
+      </AcceptanceCriteria>
+      <Priority>medium</Priority>
+    </UC-006>
+
+    <UC-007>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool reload_config для hot-reload конфигурации без рестарта</Action>
+      <Goal>Обновить env vars (API key, цены, timeout) без перезапуска сервера</Goal>
+      <Preconditions>MCP сервер запущен, .env файл обновлён</Preconditions>
+      <AcceptanceCriteria>Новые значения подхватываются без перезапуска процесса</AcceptanceCriteria>
+      <Priority>low</Priority>
+    </UC-007>
+
+    <UC-008>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool restart_server для полного перезапуска</Action>
+      <Goal>Перезапустить MCP сервер (MCP клиент автоматически поднимет новый процесс)</Goal>
+      <Preconditions>MCP сервер запущен</Preconditions>
+      <AcceptanceCriteria>Сервер завершает процесс через os._exit(0), MCP клиент auto-restart</AcceptanceCriteria>
+      <Priority>low</Priority>
+    </UC-008>
   </UseCases>
 
   <NonGoals>
     <item-1>Не поддерживает streaming — только полный ответ.</item-1>
-    <item-2>Не поддерживает multi-turn conversation с grok — каждый вызов независим.</item-1>
-    <item-3>Не реализует client-side tools / function calling — grok multi-agent не поддерживает.</item-3>
-    <item-4>Не кэширует результаты — каждый вызов идёт к API.</item-4>
+    <item-2>Не реализует client-side tools / function calling — grok multi-agent не поддерживает.</item-2>
+    <item-3>Не кэширует результаты — каждый вызов идёт к API.</item-3>
+    <item-4>Не хранит историю диалогов — followup требует явной передачи previous_review.</item-4>
   </NonGoals>
 
   <Constraints>
     <constraint-1>grok-4.20-multi-agent НЕ поддерживает Chat Completions API — только Responses API (/v1/responses).</constraint-1>
     <constraint-2>API ключ Polza.AI хранится в env variable POLZA_API_KEY или в .env файле.</constraint-2>
-    <constraint-3>Ответ может занимать до 2 минут (особенно для 16 агентов) — нужен адекватный timeout.</constraint-3>
-    <constraint-4>Стоимость: 16 агентов потребляют значительно больше токенов, чем 4.</constraint-4>
-    <constraint-5>MCP сервер запускается через npx/uvx как local MCP server в kilo.json.</constraint-5>
+    <constraint-3>Ответ может занимать до 5 минут (16 агентов) — нужен адекватный timeout.</constraint-3>
+    <constraint-4>Стоимость: $2.6/$6.6 за 1M токенов (input/output). 16 агентов потребляют значительно больше токенов.</constraint-4>
+    <constraint-5>MCP сервер запускается через pip install -e . как local MCP server в kilo.json.</constraint-5>
+    <constraint-6>Контент ограничен 100 000 символов (MAX_CONTENT_CHARS) — защита от cost DoS.</constraint-6>
+    <constraint-7>Retry: 429 и 5xx повторяются до 2 раз с exponential backoff.</constraint-7>
   </Constraints>
 
   <Risks>
-    <risk-1>Polza.AI может не проксировать Responses API корректно — нужен fallback на прямой xAI API.</risk-1>
-    <risk-2>Timeout: grok-4.20-multi-agent может работать дольше стандартного MCP timeout (30s).</risk-2>
-    <risk-3>Формат ответа Responses API отличается от Chat Completions — нужна правильная парсинг-логика.</risk-3>
-    <risk-4>Rate limiting: Polza.AI может иметь ограничения на частоту запросов.</risk-4>
+    <risk-1>Polza.AI может не проксировать Responses API корректно — mitigated: подтверждено что работает.</risk-1>
+    <risk-2>Timeout: grok-4.20-multi-agent работает медленно — mitigated: динамический timeout 90s/300s.</risk-2>
+    <risk-3>Формат ответа Responses API отличается от Chat Completions — mitigated: парсинг output_text.</risk-3>
+    <risk-4>Rate limiting: Polza.AI может иметь ограничения — mitigated: retry с backoff.</risk-4>
+    <risk-5>Стоимость: 16 агентов → до 100k+ токенов за запрос — mitigated: MAX_CONTENT_CHARS, цена в metadata.</risk-5>
   </Risks>
 
   <OpenQuestions>
-    <question-1>Поддерживает ли Polza.AI endpoint /v1/responses? Если нет — нужен прямой xAI API ключ.</question-1>
-    <question-2>Какой максимальный timeout поддерживает MCP протокол в Kilo Code?</question-2>
+    <!-- All previously open questions have been resolved -->
+    <resolution-1>Polza.AI поддерживает /v1/responses — подтверждено.</resolution-1>
+    <resolution-2>MCP timeout управляется через httpx.Timeout per-request, не MCP протокол.</resolution-2>
   </OpenQuestions>
 </RequirementsAnalysis>

@@ -1,35 +1,71 @@
-<VerificationPlan VERSION="0.2.0">
+<VerificationPlan VERSION="1.4.0">
   <GlobalPolicy>
     <log-format>[Module][function][BLOCK_NAME] message</log-format>
     <deterministic-first>true</deterministic-first>
-    <module-level-focus>Fast deterministic checks with mocked HTTP responses</module-level-focus>
+    <module-level-focus>Fast deterministic checks with mocked HTTP responses (85 tests total)</module-level-focus>
     <wave-level-focus>Integration between modules with realistic mock data</wave-level-focus>
-    <phase-level-focus>Full pipeline from MCP tool call to response</phase-level-focus>
+    <phase-level-focus>Full pipeline from MCP tool call to response, including edge cases</phase-level-focus>
     <redaction>Never log API keys or full request/response payloads.</redaction>
   </GlobalPolicy>
 
   <CriticalFlows>
     <VF-001 NAME="CriticReviewHappyPath" USE_CASES="UC-001" DATA_FLOW="DF-001" PRIORITY="high">
       <scenario>Kilo Agent вызывает critic_review с кодом для ревью</scenario>
-      <expected-outcome>Структурированный ответ с критическими проблемами, рекомендациями, замечаниями</expected-outcome>
+      <expected-outcome>Структурированный ответ с критическими проблемами, рекомендациями, замечаниями + metadata footer</expected-outcome>
       <required-signals>
         <log-marker>[Critic][structured_review][BLOCK_BUILD_PROMPT]</log-marker>
-        <log-marker>[APIClient][call][BLOCK_SEND_REQUEST]</log-marker>
+        <log-marker>[APIClient][call][BLOCK_SEND_WITH_RETRY]</log-marker>
       </required-signals>
     </VF-001>
 
     <VF-002 NAME="APIErrorHandling" USE_CASES="UC-001" DATA_FLOW="DF-001" PRIORITY="high">
       <scenario>Polza.AI возвращает ошибку (401, 429, 500, timeout)</scenario>
-      <expected-outcome>Информативное сообщение об ошибке, не краш сервера</expected-outcome>
+      <expected-outcome>Retry на 429/5xx (до 2 раз с backoff), информативное сообщение об ошибке, не краш сервера</expected-outcome>
       <required-signals>
-        <log-marker>[APIClient][handle_api_error][BLOCK_HANDLE_ERROR]</log-marker>
+        <log-marker>[APIClient][call][BLOCK_SEND_WITH_RETRY]</log-marker>
       </required-signals>
     </VF-002>
 
     <VF-003 NAME="HealthCheck" USE_CASES="UC-003" PRIORITY="medium">
-      <scenario>Kilo Agent вызывает health_check tool</scenario>
-      <expected-outcome>Возвращается статус конфигурации и (опционально) connectivity</expected-outcome>
+      <scenario>Kilo Agent вызывает check_health tool</scenario>
+      <expected-outcome>Возвращается статус конфигурации и расчёт стоимости за 1M токенов</expected-outcome>
     </VF-003>
+
+    <VF-004 NAME="ArchitectureReview" USE_CASES="UC-004" DATA_FLOW="DF-001" PRIORITY="high">
+      <scenario>Kilo Agent вызывает architecture_review с описанием архитектуры</scenario>
+      <expected-outcome>Специализированный архитектурный анализ: паттерны, зависимости, масштабируемость, риски</expected-outcome>
+      <required-signals>
+        <log-marker>[Critic][do_architecture_review][BLOCK_BUILD_PROMPT]</log-marker>
+      </required-signals>
+    </VF-004>
+
+    <VF-005 NAME="SecurityAudit" USE_CASES="UC-005" DATA_FLOW="DF-001" PRIORITY="high">
+      <scenario>Kilo Agent вызывает security_audit с кодом для аудита</scenario>
+      <expected-outcome>Специализированный анализ безопасности с severity classification (🔴🟡🟠🔵)</expected-outcome>
+      <required-signals>
+        <log-marker>[Critic][do_security_audit][BLOCK_BUILD_PROMPT]</log-marker>
+      </required-signals>
+    </VF-005>
+
+    <VF-006 NAME="FollowupDialog" USE_CASES="UC-006" PRIORITY="medium">
+      <scenario>Kilo Agent вызывает critic_followup с вопросом по предыдущему ревью</scenario>
+      <expected-outcome>Ответ строится на основе previous_review контекста</expected-outcome>
+    </VF-006>
+
+    <VF-007 NAME="ContentSizeLimit" PRIORITY="high">
+      <scenario>Контент превышает MAX_CONTENT_CHARS (100000)</scenario>
+      <expected-outcome>Контент truncation до лимита, предупреждение в логе</expected-outcome>
+    </VF-007>
+
+    <VF-008 NAME="ReloadConfig" USE_CASES="UC-007" PRIORITY="medium">
+      <scenario>Kilo Agent вызывает reload_config после изменения .env</scenario>
+      <expected-outcome>Конфиг перезагружается без перезапуска процесса</expected-outcome>
+    </VF-008>
+
+    <VF-009 NAME="RestartServer" USE_CASES="UC-008" PRIORITY="low">
+      <scenario>Kilo Agent вызывает restart_server</scenario>
+      <expected-outcome>Процесс завершается через os._exit(0), MCP клиент auto-restart</expected-outcome>
+    </VF-009>
   </CriticalFlows>
 
   <ModuleVerification>
@@ -43,7 +79,9 @@
       <scenarios>
         <scenario-1 kind="success">Config loads from env vars with valid API key</scenario-1>
         <scenario-2 kind="failure">Missing API key raises clear error</scenario-2>
-        <scenario-3 kind="success">Default values applied correctly (agent_count=4, timeout=120)</scenario-3>
+        <scenario-3 kind="success">Default values applied correctly (agent_count=16, timeout=300, log_level=INFO)</scenario-3>
+        <scenario-4 kind="success">reload_config picks up new .env values</scenario-4>
+        <scenario-5 kind="success">Price fields loaded from POLZA_PRICE_INPUT_PER_1M / POLZA_PRICE_OUTPUT_PER_1M</scenario-5>
       </scenarios>
     </V-M-CONFIG>
 
@@ -55,11 +93,18 @@
         <check-1>pytest tests/test_api_client.py -v</check-1>
       </module-checks>
       <scenarios>
-        <scenario-1 kind="success">Correct Responses API request format for agent_count=4</scenario-1>
-        <scenario-2 kind="success">Correct Responses API request format for agent_count=16</scenario-2>
+        <scenario-1 kind="success">Correct Responses API request format for agent_count=4 (effort=low)</scenario-1>
+        <scenario-2 kind="success">Correct Responses API request format for agent_count=16 (effort=high)</scenario-2>
         <scenario-3 kind="failure">API returns 401 → AUTH_FAILED error</scenario-3>
         <scenario-4 kind="failure">API timeout → TIMEOUT error</scenario-4>
         <scenario-5 kind="success">Response parsing extracts output_text correctly</scenario-5>
+        <scenario-6 kind="success">Retry on 429 with exponential backoff</scenario-7>
+        <scenario-7 kind="success">Retry on 5xx (up to 2 retries)</scenario-7>
+        <scenario-8 kind="success">Dynamic timeout: 4 agents → 90s, 16 agents → config timeout</scenario-8>
+        <scenario-9 kind="success">MAX_CONTENT_CHARS truncation applied</scenario-9>
+        <scenario-10 kind="success">Cost calculation: tokens × price_per_1m</scenario-10>
+        <scenario-11 kind="success">CritiqueResult dataclass fields populated correctly</scenario-11>
+        <scenario-12 kind="success">Persistent AsyncClient via get_client()</scenario-12>
       </scenarios>
     </V-M-API>
 
@@ -73,7 +118,12 @@
       <scenarios>
         <scenario-1 kind="success">structured_review returns formatted review text</scenario-1>
         <scenario-2 kind="success">Prompt includes focus areas when specified</scenario-2>
-        <scenario-3 kind="success">System prompt is comprehensive and structured</scenario-3>
+        <scenario-3 kind="success">System prompts (3 types) are comprehensive and in Russian</scenario-3>
+        <scenario-4 kind="success">_perform_review DRY function works for all 3 review types</scenario-4>
+        <scenario-5 kind="success">do_architecture_review uses ARCHITECTURE_SYSTEM_PROMPT</scenario-5>
+        <scenario-6 kind="success">do_security_audit uses SECURITY_SYSTEM_PROMPT</scenario-6>
+        <scenario-7 kind="success">followup includes previous_review context</scenario-7>
+        <scenario-8 kind="success">health_check returns config and pricing info</scenario-8>
       </scenarios>
     </V-M-CRITIC>
 
@@ -85,8 +135,16 @@
         <check-1>pytest tests/test_server.py -v</check-1>
       </module-checks>
       <scenarios>
-        <scenario-1 kind="success">critic_review tool is registered with correct schema</scenario-1>
-        <scenario-2 kind="success">health_check tool returns config status</scenario-2>
+        <scenario-1 kind="success">critic_review tool registered with correct schema</scenario-1>
+        <scenario-2 kind="success">architecture_review tool registered with correct schema</scenario-2>
+        <scenario-3 kind="success">security_audit tool registered with correct schema</scenario-3>
+        <scenario-4 kind="success">critic_followup tool registered with correct schema</scenario-4>
+        <scenario-5 kind="success">check_health tool returns config status</scenario-5>
+        <scenario-6 kind="success">reload_config_tool triggers config reload</scenario-6>
+        <scenario-7 kind="success">restart_server calls os._exit(0)</scenario-7>
+        <scenario-8 kind="success">_format_result adds metadata footer (model, agents, tokens, cost, review_id)</scenario-8>
+        <scenario-9 kind="success">_format_result handles errors gracefully</scenario-9>
+        <scenario-10 kind="success">Total 7 tools registered</scenario-10>
       </scenarios>
     </V-M-SERVER>
   </ModuleVerification>
@@ -106,20 +164,54 @@
     <Gate-Phase-2 PHASE="Phase-2">
       <goal>Critic logic correctly builds prompts and handles mock responses</goal>
       <commands>
-        <command-1>pytest tests/ -v</command-1>
+        <command-1>pytest tests/test_critic.py -v</command-1>
       </commands>
     </Gate-Phase-2>
 
     <Gate-Phase-3 PHASE="Phase-3">
-      <goal>MCP server runs and tools are accessible from Kilo Code</goal>
+      <goal>MCP server runs with 7 tools accessible</goal>
+      <commands>
+        <command-1>pytest tests/test_server.py -v</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>MCP server starts without errors</evidence-1>
+        <evidence-2>7 tools registered and callable</evidence-2>
+      </required-evidence>
+    </Gate-Phase-3>
+
+    <Gate-Phase-4 PHASE="Phase-4">
+      <goal>Specialized reviews and DRY refactoring validated</goal>
       <commands>
         <command-1>pytest tests/ -v</command-1>
       </commands>
       <required-evidence>
-        <evidence-1>MCP server starts without errors</evidence-1>
-        <evidence-2>Tools visible in Kilo Code MCP list</evidence-2>
+        <evidence-1>_perform_review DRY logic works for all review types</evidence-1>
+        <evidence-2>_format_result DRY formatting consistent</evidence-2>
       </required-evidence>
-    </Gate-Phase-3>
+    </Gate-Phase-4>
+
+    <Gate-Phase-5 PHASE="Phase-5">
+      <goal>Operations tools and safety limits working</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>Content size limit enforced</evidence-1>
+        <evidence-2>Reload and restart tools functional</evidence-2>
+      </required-evidence>
+    </Gate-Phase-5>
+
+    <Gate-Phase-6 PHASE="Phase-6">
+      <goal>Full deployment and documentation complete</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>85/85 tests pass on both Windows and VM</evidence-1>
+        <evidence-2>GitHub repo up to date</evidence-2>
+        <evidence-3>GRACE artifacts synced with code</evidence-3>
+      </required-evidence>
+    </Gate-Phase-6>
   </PhaseGates>
 
   <FailurePackets>

@@ -1,59 +1,78 @@
 <KnowledgeGraph>
-  <Project NAME="grok-critic-mcp" VERSION="0.2.0">
-    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, Responses API</keywords>
-    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. Tool critic_review для критического ревью кода.</annotation>
+  <Project NAME="grok-critic-mcp" VERSION="1.4.0">
+    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP</keywords>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 7 MCP tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server. Используется как субагент "Критик" в Kilo Code.</annotation>
 
-    <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="planned">
-      <purpose>Загрузка и валидация конфигурации: API ключ, base URL, timeout, default agent_count</purpose>
+    <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="complete">
+      <purpose>Загрузка и валидация конфигурации через pydantic-settings: API ключ, base URL, timeout, agent_count, цены, логирование. Hot reload без рестарта.</purpose>
       <path>src/grok_critic/config.py</path>
       <depends>none</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
       <annotations>
+        <type-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_, fields: api_key, base_url, model, default_agent_count, timeout_seconds, log_level, price_input_per_1m, price_output_per_1m" />
         <fn-load_config PURPOSE="Load config from env vars and .env file" />
-        <type-AppConfig PURPOSE="Pydantic model for configuration with validation" />
-        <export-config PURPOSE="Singleton config instance" />
+        <fn-reload_config PURPOSE="Hot reload config from .env without process restart" />
+        <fn-setup_logging PURPOSE="Configure Python logging with level from env" />
+        <export-config PURPOSE="Module-level config singleton" />
       </annotations>
     </M-CONFIG>
 
-    <M-API NAME="APIClient" TYPE="INTEGRATION" STATUS="planned">
-      <purpose>HTTP клиент для Polza.AI Responses API. Формирует и отправляет запросы к grok-4.20-multi-agent.</purpose>
+    <M-API NAME="APIClient" TYPE="INTEGRATION" STATUS="complete">
+      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff, динамический timeout, расчёт стоимости, защита от cost DoS.</purpose>
       <path>src/grok_critic/api_client.py</path>
       <depends>M-CONFIG</depends>
       <verification-ref>V-M-API</verification-ref>
       <annotations>
-        <fn-call_responses_api PURPOSE="Send request to /v1/responses endpoint with proper format" />
-        <fn-parse_response PURPOSE="Extract text output from Responses API response" />
-        <fn-handle_api_error PURPOSE="Map API errors to user-friendly messages" />
+        <type-CritiqueResult PURPOSE="Dataclass: text, model, usage (input/output tokens), cost, effort, agent_count, review_id" />
+        <type-ResponsesClient PURPOSE="Async HTTP client wrapper with persistent httpx.AsyncClient" />
+        <fn-call PURPOSE="Send request to /v1/responses with retry logic (max 2 retries on 429/5xx)" />
+        <fn-get_client PURPOSE="Singleton factory for persistent AsyncClient" />
+        <fn-close_client PURPOSE="Gracefully close persistent AsyncClient" />
+        <const-MAX_CONTENT_CHARS PURPOSE="100000 — DoS protection, truncates content beyond limit" />
+        <const-AGENT_COUNT_TO_EFFORT PURPOSE="Mapping: {4: 'low', 16: 'high'}" />
       </annotations>
-      <CrossLink from="M-API" to="M-CONFIG" relation="reads-api-key-and-base-url" />
+      <CrossLink from="M-API" to="M-CONFIG" relation="reads-api-key-base-url-and-timeout" />
     </M-API>
 
-    <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" STATUS="planned">
-      <purpose>Промпт-инжиниринг и логика критического ревью. Формирует system prompt и структурирует ответ.</purpose>
+    <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" STATUS="complete">
+      <purpose>Промпт-инжиниринг и оркестрация ревью. 3 специализированных system prompt (general, architecture, security). DRY через _perform_review().</purpose>
       <path>src/grok_critic/critic.py</path>
       <depends>M-API, M-CONFIG</depends>
       <verification-ref>V-M-CRITIC</verification-ref>
       <annotations>
-        <fn-build_critique_prompt PURPOSE="Build structured prompt for code/architecture review" />
-        <fn-structured_review PURPOSE="Run full review pipeline: prompt → API → parse → return" />
-        <fn-health_check PURPOSE="Verify API connectivity and configuration" />
+        <const-CRITIC_SYSTEM_PROMPT PURPOSE="System prompt для общего code review (русский)" />
+        <const-ARCHITECTURE_SYSTEM_PROMPT PURPOSE="System prompt для архитектурного review" />
+        <const-SECURITY_SYSTEM_PROMPT PURPOSE="System prompt для security audit с severity classification" />
+        <fn-_build_user_prompt PURPOSE="Build structured user prompt from content, context, focus_areas" />
+        <fn-_perform_review PURPOSE="DRY: shared logic for structured_review, do_architecture_review, do_security_audit" />
+        <fn-structured_review PURPOSE="Full code review pipeline: prompt → API → parse → return" />
+        <fn-do_architecture_review PURPOSE="Architecture-specific review pipeline" />
+        <fn-do_security_audit PURPOSE="Security-specific audit pipeline" />
+        <fn-followup PURPOSE="Multi-turn followup question on previous review" />
+        <fn-health_check PURPOSE="Verify API connectivity and return config/pricing status" />
       </annotations>
       <CrossLink from="M-CRITIC" to="M-API" relation="calls-responses-api" />
-      <CrossLink from="M-CRITIC" to="M-CONFIG" relation="reads-defaults" />
+      <CrossLink from="M-CRITIC" to="M-CONFIG" relation="reads-defaults-and-pricing" />
     </M-CRITIC>
 
-    <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" STATUS="planned">
-      <purpose>MCP сервер на FastMCP. Регистрирует tools и запускает stdio transport.</purpose>
+    <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" STATUS="complete">
+      <purpose>FastMCP MCP сервер. 7 зарегистрированных tools. Unified error handling и metadata footer через _format_result().</purpose>
       <path>src/grok_critic/server.py</path>
       <depends>M-CRITIC, M-CONFIG</depends>
       <verification-ref>V-M-SERVER</verification-ref>
       <annotations>
-        <tool-critic_review PURPOSE="MCP tool for critical code/architecture review" />
-        <tool-health_check PURPOSE="MCP tool for connectivity verification" />
-        <fn-main PURPOSE="Entry point: create server and run stdio" />
+        <tool-critic_review PURPOSE="General critical code review (content, context, agent_count, focus_areas)" />
+        <tool-architecture_review PURPOSE="Specialized architecture review (content, context, agent_count)" />
+        <tool-security_audit PURPOSE="Specialized security audit with severity classification (content, context, agent_count)" />
+        <tool-critic_followup PURPOSE="Multi-turn followup question (previous_review, question, agent_count)" />
+        <tool-check_health PURPOSE="Server health: config status, pricing info" />
+        <tool-reload_config_tool PURPOSE="Hot reload .env without process restart" />
+        <tool-restart_server PURPOSE="Full process exit via os._exit(0), MCP client auto-restarts" />
+        <fn-_format_result PURPOSE="DRY: unified formatting for success (with metadata footer) and error results" />
+        <fn-main PURPOSE="Entry point: create FastMCP server and run stdio" />
       </annotations>
       <CrossLink from="M-SERVER" to="M-CRITIC" relation="delegates-review-logic" />
-      <CrossLink from="M-SERVER" to="M-CONFIG" relation="reads-config" />
+      <CrossLink from="M-SERVER" to="M-CONFIG" relation="reads-config-for-reload" />
     </M-SERVER>
 
   </Project>

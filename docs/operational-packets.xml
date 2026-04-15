@@ -1,4 +1,4 @@
-<OperationalPackets VERSION="0.1.0">
+<OperationalPackets VERSION="1.4.0">
   <ExecutionPacketTemplate>
     <ExecutionPacket>
       <module-id>M-EXAMPLE</module-id>
@@ -15,7 +15,9 @@ Planned module contract excerpt goes here.
 Knowledge graph entry excerpt goes here.
       ]]></graph-entry-excerpt>
       <dependency-contract-summaries>
-        <dependency-1 module="M-CONFIG">Pydantic Settings model with API key, base URL, timeout, agent_count.</dependency-1>
+        <dependency-1 module="M-CONFIG">Pydantic Settings model with env_prefix=POLZA_, fields: api_key, base_url, model, default_agent_count, timeout_seconds, log_level, price_input_per_1m, price_output_per_1m.</dependency-1>
+        <dependency-2 module="M-API">ResponsesClient with persistent AsyncClient, retry logic, dynamic timeout, MAX_CONTENT_CHARS, CritiqueResult dataclass.</dependency-2>
+        <dependency-3 module="M-CRITIC">_perform_review DRY function, 3 system prompts, structured_review, do_architecture_review, do_security_audit, followup, health_check.</dependency-3>
       </dependency-contract-summaries>
       <verification-excerpt><![CDATA[
 Verification-plan excerpt goes here.
@@ -46,7 +48,8 @@ Verification-plan excerpt goes here.
       <exports-removed />
       <annotations-added>
         <annotation-1>&lt;fn-example_function PURPOSE="Example" /&gt;</annotation-1>
-      </annotations-removed />
+      </annotations-added>
+      <annotations-removed />
       <cross-links-added>
         <CrossLink from="M-EXAMPLE" to="M-CONFIG" relation="reads-config" />
       </cross-links-added>

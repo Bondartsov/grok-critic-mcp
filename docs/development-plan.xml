@@ -1,17 +1,18 @@
-<DevelopmentPlan VERSION="0.2.0">
+<DevelopmentPlan VERSION="1.4.0">
   <ArchitectureNotes>
-    <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI.</objective>
+    <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 7 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart.</objective>
     <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>
-    <risk-1>Polza.AI может не поддерживать /v1/responses — нужен fallback к прямому xAI API.</risk-1>
-    <risk-2>Timeout — grok multi-agent работает медленно (до 2 мин для 16 агентов).</risk-2>
+    <resolved-risk-1>Polza.AI поддерживает /v1/responses — подтверждено.</resolved-risk-1>
+    <risk-2>Timeout — grok multi-agent работает медленно (до 5 мин для 16 агентов). Mitigated: динамический timeout 90s/300s.</risk-2>
+    <risk-3>Стоимость — mitigated: MAX_CONTENT_CHARS=100000, цена в metadata footer каждого ответа.</risk-3>
   </ArchitectureNotes>
 
   <Modules>
-    <M-CONFIG NAME="Config" TYPE="UTILITY" LAYER="0" ORDER="1" STATUS="planned">
+    <M-CONFIG NAME="Config" TYPE="UTILITY" LAYER="0" ORDER="1" STATUS="complete">
       <contract>
-        <purpose>Загрузка и валидация конфигурации окружения</purpose>
+        <purpose>Загрузка и валидация конфигурации окружения через pydantic-settings</purpose>
         <inputs>
-          <param name="env_vars" type="dict" />
+          <param name="env_vars" type="dict" note="All prefixed with POLZA_" />
           <param name="dotenv_path" type="Optional[str]" />
         </inputs>
         <outputs>
@@ -22,8 +23,10 @@
         </errors>
       </contract>
       <interface>
-        <export-AppConfig PURPOSE="Pydantic settings model" />
+        <export-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_" />
         <export-load_config PURPOSE="Load and validate config singleton" />
+        <export-reload_config PURPOSE="Hot reload from .env without restart" />
+        <export-setup_logging PURPOSE="Configure Python logging" />
         <export-config PURPOSE="Module-level config instance" />
       </interface>
       <depends>none</depends>
@@ -38,26 +41,31 @@
       <verification-ref>V-M-CONFIG</verification-ref>
     </M-CONFIG>
 
-    <M-API NAME="APIClient" TYPE="INTEGRATION" LAYER="1" ORDER="1" STATUS="planned">
+    <M-API NAME="APIClient" TYPE="INTEGRATION" LAYER="1" ORDER="1" STATUS="complete">
       <contract>
-        <purpose>HTTP клиент для Polza.AI /v1/responses endpoint</purpose>
+        <purpose>HTTP клиент для Polza.AI /v1/responses endpoint с retry и persistent connection</purpose>
         <inputs>
           <param name="prompt" type="str" />
           <param name="agent_count" type="int" />
-          <param name="system_prompt" type="Optional[str]" />
+          <param name="system_prompt" type="str" />
         </inputs>
         <outputs>
-          <param name="response_text" type="str" />
+          <param name="result" type="CritiqueResult" note="text, model, usage, cost, effort, agent_count, review_id" />
         </outputs>
         <errors>
           <error code="API_ERROR" />
           <error code="TIMEOUT" />
           <error code="AUTH_FAILED" />
+          <error code="CONTENT_TOO_LARGE" note="truncated at MAX_CONTENT_CHARS=100000" />
         </errors>
       </contract>
       <interface>
-        <export-ResponsesClient PURPOSE="Async HTTP client for Responses API" />
-        <export-ResponsesClient.call PURPOSE="Send request and return parsed text" />
+        <export-CritiqueResult PURPOSE="Dataclass for structured API response" />
+        <export-ResponsesClient PURPOSE="Async HTTP client wrapper" />
+        <export-ResponsesClient.call PURPOSE="Send request with retry (max 2 on 429/5xx) and dynamic timeout" />
+        <export-get_client PURPOSE="Singleton factory for persistent AsyncClient" />
+        <export-close_client PURPOSE="Graceful shutdown of persistent AsyncClient" />
+        <export-MAX_CONTENT_CHARS PURPOSE="100000 — content size limit" />
       </interface>
       <depends>M-CONFIG</depends>
       <target>
@@ -66,31 +74,38 @@
       </target>
       <observability>
         <log-prefix>[APIClient]</log-prefix>
-        <critical-block>BLOCK_SEND_REQUEST</critical-block>
+        <critical-block>BLOCK_SEND_WITH_RETRY</critical-block>
       </observability>
       <verification-ref>V-M-API</verification-ref>
     </M-API>
 
-    <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" LAYER="2" ORDER="1" STATUS="planned">
+    <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" LAYER="2" ORDER="1" STATUS="complete">
       <contract>
-        <purpose>Формирование промптов и оркестрация критического ревью</purpose>
+        <purpose>Промпт-инжиниринг и оркестрация критического ревью, архитектурного анализа и security аудита</purpose>
         <inputs>
           <param name="content" type="str" />
           <param name="context" type="Optional[str]" />
           <param name="agent_count" type="int" />
-          <param name="focus_areas" type="Optional[list[str]]" />
+          <param name="focus_areas" type="Optional[str]" />
+          <param name="previous_review" type="Optional[str]" note="for followup" />
+          <param name="question" type="Optional[str]" note="for followup" />
         </inputs>
         <outputs>
-          <param name="review" type="str" />
+          <param name="result" type="CritiqueResult" />
         </outputs>
         <errors>
           <error code="REVIEW_FAILED" />
         </errors>
       </contract>
       <interface>
-        <export-structured_review PURPOSE="Full review pipeline" />
-        <export-health_check PURPOSE="Verify API connectivity" />
-        <export-CRITIC_SYSTEM_PROMPT PURPOSE="Default system prompt for critic agent" />
+        <export-structured_review PURPOSE="Full code review pipeline" />
+        <export-do_architecture_review PURPOSE="Architecture-specific review" />
+        <export-do_security_audit PURPOSE="Security-specific audit with severity classification" />
+        <export-followup PURPOSE="Multi-turn followup on previous review" />
+        <export-health_check PURPOSE="Verify API connectivity and config" />
+        <export-CRITIC_SYSTEM_PROMPT PURPOSE="General review system prompt (Russian)" />
+        <export-ARCHITECTURE_SYSTEM_PROMPT PURPOSE="Architecture review system prompt (Russian)" />
+        <export-SECURITY_SYSTEM_PROMPT PURPOSE="Security audit system prompt (Russian)" />
       </interface>
       <depends>M-API, M-CONFIG</depends>
       <target>
@@ -104,14 +119,14 @@
       <verification-ref>V-M-CRITIC</verification-ref>
     </M-CRITIC>
 
-    <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" LAYER="3" ORDER="1" STATUS="planned">
+    <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" LAYER="3" ORDER="1" STATUS="complete">
       <contract>
-        <purpose>MCP сервер: регистрация tools и запуск stdio transport</purpose>
+        <purpose>MCP сервер: 7 tools (critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server), unified formatting</purpose>
         <inputs>
           <param name="stdio" type="MCP transport" />
         </inputs>
         <outputs>
-          <param name="MCP tools" type="critic_review, health_check" />
+          <param name="MCP tools" type="critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server" />
         </outputs>
         <errors>
           <error code="SERVER_START_FAILED" />
@@ -128,7 +143,9 @@
       </target>
       <observability>
         <log-prefix>[Server]</log-prefix>
-        <critical-block>BLOCK_REGISTER_TOOLS</critical-block>
+        <critical-block>BLOCK_HANDLE_CRITIC_REVIEW</critical-block>
+        <critical-block>BLOCK_HANDLE_ARCH_REVIEW</critical-block>
+        <critical-block>BLOCK_HANDLE_SEC_AUDIT</critical-block>
       </observability>
       <verification-ref>V-M-SERVER</verification-ref>
     </M-SERVER>
@@ -137,35 +154,62 @@
   <DataFlow>
     <DF-001 NAME="CriticReviewFlow" TRIGGER="KiloAgent вызывает MCP tool critic_review">
       <step-1>MCP Server получает tool call с параметрами (content, context, agent_count, focus_areas)</step-1>
-      <step-2>CriticLogic.build_critique_prompt формирует структурированный промпт</step-1>
-      <step-3>CriticLogic вызывает APIClient.call(prompt, agent_count, system_prompt)</step-2>
-      <step-4>APIClient формирует Responses API request: model, input, reasoning.effort</step-3>
-      <step-5>APIClient отправляет POST /v1/responses к Polza.AI</step-4>
-      <step-6>APIClient парсит ответ, извлекает output_text</step-5>
-      <step-7>CriticLogic возвращает структурированный результат</step-6>
-      <step-8>MCP Server возвращает результат через MCP протокол</step-7>
-      <evidence>Log markers: [Server][handle_tool][BLOCK_REGISTER_TOOLS] → [Critic][structured_review][BLOCK_BUILD_PROMPT] → [APIClient][call][BLOCK_SEND_REQUEST]</evidence>
+      <step-2>CriticLogic._build_user_prompt формирует структурированный промпт</step-2>
+      <step-3>CriticLogic._perform_review оркестрирует: prompt → API → parse</step-3>
+      <step-4>CriticLogic вызывает APIClient.call(prompt, agent_count, system_prompt)</step-4>
+      <step-5>APIClient формирует Responses API request: model, input, reasoning.effort</step-5>
+      <step-6>APIClient отправляет POST /v1/responses к Polza.AI (с retry на 429/5xx)</step-6>
+      <step-7>APIClient парсит ответ, извлекает output_text, считает cost</step-7>
+      <step-8>CriticLogic возвращает CritiqueResult</step-8>
+      <step-9>MCP Server._format_result добавляет metadata footer и возвращает через MCP протокол</step-9>
+      <evidence>Log markers: [Server][handle_*][BLOCK_HANDLE_*] → [Critic][*_review][BLOCK_BUILD_PROMPT] → [APIClient][call][BLOCK_SEND_WITH_RETRY]</evidence>
     </DF-001>
   </DataFlow>
 
   <ImplementationOrder>
-    <Phase-1 name="Foundation" status="pending">
+    <Phase-1 name="Foundation" status="complete">
       <goal>Базовые модули: конфигурация и API клиент</goal>
-      <step-1 module="M-CONFIG" status="pending" verification="V-M-CONFIG">Реализовать конфигурацию с Pydantic Settings</step-1>
-      <step-2 module="M-API" status="pending" verification="V-M-API">Реализовать Responses API клиент с httpx</step-2>
+      <step-1 module="M-CONFIG" status="complete" verification="V-M-CONFIG">Реализовать конфигурацию с Pydantic Settings (env_prefix POLZA_)</step-1>
+      <step-2 module="M-API" status="complete" verification="V-M-API">Реализовать Responses API клиент с httpx (persistent client, retry, dynamic timeout)</step-2>
     </Phase-1>
 
-    <Phase-2 name="Business Logic" status="pending">
+    <Phase-2 name="Business Logic" status="complete">
       <goal>Логика критического ревью и промпт-инжиниринг</goal>
-      <step-1 module="M-CRITIC" status="pending" verification="V-M-CRITIC">Реализовать логику критика и промпты</step-1>
+      <step-1 module="M-CRITIC" status="complete" verification="V-M-CRITIC">Реализовать логику критика: 3 system prompt, structured_review, health_check</step-1>
     </Phase-2>
 
-    <Phase-3 name="Integration" status="pending">
+    <Phase-3 name="Integration" status="complete">
       <goal>MCP сервер, интеграция в Kilo Code</goal>
-      <step-1 module="M-SERVER" status="pending" verification="V-M-SERVER">Реализовать MCP сервер с FastMCP</step-1>
-      <step-2 module="M-SERVER" status="pending">Зарегистрировать в kilo.json как MCP сервер</step-2>
-      <step-3 module="M-SERVER" status="pending">Создать агента critic.md</step-3>
+      <step-1 module="M-SERVER" status="complete" verification="V-M-SERVER">Реализовать MCP сервер с FastMCP (7 tools)</step-1>
+      <step-2 module="M-SERVER" status="complete">Зарегистрировать в kilo.json как MCP сервер</step-2>
+      <step-3 module="M-SERVER" status="complete">Создать Kilo Code skill (SKILL.md) вместо агента</step-3>
     </Phase-3>
+
+    <Phase-4 name="DRY and Specialization" status="complete">
+      <goal>Рефакторинг DRY и специализированные типы ревью</goal>
+      <step-1 module="M-CRITIC" status="complete">Добавить _perform_review() DRY функцию для общей логики 3 типов ревью</step-1>
+      <step-2 module="M-CRITIC" status="complete">Реализовать do_architecture_review() с специализированным system prompt</step-2>
+      <step-3 module="M-CRITIC" status="complete">Реализовать do_security_audit() с severity classification</step-3>
+      <step-4 module="M-CRITIC" status="complete">Реализовать followup() для multi-turn диалога</step-4>
+      <step-5 module="M-SERVER" status="complete">Добавить _format_result() DRY для unified metadata footer</step-5>
+    </Phase-4>
+
+    <Phase-5 name="Operations and Safety" status="complete">
+      <goal>Операционные tools и защита от cost DoS</goal>
+      <step-1 module="M-API" status="complete">Добавить MAX_CONTENT_CHARS=100000 для truncation</step-1>
+      <step-2 module="M-CONFIG" status="complete">Реализовать reload_config() для hot reload</step-2>
+      <step-3 module="M-SERVER" status="complete">Добавить reload_config_tool MCP tool</step-3>
+      <step-4 module="M-SERVER" status="complete">Добавить restart_server MCP tool (os._exit(0))</step-4>
+    </Phase-5>
+
+    <Phase-6 name="Deployment and Documentation" status="complete">
+      <goal>GitHub, VM deployment, README, GRACE audit</goal>
+      <step-1 status="complete">GitHub repo: https://github.com/Bondartsov/grok-critic-mcp</step-1>
+      <step-2 status="complete">VM deployment: 10.61.11.54:/opt/grok-critic-mcp/repo, systemd service</step-2>
+      <step-3 status="complete">Comprehensive README.md (~600 lines)</step-3>
+      <step-4 status="complete">Critic self-review: 8.6/10</step-4>
+      <step-5 status="complete">GRACE full-integrity audit and artifact sync</step-5>
+    </Phase-6>
   </ImplementationOrder>
 
   <ExecutionPolicy>
