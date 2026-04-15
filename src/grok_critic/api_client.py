@@ -22,15 +22,12 @@ from grok_critic.config import config
 
 logger = logging.getLogger("grok-critic.api_client")
 
+MAX_CONTENT_CHARS = 100_000  # ~100KB — защита от DoS по стоимости
+
 # agent_count → reasoning.effort mapping.
 # According to xAI docs, only 2 modes exist:
-#   4 agents → effort "low" or "medium"
-#  16 agents → effort "high" or "xhigh"
-# No other agent counts are officially supported.
-AGENT_COUNT_TO_EFFORT: dict[int, str] = {
-    4: "low",
-    16: "high",
-}
+#   4 agents → effort "low"
+#  16 agents → effort "high"
 
 MAX_RETRIES = 2
 RETRY_BACKOFF_BASE = 2.0  # seconds
@@ -240,7 +237,14 @@ class ResponsesClient:
                 continue
             break  # non-retryable or last attempt — proceed to error handling
 
-        assert resp is not None  # guaranteed: either returned above or break
+        if resp is None:
+            # Safety net: all retry paths exhausted without a response.
+            logger.error("[APIClient][call][ERROR] No response received after %d attempts", MAX_RETRIES + 1)
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id,
+                error=last_error or "No response from server",
+            )
         # END_BLOCK_SEND_WITH_RETRY
 
         # START_BLOCK_ERROR_HANDLING

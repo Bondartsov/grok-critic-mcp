@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from grok_critic.api_client import CritiqueResult, ResponsesClient
+from grok_critic.api_client import CritiqueResult, ResponsesClient, MAX_CONTENT_CHARS
 from grok_critic.config import config
 
 logger = logging.getLogger("grok-critic.critic")
@@ -71,6 +71,41 @@ def _build_user_prompt(
 # END_BLOCK_BUILD_PROMPT
 
 
+# START_BLOCK_PERFORM_REVIEW
+async def _perform_review(
+    content: str,
+    system_prompt: str,
+    *,
+    context: str | None = None,
+    focus_areas: list[str] | None = None,
+    agent_count: int | None = None,
+    error_label: str = "ревью",
+) -> CritiqueResult:
+    """Shared review logic: validate content → build prompt → call API."""
+    if not content.strip():
+        return CritiqueResult(
+            text="", model=config.model,
+            agent_count=agent_count or config.agent_count,
+            effort="low", error=f"Пустой контент для {error_label}",
+        )
+
+    if len(content) > MAX_CONTENT_CHARS:
+        return CritiqueResult(
+            text="", model=config.model,
+            agent_count=agent_count or config.agent_count,
+            effort="low",
+            error=f"Контент слишком большой ({len(content)} символов). Максимум {MAX_CONTENT_CHARS}.",
+        )
+
+    count = agent_count if agent_count is not None else config.agent_count
+    prompt = _build_user_prompt(content, context, focus_areas)
+    client = ResponsesClient()
+    return await client.call(prompt=prompt, agent_count=count, system_prompt=system_prompt)
+
+
+# END_BLOCK_PERFORM_REVIEW
+
+
 # START_BLOCK_STRUCTURED_REVIEW
 async def structured_review(
     content: str,
@@ -83,32 +118,11 @@ async def structured_review(
         len(content),
         agent_count,
     )
-
-    if not content.strip():
-        logger.warning("[Critic][structured_review][STRUCTURED_REVIEW] Empty content provided")
-        return CritiqueResult(
-            text="",
-            model=config.model,
-            agent_count=agent_count or config.agent_count,
-            effort="low",
-            error="Пустой контент для ревью",
-        )
-
-    count = agent_count if agent_count is not None else config.agent_count
-    user_prompt = _build_user_prompt(content, context, focus_areas)
-    client = ResponsesClient()
-    result = await client.call(
-        prompt=user_prompt,
-        agent_count=count,
-        system_prompt=CRITIC_SYSTEM_PROMPT,
+    return await _perform_review(
+        content, CRITIC_SYSTEM_PROMPT,
+        context=context, focus_areas=focus_areas,
+        agent_count=agent_count, error_label="ревью",
     )
-
-    logger.info(
-        "[Critic][structured_review][STRUCTURED_REVIEW] Review complete, result_len=%d success=%s",
-        len(result.text),
-        result.success,
-    )
-    return result
 
 
 # END_BLOCK_STRUCTURED_REVIEW
@@ -255,17 +269,12 @@ async def do_architecture_review(
     agent_count: int | None = None,
 ) -> CritiqueResult:
     """Специализированный архитектурный ревью."""
-    if not content.strip():
-        return CritiqueResult(
-            text="", model=config.model,
-            agent_count=agent_count or config.agent_count,
-            effort="low", error="Пустой контент для архитектурного ревью",
-        )
-
-    count = agent_count if agent_count is not None else config.agent_count
-    prompt = _build_user_prompt(content, context, ["architecture", "scalability", "dependencies"])
-    client = ResponsesClient()
-    return await client.call(prompt=prompt, agent_count=count, system_prompt=ARCHITECTURE_SYSTEM_PROMPT)
+    return await _perform_review(
+        content, ARCHITECTURE_SYSTEM_PROMPT,
+        context=context,
+        focus_areas=["architecture", "scalability", "dependencies"],
+        agent_count=agent_count, error_label="архитектурного ревью",
+    )
 
 
 async def do_security_audit(
@@ -274,17 +283,12 @@ async def do_security_audit(
     agent_count: int | None = None,
 ) -> CritiqueResult:
     """Специализированный security-аудит."""
-    if not content.strip():
-        return CritiqueResult(
-            text="", model=config.model,
-            agent_count=agent_count or config.agent_count,
-            effort="low", error="Пустой контент для security аудита",
-        )
-
-    count = agent_count if agent_count is not None else config.agent_count
-    prompt = _build_user_prompt(content, context, ["security", "vulnerabilities", "secrets"])
-    client = ResponsesClient()
-    return await client.call(prompt=prompt, agent_count=count, system_prompt=SECURITY_SYSTEM_PROMPT)
+    return await _perform_review(
+        content, SECURITY_SYSTEM_PROMPT,
+        context=context,
+        focus_areas=["security", "vulnerabilities", "secrets"],
+        agent_count=agent_count, error_label="security аудита",
+    )
 
 
 # END_BLOCK_SPECIALIZED_REVIEWS

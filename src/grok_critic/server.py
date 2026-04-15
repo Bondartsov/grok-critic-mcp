@@ -41,6 +41,13 @@ def _format_metadata(result) -> str:
     return "\n".join(lines)
 
 
+def _format_result(result) -> str:
+    """Unified result formatting: error or text + metadata."""
+    if not result.success:
+        return f"❌ Error: {result.error}"
+    return result.text + _format_metadata(result)
+
+
 # END_BLOCK_FORMAT_METADATA
 
 
@@ -84,10 +91,7 @@ async def critic_review(
         focus_areas=areas,
     )
 
-    if not result.success:
-        return f"❌ Error: {result.error}"
-
-    return result.text + _format_metadata(result)
+    return _format_result(result)
 
 
 # END_BLOCK_TOOL_CRITIC_REVIEW
@@ -119,10 +123,7 @@ async def critic_followup(
         agent_count=agent_count,
     )
 
-    if not result.success:
-        return f"❌ Error: {result.error}"
-
-    return result.text + _format_metadata(result)
+    return _format_result(result)
 
 
 # END_BLOCK_TOOL_CRITIC_FOLLOWUP
@@ -174,10 +175,7 @@ async def architecture_review(
         agent_count=agent_count,
     )
 
-    if not result.success:
-        return f"❌ Error: {result.error}"
-
-    return result.text + _format_metadata(result)
+    return _format_result(result)
 
 
 # END_BLOCK_TOOL_ARCHITECTURE_REVIEW
@@ -209,10 +207,7 @@ async def security_audit(
         agent_count=agent_count,
     )
 
-    if not result.success:
-        return f"❌ Error: {result.error}"
-
-    return result.text + _format_metadata(result)
+    return _format_result(result)
 
 
 # END_BLOCK_TOOL_SECURITY_AUDIT
