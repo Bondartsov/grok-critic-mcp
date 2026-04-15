@@ -594,4 +594,4 @@ MIT
 
 ---
 
-*Built with [GRACE](https://github.com/osovv/grace) methodology — Graph-RAG Anchored Code Engineering.*
+*Built with GRACE methodology — Graph-RAG Anchored Code Engineering.*
