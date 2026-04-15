@@ -72,7 +72,7 @@ class TestExtractText:
 class TestExtractUsage:
     def test_with_usage(self) -> None:
         payload = {"usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}}
-        inp, out, total, cost_rub, cached = _extract_usage(payload)
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert inp == 100
         assert out == 50
         assert total == 150
@@ -81,17 +81,17 @@ class TestExtractUsage:
 
     def test_with_cost_rub(self) -> None:
         payload = {"usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150, "cost_rub": 1.23}}
-        inp, out, total, cost_rub, cached = _extract_usage(payload)
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert inp == 100
         assert cost_rub == 1.23
 
     def test_with_cost_alias(self) -> None:
         payload = {"usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150, "cost": 2.50}}
-        inp, out, total, cost_rub, cached = _extract_usage(payload)
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert cost_rub == 2.50
 
     def test_missing_usage(self) -> None:
-        inp, out, total, cost_rub, cached = _extract_usage({})
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage({})
         assert inp == 0
         assert out == 0
         assert total == 0
@@ -100,7 +100,7 @@ class TestExtractUsage:
 
     def test_partial_usage(self) -> None:
         payload = {"usage": {"input_tokens": 200}}
-        inp, out, total, cost_rub, cached = _extract_usage(payload)
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert inp == 200
         assert out == 0
         assert total == 0
@@ -111,7 +111,7 @@ class TestExtractUsage:
             "input_tokens": 2000, "output_tokens": 500, "total_tokens": 2500,
             "prompt_tokens_details": {"cached_tokens": 1800},
         }}
-        inp, out, total, cost_rub, cached = _extract_usage(payload)
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert inp == 2000
         assert cached == 1800
 
@@ -120,8 +120,24 @@ class TestExtractUsage:
             "input_tokens": 2000, "output_tokens": 500, "total_tokens": 2500,
             "input_tokens_details": {"cached_tokens": 1500},
         }}
-        inp, out, total, cost_rub, cached = _extract_usage(payload)
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert cached == 1500
+
+    def test_with_reasoning_tokens(self) -> None:
+        payload = {"usage": {
+            "input_tokens": 2000, "output_tokens": 5000, "total_tokens": 7000,
+            "completion_tokens_details": {"reasoning_tokens": 4200},
+        }}
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
+        assert reasoning == 4200
+
+    def test_with_output_tokens_details(self) -> None:
+        payload = {"usage": {
+            "input_tokens": 2000, "output_tokens": 5000, "total_tokens": 7000,
+            "output_tokens_details": {"reasoning_tokens": 3500},
+        }}
+        inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
+        assert reasoning == 3500
 
 
 # END_BLOCK_EXTRACT_USAGE

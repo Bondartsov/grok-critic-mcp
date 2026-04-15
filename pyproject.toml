@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "grok-critic-mcp"
-version = "1.6.0"
+version = "1.6.1"
 description = "MCP server for critical code review via grok-4.20-multi-agent"
 readme = "README.md"
 requires-python = ">=3.11"
