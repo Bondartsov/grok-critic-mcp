@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -196,7 +196,23 @@ class TestFollowup:
 
 # START_BLOCK_HEALTH_CHECK
 class TestHealthCheck:
-    async def test_healthy_when_key_set(self) -> None:
+    @pytest.fixture()
+    def mock_balance(self):
+        """Mock balance API to return a fake balance."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"amount": "1250.50"}
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_resp
+        # Make async with ... as client: return mock_client itself
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("grok_critic.critic.httpx.AsyncClient", return_value=mock_client):
+            yield mock_client
+
+    async def test_healthy_when_key_set(self, mock_balance) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
             mock_cfg.api_key = "valid-key"
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
@@ -206,6 +222,7 @@ class TestHealthCheck:
             result = await health_check()
             assert result["status"] == "ok"
             assert result["issues"] == []
+            assert result["balance_rub"] == 1250.50
 
     async def test_degraded_when_no_key(self) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
@@ -218,7 +235,7 @@ class TestHealthCheck:
             assert result["status"] == "degraded"
             assert any("POLZA_API_KEY" in issue for issue in result["issues"])
 
-    async def test_pricing_info_when_set(self) -> None:
+    async def test_pricing_info_when_set(self, mock_balance) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
             mock_cfg.api_key = "valid-key"
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
@@ -230,7 +247,7 @@ class TestHealthCheck:
             assert result["pricing"]["input_per_1m"] == 2.6
             assert result["pricing"]["output_per_1m"] == 6.6
 
-    async def test_no_pricing_when_zero(self) -> None:
+    async def test_no_pricing_when_zero(self, mock_balance) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
             mock_cfg.api_key = "valid-key"
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"

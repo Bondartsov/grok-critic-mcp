@@ -129,7 +129,7 @@ class TestCriticReviewTool:
             result = await critic_review(content="code")
             assert "Metadata" in result
             assert "agents=16" in result
-            assert "input=1240" in result
+            assert "input=1\u2009240" in result
             assert "output=870" in result
             assert "rev_test1234" in result
             assert "$0.0124" in result

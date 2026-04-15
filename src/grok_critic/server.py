@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.4.0
+# VERSION: 1.5.0
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing critic_review, critic_followup and health_check tools
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
@@ -28,15 +28,31 @@ logger = logging.getLogger("grok-critic.server")
 
 
 # START_BLOCK_FORMAT_METADATA
+def _fmt(n: int) -> str:
+    """Format number with thin-space thousands separator: 123456 → '123 456'."""
+    s = str(abs(n))
+    groups: list[str] = []
+    while s:
+        groups.insert(0, s[-3:])
+        s = s[:-3]
+    result = "\u2009".join(groups)  # thin space U+2009
+    return f"-{result}" if n < 0 else result
+
+
 def _format_metadata(result) -> str:
     lines = [
         "",
         "---",
         f"📊 Metadata: model={result.model} | agents={result.agent_count} | effort={result.effort}",
-        f"📈 Tokens: input={result.input_tokens} output={result.output_tokens} total={result.total_tokens}",
+        f"📈 Tokens: input={_fmt(result.input_tokens)} output={_fmt(result.output_tokens)} total={_fmt(result.total_tokens)}",
     ]
+    cost_parts: list[str] = []
+    if result.cost_rub is not None and result.cost_rub > 0:
+        cost_parts.append(f"{result.cost_rub:.2f} ₽")
     if result.cost_usd > 0:
-        lines.append(f"💰 Cost: ${result.cost_usd:.4f}")
+        cost_parts.append(f"${result.cost_usd:.4f}")
+    if cost_parts:
+        lines.append(f"💰 Cost: {' | '.join(cost_parts)}")
     lines.append(f"🏷️ Review ID: {result.review_id}")
     return "\n".join(lines)
 
@@ -143,6 +159,8 @@ async def check_health() -> str:
     if "pricing" in result:
         pricing = result["pricing"]
         lines.append(f"Pricing: input=${pricing['input_per_1m']}/1M output=${pricing['output_per_1m']}/1M")
+    if "balance_rub" in result:
+        lines.append(f"Balance: {result['balance_rub']:.2f} ₽")
     return "\n".join(lines)
 
 

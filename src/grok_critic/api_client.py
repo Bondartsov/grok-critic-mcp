@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.4.0
+# VERSION: 1.5.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
@@ -44,6 +44,7 @@ class CritiqueResult:
     output_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
+    cost_rub: float | None = None  # Actual cost from Polza.AI API (usage.cost_rub)
     review_id: str = ""
     error: str = ""
 
@@ -102,12 +103,14 @@ def _extract_text(payload: dict[str, Any]) -> str:
 
 
 # START_BLOCK_USAGE_EXTRACTION
-def _extract_usage(payload: dict[str, Any]) -> tuple[int, int, int]:
+def _extract_usage(payload: dict[str, Any]) -> tuple[int, int, int, float | None]:
     usage = payload.get("usage", {})
+    cost_rub = usage.get("cost_rub") or usage.get("cost")
     return (
         usage.get("input_tokens", 0),
         usage.get("output_tokens", 0),
         usage.get("total_tokens", 0),
+        float(cost_rub) if cost_rub is not None else None,
     )
 
 
@@ -286,14 +289,15 @@ class ResponsesClient:
             )
 
         text = _extract_text(payload)
-        input_tokens, output_tokens, total_tokens = _extract_usage(payload)
+        input_tokens, output_tokens, total_tokens, cost_rub = _extract_usage(payload)
         cost_usd = _calculate_cost(input_tokens, output_tokens)
 
         logger.info(
-            "[APIClient][call][CALL] Response received, text_len=%d tokens=%d cost=%.6f",
+            "[APIClient][call][CALL] Response received, text_len=%d tokens=%d cost_usd=%.6f cost_rub=%s",
             len(text),
             total_tokens,
             cost_usd,
+            f"{cost_rub:.4f}" if cost_rub is not None else "N/A",
         )
 
         return CritiqueResult(
@@ -305,6 +309,7 @@ class ResponsesClient:
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
+            cost_rub=cost_rub,
             review_id=review_id,
         )
 

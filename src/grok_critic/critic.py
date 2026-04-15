@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.4.0
+# VERSION: 1.5.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import logging
+
+import httpx
 
 from grok_critic.api_client import CritiqueResult, ResponsesClient, MAX_CONTENT_CHARS
 from grok_critic.config import config
@@ -200,6 +202,23 @@ async def health_check() -> dict:
             "input_per_1m": config.price_input_per_1m,
             "output_per_1m": config.price_output_per_1m,
         }
+
+    # Query Polza.AI balance API
+    if config.api_key:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{config.base_url}/balance",
+                    headers={"Authorization": f"Bearer {config.api_key}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    result["balance_rub"] = float(data.get("amount", 0))
+                else:
+                    issues.append(f"Balance API returned {resp.status_code}")
+        except Exception as exc:
+            logger.warning("[Critic][health_check][BALANCE] Failed to fetch balance: %s", exc)
+            issues.append(f"Balance API error: {exc}")
 
     logger.info("[Critic][health_check][HEALTH_CHECK] status=%s", result["status"])
     return result
