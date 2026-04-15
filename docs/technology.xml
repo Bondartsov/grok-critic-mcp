@@ -1,4 +1,4 @@
-<TechnologyStack VERSION="1.4.0">
+<TechnologyStack VERSION="1.5.2">
   <Runtime>Python 3.11+</Runtime>
   <Language>Python 3.11+</Language>
   <Framework>FastMCP (mcp Python SDK) 1.6+</Framework>

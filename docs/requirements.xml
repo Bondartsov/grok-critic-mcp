@@ -1,4 +1,4 @@
-<RequirementsAnalysis VERSION="1.4.0">
+<RequirementsAnalysis VERSION="1.5.2">
   <Project>
     <name>grok-critic-mcp</name>
     <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 7 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server. Используется как субагент "Критик" в Kilo Code.</annotation>

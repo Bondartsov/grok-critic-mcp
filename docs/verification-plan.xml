@@ -1,4 +1,4 @@
-<VerificationPlan VERSION="1.4.0">
+<VerificationPlan VERSION="1.5.2">
   <GlobalPolicy>
     <log-format>[Module][function][BLOCK_NAME] message</log-format>
     <deterministic-first>true</deterministic-first>

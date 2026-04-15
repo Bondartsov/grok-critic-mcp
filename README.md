@@ -25,7 +25,7 @@
 
 ## Что это
 
-MCP (Model Context Protocol) сервер, который предоставляет 7 инструментов для критического анализа кода:
+MCP (Model Context Protocol) сервер, который предоставляет 8 инструментов для критического анализа кода:
 
 | Инструмент | Назначение |
 |------------|-----------|
@@ -33,11 +33,12 @@ MCP (Model Context Protocol) сервер, который предоставля
 | `architecture_review` | Специализированный анализ архитектуры (паттерны, зависимости, масштабируемость) |
 | `security_audit` | Security-аудит с классификацией 🔴🟡🟠🔵 |
 | `critic_followup` | Уточняющий вопрос по предыдущему ревью |
-| `check_health` | Проверка статуса сервера, API-ключа, pricing |
+| `check_health` | Проверка статуса сервера, API-ключа, pricing, **баланс в ₽** |
 | `reload_config_tool` | Горячая перезагрузка `.env` без перезапуска |
 | `restart_server` | Полный перезапуск процесса (MCP-клиент поднимет автоматически) |
+| `self_update` | Автообновление с GitHub (`git pull` + `pip install` + restart) |
 
-Ответы на русском языке. Каждый ответ содержит metadata footer с моделью, токенами, стоимостью и review_id.
+Ответы на русском языке. Каждый ответ содержит metadata footer с моделью, токенами (с разделителями разрядов), кешированными токенами, стоимостью (₽ и $) и review_id.
 
 ---
 
@@ -207,7 +208,7 @@ grok-critic_critic_review(
 **Ответ содержит:**
 1. Детальный разбор по разделам (логические ошибки, SOLID, безопасность, производительность, улучшения)
 2. Конкретные рекомендации с примерами кода
-3. Metadata footer (модель, токены, стоимость, review_id)
+3. Metadata footer (модель, токены, стоимость ₽/$, cached tokens, review_id)
 
 ### `architecture_review` — ревью архитектуры
 
@@ -408,7 +409,7 @@ grok-critic-mcp/
 │   ├── config.py            # Pydantic Settings, env vars, logging
 │   ├── api_client.py        # Async HTTP client, retry, cost calculation
 │   ├── critic.py            # System prompts, review orchestration
-│   └── server.py            # FastMCP server, 7 tools, metadata formatting
+│   └── server.py            # FastMCP server, 8 tools, metadata formatting
 ├── tests/
 │   ├── test_config.py       # Config defaults, env overrides, reload
 │   ├── test_api_client.py   # Effort mapping, response parsing, retry, cost
@@ -429,7 +430,7 @@ grok-critic-mcp/
 | `config.py` | Загрузка и валидация конфигурации из `.env` через pydantic-settings. Hot reload. |
 | `api_client.py` | Async HTTP-клиент к Polza.AI Responses API. Retry, dynamic timeout, cost calculation. |
 | `critic.py` | System prompts (3 специализированных), orchestration functions, health check. |
-| `server.py` | FastMCP сервер с 7 инструментами. Parameter parsing, metadata footer formatting. |
+| `server.py` | FastMCP сервер с 8 инструментами. Parameter parsing, metadata footer formatting, self-update. |
 
 ### Ключевые технические решения
 
@@ -458,7 +459,7 @@ python -m pytest tests/ -v
 python -m pytest tests/ -v --cov=grok_critic --cov-report=term-missing
 ```
 
-**85 тестов** покрывают: config defaults и env overrides, effort mapping, response parsing, usage extraction, cost calculation, retry logic, persistent client, JSON decode error handling, tool registration, parameter parsing, metadata formatting, hot reload, server restart.
+**96 тестов** покрывают: config defaults и env overrides, effort mapping, response parsing, usage extraction (включая cost_rub и cached_tokens), cost calculation, retry logic, persistent client, JSON decode error handling, error body parsing (402/502/503), tool registration (8 tools), parameter parsing, metadata formatting с разделителями, hot reload, server restart, self_update flow, health check с balance API.
 
 ---
 

@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.5.2
+# VERSION: 1.6.0
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing critic_review, critic_followup and health_check tools
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
@@ -48,6 +48,9 @@ def _format_metadata(result) -> str:
         f"📊 Metadata: model={result.model} | agents={result.agent_count} | effort={result.effort}",
         f"📈 Tokens: input={_fmt(result.input_tokens)} output={_fmt(result.output_tokens)} total={_fmt(result.total_tokens)}",
     ]
+    if result.cached_tokens > 0:
+        pct = (result.cached_tokens / result.input_tokens * 100) if result.input_tokens > 0 else 0
+        lines.append(f"💾 Cached: {_fmt(result.cached_tokens)}/{_fmt(result.input_tokens)} ({pct:.0f}%)")
     cost_parts: list[str] = []
     if result.cost_rub is not None and result.cost_rub > 0:
         cost_parts.append(f"{result.cost_rub:.2f} ₽")

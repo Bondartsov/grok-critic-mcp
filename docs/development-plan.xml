@@ -1,4 +1,4 @@
-<DevelopmentPlan VERSION="1.4.0">
+<DevelopmentPlan VERSION="1.5.2">
   <ArchitectureNotes>
     <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 7 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart.</objective>
     <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>

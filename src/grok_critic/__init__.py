@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/__init__.py
-# VERSION: 1.5.2
+# VERSION: 1.6.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Package public API exports
 #   SCOPE: Re-export main functions and classes for external use
