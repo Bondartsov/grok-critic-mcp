@@ -1,0 +1,176 @@
+<DevelopmentPlan VERSION="0.2.0">
+  <ArchitectureNotes>
+    <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI.</objective>
+    <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>
+    <risk-1>Polza.AI может не поддерживать /v1/responses — нужен fallback к прямому xAI API.</risk-1>
+    <risk-2>Timeout — grok multi-agent работает медленно (до 2 мин для 16 агентов).</risk-2>
+  </ArchitectureNotes>
+
+  <Modules>
+    <M-CONFIG NAME="Config" TYPE="UTILITY" LAYER="0" ORDER="1" STATUS="planned">
+      <contract>
+        <purpose>Загрузка и валидация конфигурации окружения</purpose>
+        <inputs>
+          <param name="env_vars" type="dict" />
+          <param name="dotenv_path" type="Optional[str]" />
+        </inputs>
+        <outputs>
+          <param name="config" type="AppConfig" />
+        </outputs>
+        <errors>
+          <error code="MISSING_API_KEY" />
+        </errors>
+      </contract>
+      <interface>
+        <export-AppConfig PURPOSE="Pydantic settings model" />
+        <export-load_config PURPOSE="Load and validate config singleton" />
+        <export-config PURPOSE="Module-level config instance" />
+      </interface>
+      <depends>none</depends>
+      <target>
+        <source>src/grok_critic/config.py</source>
+        <tests>tests/test_config.py</tests>
+      </target>
+      <observability>
+        <log-prefix>[Config]</log-prefix>
+        <critical-block>BLOCK_VALIDATE_ENV</critical-block>
+      </observability>
+      <verification-ref>V-M-CONFIG</verification-ref>
+    </M-CONFIG>
+
+    <M-API NAME="APIClient" TYPE="INTEGRATION" LAYER="1" ORDER="1" STATUS="planned">
+      <contract>
+        <purpose>HTTP клиент для Polza.AI /v1/responses endpoint</purpose>
+        <inputs>
+          <param name="prompt" type="str" />
+          <param name="agent_count" type="int" />
+          <param name="system_prompt" type="Optional[str]" />
+        </inputs>
+        <outputs>
+          <param name="response_text" type="str" />
+        </outputs>
+        <errors>
+          <error code="API_ERROR" />
+          <error code="TIMEOUT" />
+          <error code="AUTH_FAILED" />
+        </errors>
+      </contract>
+      <interface>
+        <export-ResponsesClient PURPOSE="Async HTTP client for Responses API" />
+        <export-ResponsesClient.call PURPOSE="Send request and return parsed text" />
+      </interface>
+      <depends>M-CONFIG</depends>
+      <target>
+        <source>src/grok_critic/api_client.py</source>
+        <tests>tests/test_api_client.py</tests>
+      </target>
+      <observability>
+        <log-prefix>[APIClient]</log-prefix>
+        <critical-block>BLOCK_SEND_REQUEST</critical-block>
+      </observability>
+      <verification-ref>V-M-API</verification-ref>
+    </M-API>
+
+    <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" LAYER="2" ORDER="1" STATUS="planned">
+      <contract>
+        <purpose>Формирование промптов и оркестрация критического ревью</purpose>
+        <inputs>
+          <param name="content" type="str" />
+          <param name="context" type="Optional[str]" />
+          <param name="agent_count" type="int" />
+          <param name="focus_areas" type="Optional[list[str]]" />
+        </inputs>
+        <outputs>
+          <param name="review" type="str" />
+        </outputs>
+        <errors>
+          <error code="REVIEW_FAILED" />
+        </errors>
+      </contract>
+      <interface>
+        <export-structured_review PURPOSE="Full review pipeline" />
+        <export-health_check PURPOSE="Verify API connectivity" />
+        <export-CRITIC_SYSTEM_PROMPT PURPOSE="Default system prompt for critic agent" />
+      </interface>
+      <depends>M-API, M-CONFIG</depends>
+      <target>
+        <source>src/grok_critic/critic.py</source>
+        <tests>tests/test_critic.py</tests>
+      </target>
+      <observability>
+        <log-prefix>[Critic]</log-prefix>
+        <critical-block>BLOCK_BUILD_PROMPT</critical-block>
+      </observability>
+      <verification-ref>V-M-CRITIC</verification-ref>
+    </M-CRITIC>
+
+    <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" LAYER="3" ORDER="1" STATUS="planned">
+      <contract>
+        <purpose>MCP сервер: регистрация tools и запуск stdio transport</purpose>
+        <inputs>
+          <param name="stdio" type="MCP transport" />
+        </inputs>
+        <outputs>
+          <param name="MCP tools" type="critic_review, health_check" />
+        </outputs>
+        <errors>
+          <error code="SERVER_START_FAILED" />
+        </errors>
+      </contract>
+      <interface>
+        <export-server PURPOSE="FastMCP server instance" />
+        <export-main PURPOSE="Entry point function" />
+      </interface>
+      <depends>M-CRITIC, M-CONFIG</depends>
+      <target>
+        <source>src/grok_critic/server.py</source>
+        <tests>tests/test_server.py</tests>
+      </target>
+      <observability>
+        <log-prefix>[Server]</log-prefix>
+        <critical-block>BLOCK_REGISTER_TOOLS</critical-block>
+      </observability>
+      <verification-ref>V-M-SERVER</verification-ref>
+    </M-SERVER>
+  </Modules>
+
+  <DataFlow>
+    <DF-001 NAME="CriticReviewFlow" TRIGGER="KiloAgent вызывает MCP tool critic_review">
+      <step-1>MCP Server получает tool call с параметрами (content, context, agent_count, focus_areas)</step-1>
+      <step-2>CriticLogic.build_critique_prompt формирует структурированный промпт</step-1>
+      <step-3>CriticLogic вызывает APIClient.call(prompt, agent_count, system_prompt)</step-2>
+      <step-4>APIClient формирует Responses API request: model, input, reasoning.effort</step-3>
+      <step-5>APIClient отправляет POST /v1/responses к Polza.AI</step-4>
+      <step-6>APIClient парсит ответ, извлекает output_text</step-5>
+      <step-7>CriticLogic возвращает структурированный результат</step-6>
+      <step-8>MCP Server возвращает результат через MCP протокол</step-7>
+      <evidence>Log markers: [Server][handle_tool][BLOCK_REGISTER_TOOLS] → [Critic][structured_review][BLOCK_BUILD_PROMPT] → [APIClient][call][BLOCK_SEND_REQUEST]</evidence>
+    </DF-001>
+  </DataFlow>
+
+  <ImplementationOrder>
+    <Phase-1 name="Foundation" status="pending">
+      <goal>Базовые модули: конфигурация и API клиент</goal>
+      <step-1 module="M-CONFIG" status="pending" verification="V-M-CONFIG">Реализовать конфигурацию с Pydantic Settings</step-1>
+      <step-2 module="M-API" status="pending" verification="V-M-API">Реализовать Responses API клиент с httpx</step-2>
+    </Phase-1>
+
+    <Phase-2 name="Business Logic" status="pending">
+      <goal>Логика критического ревью и промпт-инжиниринг</goal>
+      <step-1 module="M-CRITIC" status="pending" verification="V-M-CRITIC">Реализовать логику критика и промпты</step-1>
+    </Phase-2>
+
+    <Phase-3 name="Integration" status="pending">
+      <goal>MCP сервер, интеграция в Kilo Code</goal>
+      <step-1 module="M-SERVER" status="pending" verification="V-M-SERVER">Реализовать MCP сервер с FastMCP</step-1>
+      <step-2 module="M-SERVER" status="pending">Зарегистрировать в kilo.json как MCP сервер</step-2>
+      <step-3 module="M-SERVER" status="pending">Создать агента critic.md</step-3>
+    </Phase-3>
+  </ImplementationOrder>
+
+  <ExecutionPolicy>
+    <default-profile>balanced</default-profile>
+    <controller-owns>docs/development-plan.xml, docs/knowledge-graph.xml, docs/verification-plan.xml</controller-owns>
+    <worker-owns>Only module source files and module-local tests inside the approved write scope.</worker-owns>
+  </ExecutionPolicy>
+</DevelopmentPlan>

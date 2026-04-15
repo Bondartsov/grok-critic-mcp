@@ -1,0 +1,130 @@
+<VerificationPlan VERSION="0.2.0">
+  <GlobalPolicy>
+    <log-format>[Module][function][BLOCK_NAME] message</log-format>
+    <deterministic-first>true</deterministic-first>
+    <module-level-focus>Fast deterministic checks with mocked HTTP responses</module-level-focus>
+    <wave-level-focus>Integration between modules with realistic mock data</wave-level-focus>
+    <phase-level-focus>Full pipeline from MCP tool call to response</phase-level-focus>
+    <redaction>Never log API keys or full request/response payloads.</redaction>
+  </GlobalPolicy>
+
+  <CriticalFlows>
+    <VF-001 NAME="CriticReviewHappyPath" USE_CASES="UC-001" DATA_FLOW="DF-001" PRIORITY="high">
+      <scenario>Kilo Agent вызывает critic_review с кодом для ревью</scenario>
+      <expected-outcome>Структурированный ответ с критическими проблемами, рекомендациями, замечаниями</expected-outcome>
+      <required-signals>
+        <log-marker>[Critic][structured_review][BLOCK_BUILD_PROMPT]</log-marker>
+        <log-marker>[APIClient][call][BLOCK_SEND_REQUEST]</log-marker>
+      </required-signals>
+    </VF-001>
+
+    <VF-002 NAME="APIErrorHandling" USE_CASES="UC-001" DATA_FLOW="DF-001" PRIORITY="high">
+      <scenario>Polza.AI возвращает ошибку (401, 429, 500, timeout)</scenario>
+      <expected-outcome>Информативное сообщение об ошибке, не краш сервера</expected-outcome>
+      <required-signals>
+        <log-marker>[APIClient][handle_api_error][BLOCK_HANDLE_ERROR]</log-marker>
+      </required-signals>
+    </VF-002>
+
+    <VF-003 NAME="HealthCheck" USE_CASES="UC-003" PRIORITY="medium">
+      <scenario>Kilo Agent вызывает health_check tool</scenario>
+      <expected-outcome>Возвращается статус конфигурации и (опционально) connectivity</expected-outcome>
+    </VF-003>
+  </CriticalFlows>
+
+  <ModuleVerification>
+    <V-M-CONFIG MODULE="M-CONFIG" PRIORITY="high">
+      <test-files>
+        <file>tests/test_config.py</file>
+      </test-files>
+      <module-checks>
+        <check-1>pytest tests/test_config.py -v</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Config loads from env vars with valid API key</scenario-1>
+        <scenario-2 kind="failure">Missing API key raises clear error</scenario-2>
+        <scenario-3 kind="success">Default values applied correctly (agent_count=4, timeout=120)</scenario-3>
+      </scenarios>
+    </V-M-CONFIG>
+
+    <V-M-API MODULE="M-API" PRIORITY="high">
+      <test-files>
+        <file>tests/test_api_client.py</file>
+      </test-files>
+      <module-checks>
+        <check-1>pytest tests/test_api_client.py -v</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">Correct Responses API request format for agent_count=4</scenario-1>
+        <scenario-2 kind="success">Correct Responses API request format for agent_count=16</scenario-2>
+        <scenario-3 kind="failure">API returns 401 → AUTH_FAILED error</scenario-3>
+        <scenario-4 kind="failure">API timeout → TIMEOUT error</scenario-4>
+        <scenario-5 kind="success">Response parsing extracts output_text correctly</scenario-5>
+      </scenarios>
+    </V-M-API>
+
+    <V-M-CRITIC MODULE="M-CRITIC" PRIORITY="high">
+      <test-files>
+        <file>tests/test_critic.py</file>
+      </test-files>
+      <module-checks>
+        <check-1>pytest tests/test_critic.py -v</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">structured_review returns formatted review text</scenario-1>
+        <scenario-2 kind="success">Prompt includes focus areas when specified</scenario-2>
+        <scenario-3 kind="success">System prompt is comprehensive and structured</scenario-3>
+      </scenarios>
+    </V-M-CRITIC>
+
+    <V-M-SERVER MODULE="M-SERVER" PRIORITY="high">
+      <test-files>
+        <file>tests/test_server.py</file>
+      </test-files>
+      <module-checks>
+        <check-1>pytest tests/test_server.py -v</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">critic_review tool is registered with correct schema</scenario-1>
+        <scenario-2 kind="success">health_check tool returns config status</scenario-2>
+      </scenarios>
+    </V-M-SERVER>
+  </ModuleVerification>
+
+  <PhaseGates>
+    <Gate-Phase-1 PHASE="Phase-1">
+      <goal>Config and API client have deterministic tests passing</goal>
+      <commands>
+        <command-1>pytest tests/test_config.py tests/test_api_client.py -v</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>All tests pass</evidence-1>
+        <evidence-2>API request format matches Responses API spec</evidence-2>
+      </required-evidence>
+    </Gate-Phase-1>
+
+    <Gate-Phase-2 PHASE="Phase-2">
+      <goal>Critic logic correctly builds prompts and handles mock responses</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+      </commands>
+    </Gate-Phase-2>
+
+    <Gate-Phase-3 PHASE="Phase-3">
+      <goal>MCP server runs and tools are accessible from Kilo Code</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>MCP server starts without errors</evidence-1>
+        <evidence-2>Tools visible in Kilo Code MCP list</evidence-2>
+      </required-evidence>
+    </Gate-Phase-3>
+  </PhaseGates>
+
+  <FailurePackets>
+    <packet-template>
+      <expected-fields>scenario, expected-evidence, observed-evidence, first-divergent-block, next-action</expected-fields>
+    </packet-template>
+  </FailurePackets>
+</VerificationPlan>

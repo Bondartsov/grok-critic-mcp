@@ -1,0 +1,308 @@
+# FILE: src/grok_critic/api_client.py
+# VERSION: 1.2.0
+# START_MODULE_CONTRACT
+#   PURPOSE: Async HTTP client for the Polza.AI Responses API
+#   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
+#   DEPENDS: M-CONFIG, httpx
+#   LINKS: M-API
+# END_MODULE_CONTRACT
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from grok_critic.config import config
+
+logger = logging.getLogger("grok-critic.api_client")
+
+# agent_count → reasoning.effort mapping.
+# According to xAI docs, only 2 modes exist:
+#   4 agents → effort "low" or "medium"
+#  16 agents → effort "high" or "xhigh"
+# No other agent counts are officially supported.
+AGENT_COUNT_TO_EFFORT: dict[int, str] = {
+    4: "low",
+    16: "high",
+}
+
+MAX_RETRIES = 2
+RETRY_BACKOFF_BASE = 2.0  # seconds
+
+
+# START_BLOCK_CRITIQUE_RESULT
+@dataclass
+class CritiqueResult:
+    text: str
+    model: str
+    agent_count: int
+    effort: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float = 0.0
+    review_id: str = ""
+    error: str = ""
+
+    @property
+    def success(self) -> bool:
+        return not self.error
+
+
+# END_BLOCK_CRITIQUE_RESULT
+
+
+# START_BLOCK_EFFORT_MAPPING
+def _resolve_effort(agent_count: int) -> str:
+    """Map agent_count to reasoning.effort.
+
+    Only 4 (low) and 16 (high) are officially supported by xAI.
+    Any other value falls back to nearest supported mode.
+    """
+    if agent_count <= 4:
+        return "low"
+    return "high"
+
+
+# END_BLOCK_EFFORT_MAPPING
+
+
+# START_BLOCK_DYNAMIC_TIMEOUT
+def _resolve_timeout(agent_count: int) -> int:
+    """Dynamic timeout: fewer agents → shorter timeout."""
+    base = config.timeout_seconds
+    if agent_count <= 4:
+        return min(base, 90)
+    if agent_count <= 8:
+        return min(base, 150)
+    return base  # 16+ agents — full configured timeout (default 180s+)
+
+
+# END_BLOCK_DYNAMIC_TIMEOUT
+
+
+# START_BLOCK_RESPONSE_PARSER
+def _extract_text(payload: dict[str, Any]) -> str:
+    if output_text := payload.get("output_text"):
+        return output_text
+
+    output_items = payload.get("output", [])
+    for item in output_items:
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    return content.get("text", "")
+    return ""
+
+
+# END_BLOCK_RESPONSE_PARSER
+
+
+# START_BLOCK_USAGE_EXTRACTION
+def _extract_usage(payload: dict[str, Any]) -> tuple[int, int, int]:
+    usage = payload.get("usage", {})
+    return (
+        usage.get("input_tokens", 0),
+        usage.get("output_tokens", 0),
+        usage.get("total_tokens", 0),
+    )
+
+
+# END_BLOCK_USAGE_EXTRACTION
+
+
+# START_BLOCK_COST_CALCULATION
+def _calculate_cost(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens / 1_000_000 * config.price_input_per_1m) + (
+        output_tokens / 1_000_000 * config.price_output_per_1m
+    )
+
+
+# END_BLOCK_COST_CALCULATION
+
+
+# START_BLOCK_PERSISTENT_CLIENT
+_client: httpx.AsyncClient | None = None
+
+
+async def get_client() -> httpx.AsyncClient:
+    """Get or create a persistent httpx.AsyncClient.
+
+    Timeout не задаётся здесь — он передаётся в каждый .post() вызов
+    через httpx.Timeout для поддержки динамического timeout по agent_count.
+    """
+    global _client
+    if _client is None or _client.is_closed:
+        # Базовый timeout = максимальный из конфига. Реальный — через timeout в .post()
+        _client = httpx.AsyncClient(timeout=config.timeout_seconds)
+        logger.info("[APIClient][get_client][INIT] Created persistent client")
+    return _client
+
+
+async def close_client() -> None:
+    """Gracefully close the persistent client. Called on server shutdown."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+        logger.info("[APIClient][close_client][CLOSE] Client closed")
+    _client = None
+
+
+# END_BLOCK_PERSISTENT_CLIENT
+
+
+# START_BLOCK_RESPONSES_CLIENT
+class ResponsesClient:
+    def __init__(self) -> None:
+        self._base_url = config.base_url
+        self._api_key = config.api_key
+        self._model = config.model
+        self._timeout_seconds = config.timeout_seconds
+        logger.info(
+            "[APIClient][__init__][INIT] base_url=%s model=%s timeout=%ds",
+            self._base_url,
+            self._model,
+            self._timeout_seconds,
+        )
+
+    async def call(
+        self,
+        prompt: str,
+        agent_count: int = 4,
+        system_prompt: str | None = None,
+    ) -> CritiqueResult:
+        effort = _resolve_effort(agent_count)
+        timeout = _resolve_timeout(agent_count)
+        review_id = f"rev_{uuid.uuid4().hex[:12]}"
+        logger.info(
+            "[APIClient][call][CALL] agent_count=%d effort=%s timeout=%ds prompt_len=%d review_id=%s",
+            agent_count,
+            effort,
+            timeout,
+            len(prompt),
+            review_id,
+        )
+
+        input_messages: list[dict[str, str]] = []
+        if system_prompt:
+            input_messages.append({"role": "system", "content": system_prompt})
+        input_messages.append({"role": "user", "content": prompt})
+
+        body: dict[str, Any] = {
+            "model": self._model,
+            "reasoning": {"effort": effort},
+            "input": input_messages,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+        url = f"{self._base_url}/responses"
+
+        # START_BLOCK_SEND_WITH_RETRY
+        resp: httpx.Response | None = None
+        last_error = ""
+        request_timeout = httpx.Timeout(timeout)
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                client = await get_client()
+                resp = await client.post(url, json=body, headers=headers, timeout=request_timeout)
+            except httpx.TimeoutException:
+                logger.error(
+                    "[APIClient][call][CALL] Timeout after %ds (attempt %d/%d)",
+                    timeout, attempt + 1, MAX_RETRIES + 1,
+                )
+                last_error = "Request timed out"
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_BACKOFF_BASE ** attempt)
+                    continue
+                return CritiqueResult(
+                    text="", model=self._model, agent_count=agent_count,
+                    effort=effort, review_id=review_id, error=last_error,
+                )
+
+            # Retryable status codes: 429 (rate limit) and 5xx (server error)
+            if resp.status_code in (429, *range(500, 600)) and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "[APIClient][call][RETRY] %d — retrying in %.1fs (attempt %d/%d)",
+                    resp.status_code, wait, attempt + 1, MAX_RETRIES + 1,
+                )
+                await asyncio.sleep(wait)
+                continue
+            break  # non-retryable or last attempt — proceed to error handling
+
+        assert resp is not None  # guaranteed: either returned above or break
+        # END_BLOCK_SEND_WITH_RETRY
+
+        # START_BLOCK_ERROR_HANDLING
+        if resp.status_code == 401:
+            logger.error("[APIClient][call][ERROR] 401 — API key invalid")
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id, error="API key invalid",
+            )
+        if resp.status_code == 429:
+            logger.error("[APIClient][call][ERROR] 429 — Rate limited (all retries exhausted)")
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id, error="Rate limited",
+            )
+        if resp.status_code >= 500:
+            logger.error("[APIClient][call][ERROR] %d — Server error", resp.status_code)
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id,
+                error=f"Server error ({resp.status_code})",
+            )
+        if resp.status_code >= 400:
+            logger.error("[APIClient][call][ERROR] %d — %s", resp.status_code, resp.text[:200])
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id,
+                error=f"HTTP {resp.status_code}",
+            )
+        # END_BLOCK_ERROR_HANDLING
+
+        try:
+            payload = resp.json()
+        except json.JSONDecodeError:
+            logger.error("[APIClient][call][ERROR] Invalid JSON in response")
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id, error="Invalid JSON response",
+            )
+
+        text = _extract_text(payload)
+        input_tokens, output_tokens, total_tokens = _extract_usage(payload)
+        cost_usd = _calculate_cost(input_tokens, output_tokens)
+
+        logger.info(
+            "[APIClient][call][CALL] Response received, text_len=%d tokens=%d cost=%.6f",
+            len(text),
+            total_tokens,
+            cost_usd,
+        )
+
+        return CritiqueResult(
+            text=text,
+            model=self._model,
+            agent_count=agent_count,
+            effort=effort,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+            review_id=review_id,
+        )
+
+
+# END_BLOCK_RESPONSES_CLIENT

@@ -1,0 +1,80 @@
+<RequirementsAnalysis VERSION="0.2.0">
+  <Project>
+    <name>grok-critic-mcp</name>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет tool critic_review для критического ревью кода, архитектуры и решений.</annotation>
+    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, Responses API</keywords>
+  </Project>
+
+  <Actors>
+    <actor-KiloAgent>Агент Kilo Code (orchestrator, code, architect), вызывающий tool critic_review через MCP протокол.</actor-KiloAgent>
+    <actor-PolzaAI>Полza.AI API endpoint, проксирующий xAI Responses API для grok-4.20-multi-agent.</actor-PolzaAI>
+    <actor-GrokMultiAgent>Внутренние субагенты grok-4.20-multi-agent (4 или 16 агентов), выполняющие анализ.</actor-GrokMultiAgent>
+  </Actors>
+
+  <UseCases>
+    <UC-001>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool critic_review с кодом/архитектурой для ревью</Action>
+      <Goal>Получить критический анализ с конкретными замечаниями и рекомендациями</Goal>
+      <Preconditions>MCP сервер запущен и зарегистрирован в kilo.json. API ключ Polza.AI доступен.</Preconditions>
+      <AcceptanceCriteria>
+        1. MCP tool доступен в Kilo Code через Task tool
+        2. Запрос корректно транслируется в Responses API формат
+        3. Ответ содержит структурированный анализ: критические проблемы, рекомендации, замечания, похвальное
+        4. Ошибки API обрабатываются gracefully с информативными сообщениями
+      </AcceptanceCriteria>
+      <Priority>high</Priority>
+      <RelatedFlows>DF-001</RelatedFlows>
+    </UC-001>
+
+    <UC-002>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает critic_review с параметром agent_count для контроля глубины анализа</Action>
+      <Goal>Выбрать между быстрым (4 агента) и глубоким (16 агентов) анализом</Goal>
+      <Preconditions>MCP сервер запущен</Preconditions>
+      <AcceptanceCriteria>
+        1. Параметр agent_count поддерживается (4 или 16)
+        2. reasoning.effort автоматически устанавливается в соответствии с agent_count
+        3. Ответ для 16 агентов существенно глубже, чем для 4
+      </AcceptanceCriteria>
+      <Priority>medium</Priority>
+      <RelatedFlows>DF-001</RelatedFlows>
+    </UC-003>
+
+    <UC-003>
+      <Actor>KiloAgent</Actor>
+      <Action>Вызывает MCP tool для проверки connectivity и конфигурации</Action>
+      <Goal>Убедиться что сервер работает и API ключ валиден</Goal>
+      <Preconditions>MCP сервер запущен</Preconditions>
+      <AcceptanceCriteria>Tool health_check возвращает статус и информацию о конфигурации</AcceptanceCriteria>
+      <Priority>medium</Priority>
+    </UC-003>
+  </UseCases>
+
+  <NonGoals>
+    <item-1>Не поддерживает streaming — только полный ответ.</item-1>
+    <item-2>Не поддерживает multi-turn conversation с grok — каждый вызов независим.</item-1>
+    <item-3>Не реализует client-side tools / function calling — grok multi-agent не поддерживает.</item-3>
+    <item-4>Не кэширует результаты — каждый вызов идёт к API.</item-4>
+  </NonGoals>
+
+  <Constraints>
+    <constraint-1>grok-4.20-multi-agent НЕ поддерживает Chat Completions API — только Responses API (/v1/responses).</constraint-1>
+    <constraint-2>API ключ Polza.AI хранится в env variable POLZA_API_KEY или в .env файле.</constraint-2>
+    <constraint-3>Ответ может занимать до 2 минут (особенно для 16 агентов) — нужен адекватный timeout.</constraint-3>
+    <constraint-4>Стоимость: 16 агентов потребляют значительно больше токенов, чем 4.</constraint-4>
+    <constraint-5>MCP сервер запускается через npx/uvx как local MCP server в kilo.json.</constraint-5>
+  </Constraints>
+
+  <Risks>
+    <risk-1>Polza.AI может не проксировать Responses API корректно — нужен fallback на прямой xAI API.</risk-1>
+    <risk-2>Timeout: grok-4.20-multi-agent может работать дольше стандартного MCP timeout (30s).</risk-2>
+    <risk-3>Формат ответа Responses API отличается от Chat Completions — нужна правильная парсинг-логика.</risk-3>
+    <risk-4>Rate limiting: Polza.AI может иметь ограничения на частоту запросов.</risk-4>
+  </Risks>
+
+  <OpenQuestions>
+    <question-1>Поддерживает ли Polza.AI endpoint /v1/responses? Если нет — нужен прямой xAI API ключ.</question-1>
+    <question-2>Какой максимальный timeout поддерживает MCP протокол в Kilo Code?</question-2>
+  </OpenQuestions>
+</RequirementsAnalysis>

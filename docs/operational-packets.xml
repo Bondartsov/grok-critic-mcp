@@ -1,0 +1,86 @@
+<OperationalPackets VERSION="0.1.0">
+  <ExecutionPacketTemplate>
+    <ExecutionPacket>
+      <module-id>M-EXAMPLE</module-id>
+      <module-name>Example</module-name>
+      <purpose>Implement the approved module without architectural drift.</purpose>
+      <write-scope>
+        <file-1>src/grok_critic/example.py</file-1>
+        <file-2>tests/test_example.py</file-2>
+      </write-scope>
+      <contract-excerpt><![CDATA[
+Planned module contract excerpt goes here.
+      ]]></contract-excerpt>
+      <graph-entry-excerpt><![CDATA[
+Knowledge graph entry excerpt goes here.
+      ]]></graph-entry-excerpt>
+      <dependency-contract-summaries>
+        <dependency-1 module="M-CONFIG">Pydantic Settings model with API key, base URL, timeout, agent_count.</dependency-1>
+      </dependency-contract-summaries>
+      <verification-excerpt><![CDATA[
+Verification-plan excerpt goes here.
+      ]]></verification-excerpt>
+      <expected-graph-delta-fields>
+        <field-1>imports</field-1>
+        <field-2>exports</field-2>
+        <field-3>annotations</field-3>
+        <field-4>CrossLinks</field-4>
+      </expected-graph-delta-fields>
+      <expected-verification-delta-fields>
+        <field-1>test-files</field-1>
+        <field-2>module-checks</field-2>
+        <field-3>required-log-markers</field-3>
+      </expected-verification-delta-fields>
+    </ExecutionPacket>
+  </ExecutionPacketTemplate>
+
+  <GraphDeltaTemplate>
+    <GraphDelta module="M-EXAMPLE">
+      <imports-added>
+        <import-1>M-CONFIG</import-1>
+      </imports-added>
+      <imports-removed />
+      <exports-added>
+        <export-1>example_function</export-1>
+      </exports-added>
+      <exports-removed />
+      <annotations-added>
+        <annotation-1>&lt;fn-example_function PURPOSE="Example" /&gt;</annotation-1>
+      </annotations-removed />
+      <cross-links-added>
+        <CrossLink from="M-EXAMPLE" to="M-CONFIG" relation="reads-config" />
+      </cross-links-added>
+      <cross-links-removed />
+    </GraphDelta>
+  </GraphDeltaTemplate>
+
+  <VerificationDeltaTemplate>
+    <VerificationDelta module="M-EXAMPLE">
+      <test-files-added>
+        <file-1>tests/test_example.py</file-1>
+      </test-files-added>
+      <test-files-removed />
+      <module-checks>
+        <command-1>pytest tests/test_example.py -v</command-1>
+      </module-checks>
+      <required-log-markers>
+        <marker-1>[Example][fn][BLOCK_NAME]</marker-1>
+      </required-log-markers>
+    </VerificationDelta>
+  </VerificationDeltaTemplate>
+
+  <FailurePacketTemplate>
+    <FailurePacket>
+      <scenario>Example failure scenario</scenario>
+      <contract-ref>M-EXAMPLE / V-M-EXAMPLE / scenario-1</contract-ref>
+      <expected-evidence>
+        <marker-1>[Example][fn][BLOCK_NAME]</marker-1>
+      </expected-evidence>
+      <observed-evidence>
+        <log-1>Error log</log-1>
+      </observed-evidence>
+      <first-divergent-block>BLOCK_NAME</first-divergent-block>
+      <suggested-next-action>Fix the block</suggested-next-action>
+    </FailurePacket>
+  </FailurePacketTemplate>
+</OperationalPackets>

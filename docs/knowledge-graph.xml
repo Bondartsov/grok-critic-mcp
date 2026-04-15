@@ -1,0 +1,60 @@
+<KnowledgeGraph>
+  <Project NAME="grok-critic-mcp" VERSION="0.2.0">
+    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, Responses API</keywords>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. Tool critic_review для критического ревью кода.</annotation>
+
+    <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="planned">
+      <purpose>Загрузка и валидация конфигурации: API ключ, base URL, timeout, default agent_count</purpose>
+      <path>src/grok_critic/config.py</path>
+      <depends>none</depends>
+      <verification-ref>V-M-CONFIG</verification-ref>
+      <annotations>
+        <fn-load_config PURPOSE="Load config from env vars and .env file" />
+        <type-AppConfig PURPOSE="Pydantic model for configuration with validation" />
+        <export-config PURPOSE="Singleton config instance" />
+      </annotations>
+    </M-CONFIG>
+
+    <M-API NAME="APIClient" TYPE="INTEGRATION" STATUS="planned">
+      <purpose>HTTP клиент для Polza.AI Responses API. Формирует и отправляет запросы к grok-4.20-multi-agent.</purpose>
+      <path>src/grok_critic/api_client.py</path>
+      <depends>M-CONFIG</depends>
+      <verification-ref>V-M-API</verification-ref>
+      <annotations>
+        <fn-call_responses_api PURPOSE="Send request to /v1/responses endpoint with proper format" />
+        <fn-parse_response PURPOSE="Extract text output from Responses API response" />
+        <fn-handle_api_error PURPOSE="Map API errors to user-friendly messages" />
+      </annotations>
+      <CrossLink from="M-API" to="M-CONFIG" relation="reads-api-key-and-base-url" />
+    </M-API>
+
+    <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" STATUS="planned">
+      <purpose>Промпт-инжиниринг и логика критического ревью. Формирует system prompt и структурирует ответ.</purpose>
+      <path>src/grok_critic/critic.py</path>
+      <depends>M-API, M-CONFIG</depends>
+      <verification-ref>V-M-CRITIC</verification-ref>
+      <annotations>
+        <fn-build_critique_prompt PURPOSE="Build structured prompt for code/architecture review" />
+        <fn-structured_review PURPOSE="Run full review pipeline: prompt → API → parse → return" />
+        <fn-health_check PURPOSE="Verify API connectivity and configuration" />
+      </annotations>
+      <CrossLink from="M-CRITIC" to="M-API" relation="calls-responses-api" />
+      <CrossLink from="M-CRITIC" to="M-CONFIG" relation="reads-defaults" />
+    </M-CRITIC>
+
+    <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" STATUS="planned">
+      <purpose>MCP сервер на FastMCP. Регистрирует tools и запускает stdio transport.</purpose>
+      <path>src/grok_critic/server.py</path>
+      <depends>M-CRITIC, M-CONFIG</depends>
+      <verification-ref>V-M-SERVER</verification-ref>
+      <annotations>
+        <tool-critic_review PURPOSE="MCP tool for critical code/architecture review" />
+        <tool-health_check PURPOSE="MCP tool for connectivity verification" />
+        <fn-main PURPOSE="Entry point: create server and run stdio" />
+      </annotations>
+      <CrossLink from="M-SERVER" to="M-CRITIC" relation="delegates-review-logic" />
+      <CrossLink from="M-SERVER" to="M-CONFIG" relation="reads-config" />
+    </M-SERVER>
+
+  </Project>
+</KnowledgeGraph>
