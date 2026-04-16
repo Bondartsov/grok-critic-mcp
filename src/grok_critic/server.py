@@ -1,7 +1,7 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.7.0
+# VERSION: 1.8.0
 # START_MODULE_CONTRACT
-#   PURPOSE: FastMCP server exposing critic_review, critic_followup and health_check tools
+#   PURPOSE: FastMCP server exposing 8 tools for code review, architecture, security, admin
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
 #   DEPENDS: M-CRITIC, M-CONFIG, mcp
 #   LINKS: M-SERVER
@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import subprocess
+from functools import wraps
 from pathlib import Path
+from typing import Any, Callable
 
 from mcp.server.fastmcp import FastMCP
 
@@ -70,7 +71,7 @@ def _format_result(result) -> str:
 # END_BLOCK_FORMAT_METADATA
 
 
-# START_BLOCK_READ_FILE
+# START_BLOCK_HELPERS
 def _read_file_content(file_path: str) -> tuple[str, str | None]:
     """Read file content for review. Returns (content, error_message)."""
     try:
@@ -87,7 +88,62 @@ def _read_file_content(file_path: str) -> tuple[str, str | None]:
         return "", f"Cannot read file: {exc}"
 
 
-# END_BLOCK_READ_FILE
+def _validate_agent_count(agent_count: int | None) -> int | None:
+    """Clamp agent_count to valid range: 1-64."""
+    if agent_count is None:
+        return None
+    if agent_count < 1:
+        return 1
+    if agent_count > 64:
+        return 64
+    return agent_count
+
+
+# END_BLOCK_HELPERS
+
+
+# START_BLOCK_DECORATOR
+def _review_tool(tool_name: str) -> Callable:
+    """Decorator: logging + try/except + _format_result for review tools.
+
+    Eliminates boilerplate across critic_review, architecture_review, security_audit.
+    Wrapped function returns a CritiqueResult; decorator handles formatting and errors.
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> str:
+            # Validate agent_count
+            if "agent_count" in kwargs:
+                kwargs["agent_count"] = _validate_agent_count(kwargs.get("agent_count"))
+
+            # Resolve file_path → content
+            file_path = kwargs.pop("file_path", None)
+            if file_path:
+                file_content, err = _read_file_content(file_path)
+                if err:
+                    return f"❌ {err}"
+                kwargs["content"] = file_content
+                if kwargs.get("context") is None:
+                    kwargs["context"] = f"File: {file_path}"
+
+            content_len = len(kwargs.get("content", ""))
+            agent_count = kwargs.get("agent_count")
+            logger.info(
+                "[Server][%s][TOOL_CALL] content_len=%d agent_count=%s",
+                tool_name, content_len, agent_count,
+            )
+
+            try:
+                result = await func(*args, **kwargs)
+                return _format_result(result)
+            except Exception as exc:
+                logger.exception("[Server][%s][ERROR]", tool_name)
+                return f"❌ {tool_name} failed: {exc}"
+        return wrapper
+    return decorator
+
+
+# END_BLOCK_DECORATOR
 
 
 # START_BLOCK_SERVER_INIT
@@ -99,12 +155,12 @@ server = FastMCP("grok-critic")
 
 # START_BLOCK_TOOL_CRITIC_REVIEW
 @server.tool()
+@_review_tool("critic_review")
 async def critic_review(
     content: str,
     context: str | None = None,
     agent_count: int | None = None,
     focus_areas: str | None = None,
-    file_path: str | None = None,
 ) -> str:
     """Perform a critical code review using grok-4.20-multi-agent.
 
@@ -113,34 +169,17 @@ async def critic_review(
         context: Optional context about the code (project, language, purpose).
         agent_count: Number of reasoning agents (4=low, 16=high effort). Defaults to config value.
         focus_areas: Comma-separated focus areas (e.g. 'security,performance').
-        file_path: Optional path to a file to review (server reads it, overrides content).
     """
-    if file_path:
-        file_content, err = _read_file_content(file_path)
-        if err:
-            return f"❌ {err}"
-        content = file_content
-        if context is None:
-            context = f"File: {file_path}"
-
-    logger.info(
-        "[Server][critic_review][TOOL_CALL] content_len=%d agent_count=%s",
-        len(content),
-        agent_count,
-    )
-
     areas: list[str] | None = None
     if focus_areas:
         areas = [a.strip() for a in focus_areas.split(",") if a.strip()]
 
-    result = await structured_review(
+    return await structured_review(
         content=content,
         context=context,
         agent_count=agent_count if agent_count is not None else config.agent_count,
         focus_areas=areas,
     )
-
-    return _format_result(result)
 
 
 # END_BLOCK_TOOL_CRITIC_REVIEW
@@ -148,6 +187,7 @@ async def critic_review(
 
 # START_BLOCK_TOOL_CRITIC_FOLLOWUP
 @server.tool()
+@_review_tool("critic_followup")
 async def critic_followup(
     previous_review: str,
     question: str,
@@ -160,19 +200,12 @@ async def critic_followup(
         question: Your follow-up question.
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
     """
-    logger.info(
-        "[Server][critic_followup][TOOL_CALL] prev_len=%d question_len=%d",
-        len(previous_review),
-        len(question),
-    )
-
-    result = await followup(
+    # followup uses 'previous_review' as content-like param
+    return await followup(
         previous_review=previous_review,
         question=question,
         agent_count=agent_count,
     )
-
-    return _format_result(result)
 
 
 # END_BLOCK_TOOL_CRITIC_FOLLOWUP
@@ -183,18 +216,22 @@ async def critic_followup(
 async def check_health() -> str:
     """Check the health of the grok-critic MCP server and configuration."""
     logger.info("[Server][check_health][TOOL_CALL] Health check requested")
-    result = await health_check()
-    lines = [f"Status: {result['status']}"]
-    lines.append(f"Model: {result['model']}")
-    lines.append(f"Base URL: {result['base_url']}")
-    if result["issues"]:
-        lines.append(f"Issues: {', '.join(result['issues'])}")
-    if "pricing" in result:
-        pricing = result["pricing"]
-        lines.append(f"Pricing: input=${pricing['input_per_1m']}/1M output=${pricing['output_per_1m']}/1M")
-    if "balance_rub" in result:
-        lines.append(f"Balance: {result['balance_rub']:.2f} ₽")
-    return "\n".join(lines)
+    try:
+        result = await health_check()
+        lines = [f"Status: {result['status']}"]
+        lines.append(f"Model: {result['model']}")
+        lines.append(f"Base URL: {result['base_url']}")
+        if result["issues"]:
+            lines.append(f"Issues: {', '.join(result['issues'])}")
+        if "pricing" in result:
+            pricing = result["pricing"]
+            lines.append(f"Pricing: input=${pricing['input_per_1m']}/1M output=${pricing['output_per_1m']}/1M")
+        if "balance_rub" in result:
+            lines.append(f"Balance: {result['balance_rub']:.2f} ₽")
+        return "\n".join(lines)
+    except Exception as exc:
+        logger.exception("[Server][check_health][ERROR]")
+        return f"❌ Health check failed: {exc}"
 
 
 # END_BLOCK_TOOL_HEALTH_CHECK
@@ -202,11 +239,11 @@ async def check_health() -> str:
 
 # START_BLOCK_TOOL_ARCHITECTURE_REVIEW
 @server.tool()
+@_review_tool("architecture_review")
 async def architecture_review(
     content: str,
     context: str | None = None,
     agent_count: int | None = None,
-    file_path: str | None = None,
 ) -> str:
     """Specialized architecture review: patterns, dependencies, scalability, risks.
 
@@ -214,29 +251,12 @@ async def architecture_review(
         content: Architecture description, diagram, or code to review.
         context: Optional project context (tech stack, constraints, team size).
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
-        file_path: Optional path to a file to review (server reads it, overrides content).
     """
-    if file_path:
-        file_content, err = _read_file_content(file_path)
-        if err:
-            return f"❌ {err}"
-        content = file_content
-        if context is None:
-            context = f"File: {file_path}"
-
-    logger.info(
-        "[Server][architecture_review][TOOL_CALL] content_len=%d agent_count=%s",
-        len(content),
-        agent_count,
-    )
-
-    result = await do_architecture_review(
+    return await do_architecture_review(
         content=content,
         context=context,
         agent_count=agent_count,
     )
-
-    return _format_result(result)
 
 
 # END_BLOCK_TOOL_ARCHITECTURE_REVIEW
@@ -244,11 +264,11 @@ async def architecture_review(
 
 # START_BLOCK_TOOL_SECURITY_AUDIT
 @server.tool()
+@_review_tool("security_audit")
 async def security_audit(
     content: str,
     context: str | None = None,
     agent_count: int | None = None,
-    file_path: str | None = None,
 ) -> str:
     """Specialized security audit: injection, auth, secrets, infrastructure.
 
@@ -256,29 +276,12 @@ async def security_audit(
         content: Code or configuration to audit for security vulnerabilities.
         context: Optional context (framework, deployment, threat model).
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
-        file_path: Optional path to a file to audit (server reads it, overrides content).
     """
-    if file_path:
-        file_content, err = _read_file_content(file_path)
-        if err:
-            return f"❌ {err}"
-        content = file_content
-        if context is None:
-            context = f"File: {file_path}"
-
-    logger.info(
-        "[Server][security_audit][TOOL_CALL] content_len=%d agent_count=%s",
-        len(content),
-        agent_count,
-    )
-
-    result = await do_security_audit(
+    return await do_security_audit(
         content=content,
         context=context,
         agent_count=agent_count,
     )
-
-    return _format_result(result)
 
 
 # END_BLOCK_TOOL_SECURITY_AUDIT
@@ -310,7 +313,7 @@ async def reload_config_tool() -> str:
         ]
         return "\n".join(lines)
     except Exception as exc:
-        logger.error("[Server][reload_config_tool][ERROR] %s", exc)
+        logger.exception("[Server][reload_config_tool][ERROR]")
         return f"❌ Reload failed: {exc}"
 
 
@@ -332,7 +335,7 @@ async def self_update() -> str:
         return "❌ self_update is disabled. Set POLZA_ALLOW_SELF_UPDATE=true in .env and reload_config."
 
     lines: list[str] = ["🔄 Self-update started..."]
-    repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    repo_dir = str(Path(__file__).resolve().parents[2])
 
     # Step 1: git pull
     try:

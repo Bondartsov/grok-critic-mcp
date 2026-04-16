@@ -1,5 +1,5 @@
 # FILE: tests/test_server.py
-# VERSION: 1.1.0
+# VERSION: 1.2.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-SERVER MCP tool registration and invocation
 #   SCOPE: Verify tools are registered, parameters work, calls delegate correctly
@@ -15,11 +15,15 @@ import pytest
 
 from grok_critic.api_client import CritiqueResult
 from grok_critic.server import (
+    _read_file_content,
+    _validate_agent_count,
+    architecture_review,
     check_health,
     critic_followup,
     critic_review,
     reload_config_tool,
     restart_server,
+    security_audit,
     self_update,
     server,
 )
@@ -374,3 +378,148 @@ class TestSelfUpdateTool:
 
 
 # END_BLOCK_SELF_UPDATE_TOOL
+
+
+# START_BLOCK_VALIDATE_AGENT_COUNT
+class TestValidateAgentCount:
+    def test_none_passes_through(self) -> None:
+        assert _validate_agent_count(None) is None
+
+    def test_zero_clamps_to_one(self) -> None:
+        assert _validate_agent_count(0) == 1
+
+    def test_negative_clamps_to_one(self) -> None:
+        assert _validate_agent_count(-5) == 1
+
+    def test_over_64_clamps_to_64(self) -> None:
+        assert _validate_agent_count(100) == 64
+
+    def test_valid_values_pass(self) -> None:
+        assert _validate_agent_count(4) == 4
+        assert _validate_agent_count(16) == 16
+        assert _validate_agent_count(64) == 64
+
+    def test_boundary_values(self) -> None:
+        assert _validate_agent_count(1) == 1
+        assert _validate_agent_count(64) == 64
+
+
+# END_BLOCK_VALIDATE_AGENT_COUNT
+
+
+# START_BLOCK_READ_FILE_CONTENT
+class TestReadFileContent:
+    def test_nonexistent_file(self) -> None:
+        content, err = _read_file_content("/nonexistent/path/file.py")
+        assert content == ""
+        assert "not found" in err.lower() or "not a file" in err.lower()
+
+    def test_empty_file(self, tmp_path) -> None:
+        f = tmp_path / "empty.py"
+        f.write_text("")
+        content, err = _read_file_content(str(f))
+        assert content == ""
+        assert "empty" in err.lower()
+
+    def test_valid_file(self, tmp_path) -> None:
+        f = tmp_path / "code.py"
+        f.write_text("def hello(): pass", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert err is None
+        assert "hello" in content
+
+    def test_directory_path(self, tmp_path) -> None:
+        content, err = _read_file_content(str(tmp_path))
+        assert content == ""
+        assert "not a file" in err.lower()
+
+
+# END_BLOCK_READ_FILE_CONTENT
+
+
+# START_BLOCK_DECORATOR_TESTS
+class TestDecoratorBehavior:
+    async def test_decorator_catches_exception(self) -> None:
+        """Decorator wraps unexpected exceptions into user-friendly error strings."""
+        with patch(
+            "grok_critic.server.structured_review",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("unexpected boom"),
+        ):
+            result = await critic_review(content="code")
+            assert "❌" in result
+            assert "unexpected boom" in result
+
+    async def test_decorator_clamps_agent_count(self) -> None:
+        """Decorator validates and clamps agent_count before passing to critic."""
+        mock = AsyncMock(return_value=CritiqueResult(
+            text="ok", model="m", agent_count=1, effort="low", review_id="rev_1"
+        ))
+        with patch("grok_critic.server.structured_review", new=mock):
+            await critic_review(content="code", agent_count=100)
+            # Decorator clamped 100 → 64, but the underlying function still
+            # receives the clamped value which then goes to structured_review.
+            # structured_review uses config default if None, so we check that
+            # agent_count was clamped (64, not 100).
+            assert mock.call_args.kwargs["agent_count"] == 64
+
+    async def test_decorator_clamps_negative_agent_count(self) -> None:
+        mock = AsyncMock(return_value=CritiqueResult(
+            text="ok", model="m", agent_count=1, effort="low", review_id="rev_1"
+        ))
+        with patch("grok_critic.server.structured_review", new=mock):
+            await critic_review(content="code", agent_count=-1)
+            assert mock.call_args.kwargs["agent_count"] == 1
+
+
+# END_BLOCK_DECORATOR_TESTS
+
+
+# START_BLOCK_ARCHITECTURE_SECURITY_TOOLS
+class TestArchitectureReviewTool:
+    async def test_basic_call(self) -> None:
+        mock_result = CritiqueResult(
+            text="Architecture looks solid",
+            model="x-ai/grok-4.20-multi-agent",
+            agent_count=16,
+            effort="high",
+            input_tokens=200,
+            output_tokens=100,
+            total_tokens=300,
+            cost_usd=0.01,
+            review_id="rev_arch1",
+        )
+        with patch(
+            "grok_critic.server.do_architecture_review",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ):
+            result = await architecture_review(content="microservices diagram")
+            assert "solid" in result
+            assert "rev_arch1" in result
+
+
+class TestSecurityAuditTool:
+    async def test_basic_call(self) -> None:
+        mock_result = CritiqueResult(
+            text="Found 2 SQL injection vulnerabilities",
+            model="x-ai/grok-4.20-multi-agent",
+            agent_count=16,
+            effort="high",
+            input_tokens=150,
+            output_tokens=80,
+            total_tokens=230,
+            cost_usd=0.008,
+            review_id="rev_sec1",
+        )
+        with patch(
+            "grok_critic.server.do_security_audit",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ):
+            result = await security_audit(content="SELECT * FROM users WHERE id=")
+            assert "SQL injection" in result
+            assert "rev_sec1" in result
+
+
+# END_BLOCK_ARCHITECTURE_SECURITY_TOOLS

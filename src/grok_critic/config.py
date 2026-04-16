@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.4.0
+# VERSION: 1.5.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging
@@ -29,11 +29,11 @@ class AppConfig(BaseSettings):
         extra="ignore",
     )
 
-    api_key: str = Field(default="")
+    api_key: str = Field(min_length=1, description="Polza.AI API key (POLZA_API_KEY)")
     base_url: str = Field(default="https://polza.ai/api/v1")
     model: str = Field(default="x-ai/grok-4.20-multi-agent")
-    agent_count: int = Field(default=16)
-    timeout_seconds: int = Field(default=180)
+    agent_count: int = Field(default=16, ge=1, le=64)
+    timeout_seconds: int = Field(default=180, ge=1)
     log_level: str = Field(default="WARNING")
     log_file: str = Field(default="")  # пустой = stderr (MCP stdio не занимается)
     price_input_per_1m: float = Field(default=0.0)

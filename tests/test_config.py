@@ -1,5 +1,5 @@
 # FILE: tests/test_config.py
-# VERSION: 1.1.0
+# VERSION: 1.2.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CONFIG configuration loading and validation
 #   SCOPE: Test env var reading, defaults, log_level validation, price fields
@@ -124,6 +124,80 @@ class TestLogLevelValidation:
 
 
 # END_BLOCK_VALIDATION
+
+
+# START_BLOCK_API_KEY_VALIDATION
+class TestApiKeyValidation:
+    def test_api_key_required(self) -> None:
+        """api_key is mandatory — creating AppConfig without it raises error."""
+        with pytest.raises(Exception):
+            # _make_no_env bypasses .env, so no api_key is available
+            _make_no_env()
+
+    def test_api_key_empty_string_rejected(self) -> None:
+        """Empty string is not valid for api_key (min_length=1)."""
+        with pytest.raises(Exception):
+            _make_no_env(api_key="")
+
+    def test_api_key_valid(self) -> None:
+        """Non-empty api_key is accepted."""
+        cfg = _make_no_env(api_key="pza_test-key-123")
+        assert cfg.api_key == "pza_test-key-123"
+
+
+# END_BLOCK_API_KEY_VALIDATION
+
+
+# START_BLOCK_TIMEOUT_VALIDATION
+class TestTimeoutValidation:
+    def test_timeout_zero_rejected(self) -> None:
+        with pytest.raises(Exception):
+            _make_no_env(api_key="test-key", timeout_seconds=0)
+
+    def test_timeout_negative_rejected(self) -> None:
+        with pytest.raises(Exception):
+            _make_no_env(api_key="test-key", timeout_seconds=-1)
+
+    def test_timeout_minimum_valid(self) -> None:
+        cfg = _make_no_env(api_key="test-key", timeout_seconds=1)
+        assert cfg.timeout_seconds == 1
+
+    def test_timeout_large_value(self) -> None:
+        cfg = _make_no_env(api_key="test-key", timeout_seconds=600)
+        assert cfg.timeout_seconds == 600
+
+
+# END_BLOCK_TIMEOUT_VALIDATION
+
+
+# START_BLOCK_AGENT_COUNT_VALIDATION
+class TestAgentCountValidation:
+    def test_agent_count_zero_rejected(self) -> None:
+        with pytest.raises(Exception):
+            _make_no_env(api_key="test-key", agent_count=0)
+
+    def test_agent_count_negative_rejected(self) -> None:
+        with pytest.raises(Exception):
+            _make_no_env(api_key="test-key", agent_count=-1)
+
+    def test_agent_count_too_large_rejected(self) -> None:
+        with pytest.raises(Exception):
+            _make_no_env(api_key="test-key", agent_count=65)
+
+    def test_agent_count_minimum_valid(self) -> None:
+        cfg = _make_no_env(api_key="test-key", agent_count=1)
+        assert cfg.agent_count == 1
+
+    def test_agent_count_maximum_valid(self) -> None:
+        cfg = _make_no_env(api_key="test-key", agent_count=64)
+        assert cfg.agent_count == 64
+
+    def test_agent_count_16_valid(self) -> None:
+        cfg = _make_no_env(api_key="test-key", agent_count=16)
+        assert cfg.agent_count == 16
+
+
+# END_BLOCK_AGENT_COUNT_VALIDATION
 
 
 # START_BLOCK_RELOAD_CONFIG
