@@ -320,8 +320,10 @@ class TestRestartServerTool:
 # START_BLOCK_SELF_UPDATE_TOOL
 class TestSelfUpdateTool:
     async def test_disabled_by_default(self) -> None:
-        result = await self_update()
-        assert "disabled" in result
+        with patch("grok_critic.server.config") as mock_cfg:
+            mock_cfg.allow_self_update = False
+            result = await self_update()
+            assert "disabled" in result
 
     async def test_already_up_to_date(self) -> None:
         mock_proc = AsyncMock()
