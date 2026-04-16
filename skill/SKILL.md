@@ -75,7 +75,7 @@ grok-critic_critic_followup(
 grok-critic_check_health()
 ```
 
-Без параметров. Показывает статус, модель, pricing.
+Без параметров. Показывает статус, модель, pricing и **баланс в ₽** (запрашивает Polza.AI Balance API).
 
 ### 6. `reload_config_tool` — горячая перезагрузка .env
 
@@ -93,6 +93,14 @@ grok-critic_restart_server(reason: str | None)
 
 Жёсткий выход процесса. MCP-клиент автоматически перезапустит сервер.
 
+### 8. `self_update` — автообновление с GitHub
+
+```
+grok-critic_self_update()
+```
+
+Без параметров. Делает `git pull` + `pip install -e .` + `os._exit(0)`. MCP-клиент автоматически перезапустит сервер с новым кодом. Использовать когда новая версия запушена в GitHub.
+
 ## Agent Count Guide
 
 | Agents | Effort | Timeout | When to use |
@@ -102,6 +110,8 @@ grok-critic_restart_server(reason: str | None)
 
 Default: 16 (из `.env`).
 
+**Validation:** `agent_count` автоматически clamps к диапазону 1-64. Некорректные значения (0, -5, 100) будут приведены к границам. Config-level валидация (pydantic): `ge=1, le=64`.
+
 ## Response Format
 
 Каждый ответ содержит metadata footer:
@@ -109,10 +119,27 @@ Default: 16 (из `.env`).
 ```
 ---
 📊 Metadata: model=x-ai/grok-4.20-multi-agent | agents=16 | effort=high
-📈 Tokens: input=18231 output=15434 total=33665
-💰 Cost: $0.1493
+📈 Tokens: input=18 231 output=15 434 total=33 665
+💾 Cached: 18 000/18 231 (99%)
+💰 Cost: 1.23 ₽ | $0.1493
 🏷️ Review ID: rev_1f866fc571eb
 ```
+
+- **Tokens** — с thin-space разделителями (1 234 567)
+- **Cached** — показывается только если есть кешированные токены (Polza.AI автоматически кеширует system prompt, чтение из кеша в 4 раза дешевле)
+- **Cost** — сначала реальная стоимость в ₽ (из Polza.AI API `usage.cost_rub`), затем расчётная в $ (по ценам из конфига)
+
+## Error Messages
+
+Ошибки парсятся из тела ответа Polza.AI (`{error: {code, message}}`):
+
+| Код | Пример сообщения |
+|-----|-----------------|
+| 401 | `Auth error: API key invalid` |
+| 402 | `Payment required: Недостаточно средств на балансе` |
+| 429 | `Rate limited: Too many requests for grok-4.20-multi-agent` |
+| 502 | `Provider down: xAI provider unavailable` |
+| 503 | `No providers: No providers available` |
 
 ## Workflow Examples
 
@@ -139,9 +166,17 @@ Default: 16 (из `.env`).
 3. Все 🟡 HIGH → исправить перед production
 ```
 
+### Update to latest version
+
+```
+1. self_update() — подтянет новый код с GitHub и перезапустит
+```
+
 ## Cost Awareness
 
 При $2.6/$6.6 за 1M токенов типичный вызов с 16 агентами стоит $0.10–0.25. Не вызывать критика для тривиальных задач (изменение 5 строк, форматирование, rename).
+
+**Кеширование:** Polza.AI автоматически кеширует system prompt через `prompt_cache_key`. Повторные вызовы с тем же system prompt обходятся дешевле (cached tokens ~0.25x стоимости).
 
 ## Rules
 
@@ -151,3 +186,4 @@ Default: 16 (из `.env`).
 4. **Если** критик нашёл 🔴 CRITICAL → исправь ПЕРЕД продолжением
 5. **Всегда отвечай критику через `critic_followup`** — если не согласен с замечанием, приведи аргументы. Если есть контекст который критик не учёл — объясни. Если критик переоценил проблему — оспорь. Критик пересматривает оценку при сильных аргументах. **НЕ глотай замечания молча.**
 6. **Никогда** не вызывай критика для кода, который ты сам только что сгенерировал и ещё не проверил — сначала прочитай что написал
+7. **Следи за балансом** — `check_health` показывает баланс в ₽. Если низкий — предупреди пользователя.

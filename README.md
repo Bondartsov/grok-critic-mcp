@@ -427,10 +427,10 @@ grok-critic-mcp/
 
 | Module | PURPOSE |
 |--------|---------|
-| `config.py` | Загрузка и валидация конфигурации из `.env` через pydantic-settings. Hot reload. |
+| `config.py` | Загрузка и валидация конфигурации из `.env` через pydantic-settings. **api_key обязательный** (min_length=1), agent_count (ge=1, le=64), timeout_seconds (ge=1). Hot reload. |
 | `api_client.py` | Async HTTP-клиент к Polza.AI Responses API. Retry, dynamic timeout, cost calculation. |
 | `critic.py` | System prompts (3 специализированных), orchestration functions, health check. |
-| `server.py` | FastMCP сервер с 8 инструментами. Parameter parsing, metadata footer formatting, self-update. |
+| `server.py` | FastMCP сервер с 8 инструментами. **Декоратор `_review_tool`** (DRY, try/except, agent_count validation), `_validate_agent_count` (clamp 1-64), `_read_file_content`, metadata footer formatting, self-update. |
 
 ### Ключевые технические решения
 
@@ -459,7 +459,7 @@ python -m pytest tests/ -v
 python -m pytest tests/ -v --cov=grok_critic --cov-report=term-missing
 ```
 
-**96 тестов** покрывают: config defaults и env overrides, effort mapping, response parsing, usage extraction (включая cost_rub и cached_tokens), cost calculation, retry logic, persistent client, JSON decode error handling, error body parsing (402/502/503), tool registration (8 tools), parameter parsing, metadata formatting с разделителями, hot reload, server restart, self_update flow, health check с balance API.
+**127 тестов** покрывают: config defaults, env overrides, **config validation** (api_key обязательный, agent_count ge=1/le=64, timeout_seconds ge=1), effort mapping, response parsing, usage extraction (включая cost_rub и cached_tokens), cost calculation, retry logic, persistent client, JSON decode error handling, error body parsing (402/502/503), tool registration (8 tools), parameter parsing, **decorator `_review_tool`** (error handling, agent_count clamping), metadata formatting с разделителями, hot reload, server restart, self_update flow, health check с balance API, **`_validate_agent_count`** (clamping 1-64), **`_read_file_content`**.
 
 ---
 
