@@ -12,6 +12,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import SecretStr
 
 from grok_critic.api_client import CritiqueResult
 from grok_critic.server import (
@@ -268,7 +269,7 @@ class TestReloadConfigTool:
         with patch(
             "grok_critic.server.reload_config",
             return_value=type("Cfg", (), {
-                "api_key": "pza_testkey123",
+                "api_key": SecretStr("pza_testkey123"),
                 "base_url": "https://polza.ai/api/v1",
                 "model": "x-ai/grok-4.20-multi-agent",
                 "agent_count": 16,

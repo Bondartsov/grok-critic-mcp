@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.6.0
+# VERSION: 1.7.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
@@ -186,7 +186,9 @@ async def health_check() -> dict:
 
     issues: list[str] = []
 
-    if not config.api_key:
+    # SecretStr is never empty (min_length=1), but guard against edge cases
+    api_key_value = config.api_key.get_secret_value()
+    if not api_key_value:
         issues.append("POLZA_API_KEY is not set")
 
     healthy = len(issues) == 0
@@ -204,12 +206,12 @@ async def health_check() -> dict:
         }
 
     # Query Polza.AI balance API
-    if config.api_key:
+    if api_key_value:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     f"{config.base_url}/balance",
-                    headers={"Authorization": f"Bearer {config.api_key}"},
+                    headers={"Authorization": f"Bearer {api_key_value}"},
                 )
                 if resp.status_code == 200:
                     data = resp.json()

@@ -71,7 +71,7 @@ class TestEnvOverride:
     def test_api_key_from_env(self) -> None:
         with patch.dict(os.environ, {"POLZA_API_KEY": "env-key-123"}):
             cfg = AppConfig()
-            assert cfg.api_key == "env-key-123"
+            assert cfg.api_key.get_secret_value() == "env-key-123"
 
     def test_base_url_override(self) -> None:
         with patch.dict(os.environ, {"POLZA_BASE_URL": "http://localhost:8080"}):
@@ -142,7 +142,7 @@ class TestApiKeyValidation:
     def test_api_key_valid(self) -> None:
         """Non-empty api_key is accepted."""
         cfg = _make_no_env(api_key="pza_test-key-123")
-        assert cfg.api_key == "pza_test-key-123"
+        assert cfg.api_key.get_secret_value() == "pza_test-key-123"
 
 
 # END_BLOCK_API_KEY_VALIDATION

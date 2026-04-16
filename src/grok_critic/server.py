@@ -300,9 +300,11 @@ async def reload_config_tool() -> str:
         new_cfg = reload_config()
         # Close stale HTTP client (it may have old base_url / timeout).
         await close_client()
+        api_key_val = new_cfg.api_key.get_secret_value()
+        masked_key = f"***{api_key_val[-4:]}" if len(api_key_val) > 4 else "(not set)"
         lines = [
             "✅ Config reloaded from .env",
-            f"  api_key: {'***' + new_cfg.api_key[-4:] if len(new_cfg.api_key) > 4 else '(not set)'}",
+            f"  api_key: {masked_key}",
             f"  base_url: {new_cfg.base_url}",
             f"  model: {new_cfg.model}",
             f"  agent_count: {new_cfg.agent_count}",

@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.5.0
+# VERSION: 1.6.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging
@@ -14,7 +14,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger("grok-critic.config")
@@ -29,7 +29,7 @@ class AppConfig(BaseSettings):
         extra="ignore",
     )
 
-    api_key: str = Field(min_length=1, description="Polza.AI API key (POLZA_API_KEY)")
+    api_key: SecretStr = Field(min_length=1, description="Polza.AI API key (POLZA_API_KEY)")
     base_url: str = Field(default="https://polza.ai/api/v1")
     model: str = Field(default="x-ai/grok-4.20-multi-agent")
     agent_count: int = Field(default=16, ge=1, le=64)

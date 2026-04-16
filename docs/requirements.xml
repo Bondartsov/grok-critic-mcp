@@ -1,7 +1,7 @@
-<RequirementsAnalysis VERSION="1.5.2">
+<RequirementsAnalysis VERSION="1.8.0">
   <Project>
     <name>grok-critic-mcp</name>
-    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 7 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server. Используется как субагент "Критик" в Kilo Code.</annotation>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 8 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update. SecretStr для api_key. Декоратор _review_tool для DRY. Используется как субагент "Критик" в Kilo Code.</annotation>
     <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP</keywords>
   </Project>
 
@@ -117,7 +117,7 @@
 
   <Constraints>
     <constraint-1>grok-4.20-multi-agent НЕ поддерживает Chat Completions API — только Responses API (/v1/responses).</constraint-1>
-    <constraint-2>API ключ Polza.AI хранится в env variable POLZA_API_KEY или в .env файле.</constraint-2>
+    <constraint-2>API ключ Polza.AI хранится в env variable POLZA_API_KEY или в .env файле. Используется SecretStr для защиты от случайного логирования.</constraint-2>
     <constraint-3>Ответ может занимать до 5 минут (16 агентов) — нужен адекватный timeout.</constraint-3>
     <constraint-4>Стоимость: $2.6/$6.6 за 1M токенов (input/output). 16 агентов потребляют значительно больше токенов.</constraint-4>
     <constraint-5>MCP сервер запускается через pip install -e . как local MCP server в kilo.json.</constraint-5>

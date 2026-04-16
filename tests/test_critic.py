@@ -12,6 +12,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import SecretStr
 
 from grok_critic.api_client import CritiqueResult
 from grok_critic.critic import (
@@ -214,7 +215,7 @@ class TestHealthCheck:
 
     async def test_healthy_when_key_set(self, mock_balance) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
-            mock_cfg.api_key = "valid-key"
+            mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
             mock_cfg.price_input_per_1m = 0.0
@@ -226,7 +227,7 @@ class TestHealthCheck:
 
     async def test_degraded_when_no_key(self) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
-            mock_cfg.api_key = ""
+            mock_cfg.api_key = SecretStr("")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
             mock_cfg.price_input_per_1m = 0.0
@@ -237,7 +238,7 @@ class TestHealthCheck:
 
     async def test_pricing_info_when_set(self, mock_balance) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
-            mock_cfg.api_key = "valid-key"
+            mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
             mock_cfg.price_input_per_1m = 2.6
@@ -249,7 +250,7 @@ class TestHealthCheck:
 
     async def test_no_pricing_when_zero(self, mock_balance) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
-            mock_cfg.api_key = "valid-key"
+            mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
             mock_cfg.price_input_per_1m = 0.0

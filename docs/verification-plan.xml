@@ -1,8 +1,8 @@
-<VerificationPlan VERSION="1.5.2">
+<VerificationPlan VERSION="1.8.0">
   <GlobalPolicy>
     <log-format>[Module][function][BLOCK_NAME] message</log-format>
     <deterministic-first>true</deterministic-first>
-    <module-level-focus>Fast deterministic checks with mocked HTTP responses (85 tests total)</module-level-focus>
+    <module-level-focus>Fast deterministic checks with mocked HTTP responses (127 tests total)</module-level-focus>
     <wave-level-focus>Integration between modules with realistic mock data</wave-level-focus>
     <phase-level-focus>Full pipeline from MCP tool call to response, including edge cases</phase-level-focus>
     <redaction>Never log API keys or full request/response payloads.</redaction>
@@ -66,6 +66,21 @@
       <scenario>Kilo Agent вызывает restart_server</scenario>
       <expected-outcome>Процесс завершается через os._exit(0), MCP клиент auto-restart</expected-outcome>
     </VF-009>
+
+    <VF-010 NAME="SecretStrProtection" PRIORITY="high">
+      <scenario>API ключ хранится как SecretStr — проверяется что ключ не утекает через repr/str</scenario>
+      <expected-outcome>config.api_key возвращает SecretStr('**********'), только get_secret_value() даёт реальный ключ</expected-outcome>
+    </VF-010>
+
+    <VF-011 NAME="ConfigValidation" PRIORITY="high">
+      <scenario>Config валидирует agent_count (1-64), timeout_seconds (ge=1), api_key (min_length=1)</scenario>
+      <expected-outcome>Pydantic rejects invalid values: agent_count=0, timeout=-1, api_key=""</expected-outcome>
+    </VF-011>
+
+    <VF-012 NAME="DecoratorAgentCountClamping" PRIORITY="medium">
+      <scenario>_review_tool decorator clamps agent_count: -5→1, 0→1, 100→64</scenario>
+      <expected-outcome>Decorator validates and clamps before passing to critic functions</expected-outcome>
+    </VF-012>
   </CriticalFlows>
 
   <ModuleVerification>
@@ -82,6 +97,11 @@
         <scenario-3 kind="success">Default values applied correctly (agent_count=16, timeout=300, log_level=INFO)</scenario-3>
         <scenario-4 kind="success">reload_config picks up new .env values</scenario-4>
         <scenario-5 kind="success">Price fields loaded from POLZA_PRICE_INPUT_PER_1M / POLZA_PRICE_OUTPUT_PER_1M</scenario-5>
+        <scenario-6 kind="failure">api_key is SecretStr — empty string rejected (min_length=1)</scenario-6>
+        <scenario-7 kind="failure">agent_count=0 rejected (ge=1)</scenario-7>
+        <scenario-8 kind="failure">agent_count=65 rejected (le=64)</scenario-8>
+        <scenario-9 kind="failure">timeout_seconds=0 rejected (ge=1)</scenario-9>
+        <scenario-10 kind="success">api_key accessible via get_secret_value() only</scenario-10>
       </scenarios>
     </V-M-CONFIG>
 
@@ -144,7 +164,11 @@
         <scenario-7 kind="success">restart_server calls os._exit(0)</scenario-7>
         <scenario-8 kind="success">_format_result adds metadata footer (model, agents, tokens, cost, review_id)</scenario-8>
         <scenario-9 kind="success">_format_result handles errors gracefully</scenario-9>
-        <scenario-10 kind="success">Total 7 tools registered</scenario-10>
+        <scenario-10 kind="success">Total 8 tools registered</scenario-10>
+        <scenario-11 kind="success">_review_tool decorator catches exceptions and returns user-friendly errors</scenario-11>
+        <scenario-12 kind="success">_validate_agent_count clamps: 0→1, -5→1, 100→64</scenario-12>
+        <scenario-13 kind="success">_read_file_content handles missing/empty/directory paths</scenario-13>
+        <scenario-14 kind="success">reload_config_tool uses get_secret_value() for masked display</scenario-14>
       </scenarios>
     </V-M-SERVER>
   </ModuleVerification>
@@ -207,11 +231,22 @@
         <command-1>pytest tests/ -v</command-1>
       </commands>
       <required-evidence>
-        <evidence-1>85/85 tests pass on both Windows and VM</evidence-1>
+        <evidence-1>127/127 tests pass on both Windows and VM</evidence-1>
         <evidence-2>GitHub repo up to date</evidence-2>
         <evidence-3>GRACE artifacts synced with code</evidence-3>
       </required-evidence>
     </Gate-Phase-6>
+
+    <Gate-Phase-7 PHASE="Phase-7">
+      <goal>Security hardening, DRY decorator, config validations validated</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+      </commands>
+      <required-evidence>
+        <evidence-1>127/127 tests pass including SecretStr, config validation, decorator tests</evidence-1>
+        <evidence-2>api_key never appears in logs or repr output</evidence-2>
+      </required-evidence>
+    </Gate-Phase-7>
   </PhaseGates>
 
   <FailurePackets>

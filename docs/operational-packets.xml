@@ -1,4 +1,4 @@
-<OperationalPackets VERSION="1.5.2">
+<OperationalPackets VERSION="1.8.0">
   <ExecutionPacketTemplate>
     <ExecutionPacket>
       <module-id>M-EXAMPLE</module-id>
@@ -15,7 +15,7 @@ Planned module contract excerpt goes here.
 Knowledge graph entry excerpt goes here.
       ]]></graph-entry-excerpt>
       <dependency-contract-summaries>
-        <dependency-1 module="M-CONFIG">Pydantic Settings model with env_prefix=POLZA_, fields: api_key, base_url, model, default_agent_count, timeout_seconds, log_level, price_input_per_1m, price_output_per_1m.</dependency-1>
+        <dependency-1 module="M-CONFIG">Pydantic Settings model with env_prefix=POLZA_, fields: api_key (SecretStr, min_length=1), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, price_input_per_1m, price_output_per_1m.</dependency-1>
         <dependency-2 module="M-API">ResponsesClient with persistent AsyncClient, retry logic, dynamic timeout, MAX_CONTENT_CHARS, CritiqueResult dataclass.</dependency-2>
         <dependency-3 module="M-CRITIC">_perform_review DRY function, 3 system prompts, structured_review, do_architecture_review, do_security_audit, followup, health_check.</dependency-3>
       </dependency-contract-summaries>

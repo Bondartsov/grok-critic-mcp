@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.7.0
+# VERSION: 1.8.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
@@ -171,7 +171,7 @@ async def close_client() -> None:
 class ResponsesClient:
     def __init__(self) -> None:
         self._base_url = config.base_url
-        self._api_key = config.api_key
+        self._api_key = config.api_key.get_secret_value()
         self._model = config.model
         self._timeout_seconds = config.timeout_seconds
         logger.info(

@@ -1,6 +1,6 @@
-<DevelopmentPlan VERSION="1.5.2">
+<DevelopmentPlan VERSION="1.8.0">
   <ArchitectureNotes>
-    <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 7 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart.</objective>
+    <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 8 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart, self-update.</objective>
     <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>
     <resolved-risk-1>Polza.AI поддерживает /v1/responses — подтверждено.</resolved-risk-1>
     <risk-2>Timeout — grok multi-agent работает медленно (до 5 мин для 16 агентов). Mitigated: динамический timeout 90s/300s.</risk-2>
@@ -121,12 +121,12 @@
 
     <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" LAYER="3" ORDER="1" STATUS="complete">
       <contract>
-        <purpose>MCP сервер: 7 tools (critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server), unified formatting</purpose>
+      <purpose>MCP сервер: 8 tools (critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update), декоратор _review_tool для DRY, unified formatting</purpose>
         <inputs>
           <param name="stdio" type="MCP transport" />
         </inputs>
         <outputs>
-          <param name="MCP tools" type="critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server" />
+          <param name="MCP tools" type="critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update" />
         </outputs>
         <errors>
           <error code="SERVER_START_FAILED" />
@@ -210,6 +210,17 @@
       <step-4 status="complete">Critic self-review: 8.6/10</step-4>
       <step-5 status="complete">GRACE full-integrity audit and artifact sync</step-5>
     </Phase-6>
+
+    <Phase-7 name="Hardening and DRY Refactoring" status="complete">
+      <goal>Security hardening (SecretStr), DRY decorator, config validations, comprehensive tests</goal>
+      <step-1 module="M-CONFIG" status="complete">api_key → SecretStr (defense-in-depth), min_length=1 (mandatory)</step-1>
+      <step-2 module="M-CONFIG" status="complete">agent_count ge=1 le=64, timeout_seconds ge=1 (pydantic validators)</step-2>
+      <step-3 module="M-SERVER" status="complete">Декоратор _review_tool — DRY для review tools (logging, try/except, agent_count clamping)</step-3>
+      <step-4 module="M-SERVER" status="complete">_validate_agent_count (clamp 1-64), _read_file_content</step-4>
+      <step-5 module="M-API" status="complete">config.api_key.get_secret_value() вместо прямого доступа</step-5>
+      <step-6 module="M-CRITIC" status="complete">health_check: api_key через get_secret_value()</step-6>
+      <step-7 status="complete">28 новых тестов (99 → 127): SecretStr, валидации, декоратор, _validate_agent_count</step-7>
+    </Phase-7>
   </ImplementationOrder>
 
   <ExecutionPolicy>

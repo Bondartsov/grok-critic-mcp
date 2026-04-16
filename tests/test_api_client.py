@@ -13,6 +13,7 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from pydantic import SecretStr
 import pytest
 
 from grok_critic.api_client import (
@@ -228,7 +229,7 @@ class TestResponsesClientCall:
     def client(self) -> ResponsesClient:
         with patch("grok_critic.api_client.config") as mock_cfg:
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.api_key = "test-key"
+            mock_cfg.api_key = SecretStr("test-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
             mock_cfg.price_input_per_1m = 0.0
