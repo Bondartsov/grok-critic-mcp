@@ -1,66 +1,100 @@
 # grok-critic-mcp
 
-**MCP-сервер для глубокого ревью кода, архитектуры и security-аудита через [grok-4.20-multi-agent](https://x.ai) (16 reasoning agents).**
+**MCP-сервер, превращающий модель [`grok-4.20-multi-agent`](https://x.ai) (xAI) во «внешнего критика» для AI-агентов** — глубокое ревью кода, анализ архитектуры и security-аудит по требованию.
 
-Работает через [Polza.AI](https://polza.ai) — OpenAI-совместимый API-прокси к xAI моделям. Использует Responses API (`/v1/responses`), **не** Chat Completions.
+Работает через [Polza.AI](https://polza.ai) — OpenAI-совместимый API-прокси к моделям xAI. Использует **Responses API** (`POST /v1/responses`), **не** Chat Completions.
 
 ---
 
 ## Содержание
 
-- [Что это](#что-это)
+- [Зачем это нужно](#зачем-это-нужно)
 - [Как работает grok-4.20-multi-agent](#как-работает-grok-420-multi-agent)
+- [Модель работы: MCP + Skill + Instructions](#модель-работы-mcp--skill--instructions)
 - [Установка](#установка)
-- [Настройка](#настройка)
-- [MCP-инструменты](#mcp-инструменты)
+- [Конфигурация](#конфигурация)
+- [Регистрация в MCP-клиенте](#регистрация-в-mcp-клиенте)
+- [MCP-инструменты (справочник)](#mcp-инструменты-справочник)
+- [Внутренняя логика запроса](#внутренняя-логика-запроса)
+- [Формат ответа](#формат-ответа)
+- [Правила работы с критиком](#правила-работы-с-критиком)
 - [Kilo Code Skill](#kilo-code-skill)
-- [Интеграция с агентами](#интеграция-с-агентами)
-- [Architecture](#architecture)
-- [Testing](#testing)
-- [Deployment на VM](#deployment-на-vm)
-- [Cost Estimation](#cost-estimation)
+- [Архитектура](#архитектура)
+- [Тестирование](#тестирование)
+- [Деплой на VM](#деплой-на-vm)
+- [Оценка стоимости](#оценка-стоимости)
 - [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
-## Что это
+## Зачем это нужно
 
-MCP (Model Context Protocol) сервер, который предоставляет 8 инструментов для критического анализа кода:
+AI-агент, который пишет код, склонен «глотать» собственные ошибки: он и автор, и единственный ревьюер. `grok-critic-mcp` даёт агенту **второе, независимое и более глубокое мнение** — специально настроенную модель-критика, которую агент обязан вызвать в определённых ситуациях (после существенного кода, при спорной архитектуре, для security-чувствительного кода, при неудачном баг-фиксе).
 
-| Инструмент | Назначение |
-|------------|-----------|
-| `critic_review` | Общее ревью кода (баги, SOLID, DRY, безопасность, производительность) |
-| `architecture_review` | Специализированный анализ архитектуры (паттерны, зависимости, масштабируемость) |
-| `security_audit` | Security-аудит с классификацией 🔴🟡🟠🔵 |
-| `critic_followup` | Уточняющий вопрос по предыдущему ревью |
-| `check_health` | Проверка статуса сервера, API-ключа, pricing, **баланс в ₽** |
-| `reload_config_tool` | Горячая перезагрузка `.env` без перезапуска |
-| `restart_server` | Полный перезапуск процесса (MCP-клиент поднимет автоматически) |
-| `self_update` | Автообновление с GitHub (`git pull` + `pip install` + restart) |
+Ключевая идея: обычное ревью одним LLM — это один проход рассуждения. `grok-4.20-multi-agent` вместо этого запускает **несколько независимых reasoning-агентов параллельно** и сводит их к консенсусу — то есть даёт более полный и устойчивый разбор, чем одиночная модель.
 
-Ответы на русском языке. Каждый ответ содержит metadata footer с моделью, токенами (с разделителями разрядов), кешированными токенами, стоимостью (₽ и $) и review_id.
+Сервер предоставляет агентам-заказчикам (Claude Code, Kilo Code, Cursor, VS Code и др.) единый набор из **8 инструментов** и берёт на себя весь транспорт: HTTP-запросы к Polza.AI, retry, разбор ответа, подсчёт токенов и стоимости, форматирование результата на русском языке.
 
 ---
 
 ## Как работает grok-4.20-multi-agent
 
-`grok-4.20-multi-agent` — модель от xAI с **multi-agent reasoning**. Вместо одного chain-of-thought она запускает несколько параллельных reasoning agents, каждый из которых независимо анализирует проблему, а затем формирует консенсус.
+Модель от xAI с **multi-agent reasoning**. Вместо единственного chain-of-thought она порождает несколько параллельных reasoning-агентов, каждый независимо анализирует задачу, после чего формируется консенсус-ответ.
 
-### Agent count → Effort mapping
+### Число агентов → уровень усилий (effort)
 
-| Agent count | Reasoning effort | Timeout | Когда использовать |
-|-------------|-----------------|---------|-------------------|
-| 4 | `low` | ~90s | Быстрая проверка, мелкие сниппеты |
-| 16 | `high` | ~300s | Полное ревью, архитектура, security |
+| `agent_count` | Reasoning effort | Ориентир по времени | Когда применять                      |
+| :-----------: | :--------------: | :-----------------: | ------------------------------------ |
+|      `4`      |      `low`       |       быстро        | Быстрая проверка, небольшие сниппеты |
+|     `16`      |      `high`      | до нескольких минут | Полное ревью, архитектура, security  |
 
-Официально xAI поддерживает только 4 и 16 агентов. Другие значения маппятся на ближайшее: ≤4 → `low`, >4 → `high`.
+Официально xAI поддерживает два режима усилий. Сервер маппит `agent_count` на effort детерминированной функцией: **`agent_count ≤ 4 → "low"`, иначе `"high"`**. Любое переданное значение сначала клэмпится в диапазон **1–64** (двойной клэмп: pydantic-валидация в конфиге + защитная проверка в сервере).
 
-### API особенности
+### Особенности API
 
-- Работает **только** через Responses API (`POST /v1/responses`), **не** Chat Completions (`/v1/chat/completions`)
-- Запрос содержит `reasoning.effort` (не `reasoning_effort`)
-- Ответ содержит `output_text` или `output[].content[].text`
-- Latency при 16 агентах: 1–3 минуты (в зависимости от объёма кода)
+- Только Responses API (`POST /v1/responses`), **не** `/v1/chat/completions`.
+- В запросе усилия задаются как `reasoning.effort` (объект), а не `reasoning_effort`.
+- В ответе текст лежит в `output_text` либо в `output[].content[].text` (тип `output_text`).
+- Latency при 16 агентах — заметная (обычно 1–3 минуты), поэтому таймауты клиента и сервера подбираются с запасом.
+
+---
+
+## Модель работы: MCP + Skill + Instructions
+
+Три уровня, каждый отвечает за своё:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      AI-агент (Kilo / Claude Code / Cursor)    │
+│                                                                │
+│  instructions.md / AGENTS.md ──►  ПРАВИЛА: "когда обязан      │
+│         │                          вызвать критика"            │
+│         ▼                                                      │
+│  skill/grok-critic ───────────►  КАК вызывать: инструменты,   │
+│         │                          параметры, триггеры, cost   │
+│         ▼                                                      │
+│  MCP tool call: critic_review(content=..., ...)               │
+│         │                                                      │
+│         ▼                                                      │
+│  ┌─────────────────────────────────────────┐                 │
+│  │  grok-critic-mcp (Python, stdio)          │                 │
+│  │    server.py   ← FastMCP, 8 tools         │                 │
+│  │      │  _review_tool: file_path→content,  │                 │
+│  │      │  clamp agent_count, log, format    │                 │
+│  │      ▼                                     │                 │
+│  │    critic.py   ← system-промпты, сборка    │                 │
+│  │      ▼                                     │                 │
+│  │    api_client.py ─── HTTP ──► Polza.AI ──► grok-4.20-       │
+│  │      ▲                          /responses   multi-agent    │
+│  │    config.py  ← .env (POLZA_*)             │                 │
+│  └─────────────────────────────────────────┘                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+- **MCP-сервер** — транспортный слой (Python-процесс на stdio). Принимает tool-вызовы, ходит в Polza.AI, парсит ответ, считает стоимость.
+- **Skill** — markdown-инструкция, объясняющая агенту, **когда и как** пользоваться инструментами. Без скилла агент не знает, что критик существует.
+- **Instructions / AGENTS.md** — правила проекта/агента, **обязывающие** вызывать критика в нужные моменты.
 
 ---
 
@@ -68,74 +102,96 @@ MCP (Model Context Protocol) сервер, который предоставля
 
 ### Требования
 
-- Python 3.11+
-- API-ключ [Polza.AI](https://polza.ai) (или любой OpenAI-совместимый провайдер с поддержкой Responses API)
+- **Python 3.11+** (используется `str.is_relative_to`, `X | None`-аннотации, `parents[2]`).
+- API-ключ [Polza.AI](https://polza.ai) — или любого OpenAI-совместимого провайдера с поддержкой Responses API.
 
 ### Из исходников
 
 ```bash
-git clone https://github.com/a-bondartsov/grok-critic-mcp.git
+git clone https://github.com/Bondartsov/grok-critic-mcp.git
 cd grok-critic-mcp
 pip install -e .
 ```
 
-### Через pip (после публикации)
+После установки доступна console-команда `grok-critic` (entry point `grok_critic.server:main` из `pyproject.toml`).
+
+### Dev-режим (с тестами)
 
 ```bash
-pip install grok-critic-mcp
+pip install -e ".[dev]"   # + pytest, pytest-asyncio, respx
 ```
 
 ---
 
-## Настройка
+## Конфигурация
 
-### 1. Создайте `.env` файл
+Конфигурация читается **только из переменных окружения с префиксом `POLZA_`** (через `pydantic-settings`). Источник — окружение процесса и файл `.env` в корне репозитория (путь вычисляется относительно `config.py`, не зависит от текущей рабочей директории). Посторонние переменные игнорируются (`extra="ignore"`).
 
-Скопируйте `.env.example` в `.env` и заполните:
+Скопируйте шаблон и заполните:
 
 ```bash
 cp .env.example .env
 ```
 
+### Полная таблица параметров
+
+| Переменная                  | Тип    | Дефолт (в коде)              | Обязательна | Назначение                                                                                                                      |
+| --------------------------- | ------ | ---------------------------- | :---------: | ------------------------------------------------------------------------------------------------------------------------------- |
+| `POLZA_API_KEY`             | secret | —                            |   **да**    | Ключ Polza.AI. Хранится как `SecretStr`, не попадает в логи/`repr`. `min_length=1`.                                             |
+| `POLZA_BASE_URL`            | str    | `https://polza.ai/api/v1`    |     нет     | Базовый URL API.                                                                                                                |
+| `POLZA_MODEL`               | str    | `x-ai/grok-4.20-multi-agent` |     нет     | Идентификатор модели.                                                                                                           |
+| `POLZA_AGENT_COUNT`         | int    | `16`                         |     нет     | Число агентов по умолчанию. Диапазон `1–64` (`ge=1, le=64`).                                                                    |
+| `POLZA_TIMEOUT_SECONDS`     | int    | `180`                        |     нет     | Максимальный таймаут запроса, сек (`ge=1`). Для 16 агентов рекомендуется `300`; в поставляемом `.env.example` выставлено `300`. |
+| `POLZA_LOG_LEVEL`           | str    | `WARNING`                    |     нет     | Один из `DEBUG/INFO/WARNING/ERROR/CRITICAL` (валидируется, регистр нормализуется).                                              |
+| `POLZA_LOG_FILE`            | str    | `""` (пусто)                 |     нет     | Пусто → лог в `stderr` (stdout занят под MCP stdio). Иначе — путь к файлу лога.                                                 |
+| `POLZA_PRICE_INPUT_PER_1M`  | float  | `0.0`                        |     нет     | Цена $ за 1M input-токенов (для расчёта `cost_usd`). Ориентир Polza.AI — `2.6`.                                                 |
+| `POLZA_PRICE_OUTPUT_PER_1M` | float  | `0.0`                        |     нет     | Цена $ за 1M output-токенов. Ориентир — `6.6`.                                                                                  |
+| `POLZA_ALLOW_SELF_UPDATE`   | bool   | `false`                      |     нет     | Разрешает инструмент `self_update` (`git pull`+`pip install`+restart). По умолчанию **выключен**.                               |
+| `POLZA_ALLOWED_READ_DIRS`   | str    | `""` (только cwd)            |     нет     | Доп. директории, откуда разрешено читать файлы через `file_path`. Разделитель — `os.pathsep` (`;` на Windows, `:` на Unix).     |
+| `POLZA_MAX_RETRIES`         | int    | `2`                          |     нет     | Число повторов запроса при таймаутах/сетевых ошибках/`429`/`5xx` (`0–10`).                                                      |
+| `POLZA_RETRY_BACKOFF_BASE`  | float  | `2.0`                        |     нет     | База экспоненциального backoff между повторами (сек): пауза = `base^attempt`.                                                   |
+| `POLZA_MAX_CONTENT_CHARS`   | int    | `100000`                     |     нет     | Лимит размера контента ревью (~100 КБ) — защита от перерасхода. Превышение → ошибка без обращения к API.                        |
+| `POLZA_TIMEOUT_LOW`         | int    | `90`                         |     нет     | Таймаут (сек) при `agent_count ≤ 4`.                                                                                            |
+| `POLZA_TIMEOUT_MID`         | int    | `150`                        |     нет     | Таймаут (сек) при `4 < agent_count ≤ 8`.                                                                                        |
+
+> **Важно про запуск.** `config` инстанцируется на уровне модуля при импорте. Если `POLZA_API_KEY` не задан (ни в окружении, ни в `.env`) — импорт упадёт с `ValidationError` сразу при старте. Это намеренно: сервер без ключа бесполезен.
+
+Пример `.env`:
+
 ```ini
 # ОБЯЗАТЕЛЬНО
 POLZA_API_KEY=pza_your_key_here
 
-# Опционально (значения по умолчанию показаны)
+# Опционально (показаны рекомендуемые значения)
 POLZA_BASE_URL=https://polza.ai/api/v1
 POLZA_MODEL=x-ai/grok-4.20-multi-agent
 POLZA_AGENT_COUNT=16
 POLZA_TIMEOUT_SECONDS=300
 POLZA_LOG_LEVEL=WARNING
-POLZA_LOG_FILE=              # пусто = stderr (для MCP stdio)
-POLZA_PRICE_INPUT_PER_1M=2.6   # $ за 1M input токенов
-POLZA_PRICE_OUTPUT_PER_1M=6.6  # $ за 1M output токенов
+POLZA_LOG_FILE=
+POLZA_PRICE_INPUT_PER_1M=2.6
+POLZA_PRICE_OUTPUT_PER_1M=6.6
+POLZA_ALLOW_SELF_UPDATE=false
+POLZA_ALLOWED_READ_DIRS=
 ```
 
-### 2. Регистрация в MCP-клиенте
+### Горячая перезагрузка
 
-#### Kilo Code (`~/.config/kilo/opencode.json`)
+После изменения `.env` не обязательно перезапускать процесс — вызовите инструмент `reload_config_tool`. Он перечитывает `.env`, **обновляет объект `config` in-place** (все модули, импортировавшие `config`, сразу видят новые значения) и закрывает устаревший HTTP-клиент (у него мог быть старый `base_url`/`timeout`).
 
-Добавьте в `mcpServers`:
+---
 
-```json
-{
-  "mcpServers": {
-    "grok-critic": {
-      "command": "python",
-      "args": ["-m", "grok_critic.server"],
-      "timeout": 300000,
-      "env": {
-        "POLZA_API_KEY": "pza_your_key_here"
-      }
-    }
-  }
-}
+## Регистрация в MCP-клиенте
+
+### Claude Code
+
+Через CLI (рекомендуется):
+
+```bash
+claude mcp add grok-critic -- python -m grok_critic.server
 ```
 
-> **Note:** Если установлен через `pip install -e .`, можно использовать `"command": "grok-critic"` (entry point из `pyproject.toml`).
-
-#### Claude Code (`~/.claude/mcp.json`)
+Либо вручную в конфиге MCP-клиента:
 
 ```json
 {
@@ -149,7 +205,24 @@ POLZA_PRICE_OUTPUT_PER_1M=6.6  # $ за 1M output токенов
 }
 ```
 
-#### Cursor / VS Code (settings.json)
+### Kilo Code (`~/.config/kilo/opencode.json`)
+
+```json
+{
+  "mcpServers": {
+    "grok-critic": {
+      "command": "python",
+      "args": ["-m", "grok_critic.server"],
+      "timeout": 300000,
+      "env": { "POLZA_API_KEY": "pza_your_key_here" }
+    }
+  }
+}
+```
+
+> Если установлено через `pip install -e .`, можно указать `"command": "grok-critic"` (console-script).
+
+### Cursor / VS Code (settings.json)
 
 ```json
 {
@@ -162,342 +235,292 @@ POLZA_PRICE_OUTPUT_PER_1M=6.6  # $ за 1M output токенов
 }
 ```
 
-### 3. Проверка
+### Проверка
 
-Запустите сервер вручную и вызовите `check_health`:
-
-```bash
-python -m grok_critic.server
-```
-
-Или через MCP-клиент после регистрации — вызовите инструмент `check_health`. Должен вернуть:
+Вызовите `check_health` через клиента (или запустите `python -m grok_critic.server` вручную). Ожидаемый вывод:
 
 ```
 Status: ok
 Model: x-ai/grok-4.20-multi-agent
 Base URL: https://polza.ai/api/v1
 Pricing: input=$2.6/1M output=$6.6/1M
+Balance: 1234.56 ₽
 ```
 
 ---
 
-## MCP-инструменты
+## MCP-инструменты (справочник)
 
-### `critic_review` — общее ревью кода
+Восемь инструментов делятся на **ревью** (обращаются к модели) и **административные** (управляют сервером).
+
+### Ревью-инструменты
+
+Все четыре обёрнуты декоратором `_review_tool`, который единообразно: клэмпит `agent_count` (1–64), опционально читает файл по `file_path`, логирует вызов, ловит исключения и форматирует результат.
+
+#### `critic_review` — общее ревью кода
 
 ```python
 critic_review(
-    content: str,            # ОБЯЗАТЕЛЬНО — код для ревью
-    context: str | None,     # проект, язык, назначение
-    agent_count: int | None, # 4 или 16 (default из .env)
-    focus_areas: str | None  # "security,performance,SOLID,DRY"
+    content: str,             # код для ревью
+    context: str | None = None,      # проект, язык, назначение
+    agent_count: int | None = None,  # 4 или 16 (default из конфига)
+    focus_areas: str | None = None,  # "security,performance,SOLID,DRY"
 ) -> str
 ```
 
-**Пример вызова (из любого AI-агента):**
+`focus_areas` — строка, разбиваемая по запятым в список фокус-областей. Разбирает баги и edge-cases, SOLID/DRY/KISS, производительность (N+1, память, сложность), безопасность, предлагает рефакторинг с примерами и недостающие тесты.
 
-```
-grok-critic_critic_review(
-    content="def process_order(order):\n    db.execute('INSERT INTO orders VALUES (' + str(order.id) + ')')",
-    context="Python e-commerce order processing",
-    agent_count=16,
-    focus_areas="security,performance"
-)
-```
-
-**Ответ содержит:**
-1. Детальный разбор по разделам (логические ошибки, SOLID, безопасность, производительность, улучшения)
-2. Конкретные рекомендации с примерами кода
-3. Metadata footer (модель, токены, стоимость ₽/$, cached tokens, review_id)
-
-### `architecture_review` — ревью архитектуры
+#### `architecture_review` — ревью архитектуры
 
 ```python
-architecture_review(
-    content: str,            # описание архитектуры, C4 диаграмма, код
-    context: str | None,     # tech stack, constraints, team size
-    agent_count: int | None  # override
-) -> str
+architecture_review(content, context=None, agent_count=None) -> str
 ```
 
-Фокус: архитектурные паттерны, направление зависимостей, циклические связи, coupling/cohesion, масштабируемость, single points of failure, технический долг.
+Специализированный system-промпт. `focus_areas` фиксирован: `architecture, scalability, dependencies`. Разбирает паттерны (Modular Monolith / Microservices / DDD), Bounded Contexts, направление и цикличность зависимостей, coupling/cohesion, масштабируемость, single points of failure, технический долг.
 
-### `security_audit` — security аудит
+#### `security_audit` — security-аудит
 
 ```python
-security_audit(
-    content: str,            # код или конфигурация
-    context: str | None,     # framework, deployment, threat model
-    agent_count: int | None  # override
-) -> str
+security_audit(content, context=None, agent_count=None) -> str
 ```
 
-Чеклист: injection (SQL, XSS, command, path traversal), auth (MFA, sessions, privilege escalation), данные и секреты (hardcoded credentials, небезопасное хранение), инфраструктура (CORS, rate limiting, SSRF).
+Специализированный system-промпт. `focus_areas` фиксирован: `security, vulnerabilities, secrets`. Чеклист: injection (SQL/XSS/command/path traversal), аутентификация и авторизация (пароли, MFA, session fixation/hijacking, privilege escalation, IDOR), данные и секреты, инфраструктура (CORS, rate limiting, SSRF/CSRF). Вывод классифицируется по уровням **🔴 CRITICAL / 🟡 HIGH / 🟠 MEDIUM / 🔵 LOW**.
 
-Классификация: 🔴 CRITICAL / 🟡 HIGH / 🟠 MEDIUM / 🔵 LOW
-
-### `critic_followup` — уточняющий вопрос
+#### `critic_followup` — уточняющий вопрос
 
 ```python
 critic_followup(
-    previous_review: str,    # ПОЛНЫЙ текст предыдущего ответа критика
-    question: str,           # уточняющий вопрос
-    agent_count: int | None  # override
+    previous_review: str,     # ПОЛНЫЙ текст предыдущего ответа критика
+    question: str,            # уточняющий вопрос / контраргумент
+    agent_count: int | None = None,
 ) -> str
 ```
 
-Использовать если:
-- Ответ неполный — нужно углубиться в конкретный аспект
-- Не согласны с рекомендацией — привести аргументацию
-- Нужны дополнительные примеры или альтернативы
+Продолжение диалога по уже полученному ревью: углубиться в аспект, оспорить оценку, запросить альтернативы. История диалога **не хранится** на сервере — предыдущий ответ передаётся явно.
 
-### `check_health` — статус сервера
+#### Параметр `file_path` (для трёх content-инструментов)
+
+`critic_review`, `architecture_review`, `security_audit` дополнительно принимают опциональный `file_path`. Если он передан, сервер читает файл, подставляет его как `content`, а при отсутствии явного `context` проставляет `context = "File: <путь>"`. Если файл не найден / это не файл / пустой — возвращается ошибка **без** обращения к API (чтобы не тратить платный вызов на невалидный ввод).
+
+> **Sandbox (ограничение области чтения).** Файл должен лежать внутри разрешённых корней: рабочая директория сервера (cwd) + директории из `POLZA_ALLOWED_READ_DIRS`. Путь вне разрешённых корней (включая выход через `..`) отклоняется с ошибкой `Access denied` **до** обращения к API. Дополнительно действует denylist типичных файлов секретов — `.env`, `id_rsa`, `id_ed25519`, `credentials.json`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.kdbx` блокируются даже внутри разрешённых директорий, т.к. содержимое файла отправляется во внешний API. Файлы больше 1 МБ также отклоняются (всё равно режутся лимитом `MAX_CONTENT_CHARS`).
+
+### Административные инструменты
+
+#### `check_health` — статус и баланс
 
 ```python
 check_health() -> str
 ```
 
-Возвращает: статус, модель, base URL, pricing (если настроен), список проблем.
+Без параметров. Возвращает статус, модель, base URL, pricing (если цены заданы), список проблем и **баланс в ₽** (запрашивает Balance-эндпоинт Polza.AI).
 
-### `reload_config_tool` — горячая перезагрузка
+#### `reload_config_tool` — горячая перезагрузка `.env`
 
 ```python
 reload_config_tool() -> str
 ```
 
-Перечитывает `.env` **без перезапуска** процесса. Использовать после изменения цен, API-ключа, таймаута. Старый HTTP-клиент закрывается автоматически.
+Без параметров. Перечитывает `.env` без рестарта, обновляет `config` in-place, закрывает устаревший HTTP-клиент. Возвращает текущие значения (ключ — маскированный). Применяйте после изменения цен, таймаута, `POLZA_ALLOW_SELF_UPDATE` и др.
 
-### `restart_server` — полный перезапуск
+#### `restart_server` — полный перезапуск
 
 ```python
-restart_server(reason: str | None) -> str
+restart_server(reason: str | None = None) -> str
 ```
 
-Жёсткий выход через `os._exit(0)`. MCP-клиент (Kilo Code, Claude Code и т.д.) автоматически перезапустит сервер. Использовать если hot reload недостаточен.
+Закрывает соединения и делает `os._exit(0)`. MCP-клиент (Kilo Code, Claude Code и т.д.) автоматически поднимает процесс заново. `reason` логируется перед выходом.
+
+#### `self_update` — обновление с GitHub
+
+```python
+self_update() -> str
+```
+
+Без параметров. **Требует включённого флага** `POLZA_ALLOW_SELF_UPDATE=true` — иначе вернёт `❌ self_update is disabled...`. При включённом флаге: `git pull` (таймаут 60 с) → если «Already up to date», выходит без изменений; иначе `pip install -e .` (таймаут 120 с) → `os._exit(0)`, после чего клиент перезапускает сервер с новым кодом.
+
+> Флаг выключен по умолчанию намеренно: инструмент выполняет установку пакета и завершает процесс. Включайте осознанно.
+
+---
+
+## Внутренняя логика запроса
+
+Что происходит между tool-вызовом и ответом модели:
+
+1. **Декоратор `_review_tool`** клэмпит `agent_count` (1–64), при наличии `file_path` читает файл в `content`, логирует `content_len`/`agent_count`.
+2. **`critic.py`** валидирует непустоту `content` и его длину против **`MAX_CONTENT_CHARS = 100 000`** (защита от разгона стоимости), выбирает `agent_count` (переданный или из конфига) и собирает user-промпт из секций `## Контекст`, `## Фокус внимания`, `## Код для ревью`. Подбирается один из четырёх system-промптов (общий / followup / architecture / security). **Все ответы — на русском.**
+3. **`api_client.py`** формирует запрос к `POST {base_url}/responses`:
+   - заголовки `Authorization: Bearer <key>`, `Content-Type: application/json`;
+   - тело: `model`, `reasoning.effort` (из `agent_count`), `input` (system + user сообщения), опциональный `prompt_cache_key` (кеширование system-промпта на стороне Polza.AI);
+   - **динамический таймаут** по числу агентов: `≤4 → min(base, 90с)`, `≤8 → min(base, 150с)`, иначе полный `POLZA_TIMEOUT_SECONDS`.
+4. **Retry**: до 2 повторов с экспоненциальным backoff (`2^attempt`) на таймаутах, сетевых ошибках транспорта (`ConnectError`, `ReadError`, `RemoteProtocolError` и др. `httpx.TransportError` — с пересозданием HTTP-клиента), `429` и `5xx`. Явно разбираются статусы `401` (auth), `402` (недостаточно средств), `429` (rate limit), `502` (провайдер недоступен), `503` (нет провайдеров), прочие `4xx/5xx`.
+5. **Разбор ответа**: извлекается текст, `usage` (input/output/total-токены, `cost_rub` от API, cached- и reasoning-токены), локально считается `cost_usd` по ценам из конфига. Наружу возвращается единый объект `CritiqueResult`.
+6. **`server.py`** форматирует результат: текст ревью + metadata footer.
+
+`ResponsesClient` (httpx.AsyncClient) создаётся один раз и переиспользуется между запросами; таймаут передаётся per-request, что и позволяет менять его динамически.
+
+---
+
+## Формат ответа
+
+Каждое ревью возвращается как текст + metadata footer:
+
+```
+<текст ревью на русском>
+
+---
+📊 Metadata: model=x-ai/grok-4.20-multi-agent | agents=16 | effort=high
+📈 Tokens: input=18 231 output=15 434 total=33 665
+🧠 Reasoning: 9 100 (59% of output) — ~4x cost
+💾 Cached: 18 000/18 231 (99%)
+💰 Cost: 1.23 ₽ | $0.1493
+🏷️ Review ID: rev_1f866fc571eb
+```
+
+- **Tokens** — с пробелами-разделителями разрядов.
+- **Reasoning** — показывается, если reasoning-токенов > 0 (и их доля от output); стоят примерно в 4× дороже обычных.
+- **Cached** — показывается, если Polza.AI закешировал часть input (обычно system-промпт); чтение из кеша дешевле.
+- **Cost** — реальная стоимость в ₽ (из `usage.cost_rub`) и/или расчётная в $ (по ценам конфига). Показываются только ненулевые части.
+- **Review ID** — идентификатор для ссылки в followup.
+
+При ошибке инструмент возвращает строку вида `❌ Error: <причина>` (или `❌ <tool> failed: <exc>` для неожиданных исключений).
+
+---
+
+## Правила работы с критиком
+
+Эти правила предназначены для AI-агента, который пользуется сервером (они же зашиты в [skill](skill/SKILL.md)):
+
+1. **Всегда передавай `context`** — критик работает точнее, зная проект, язык и назначение кода.
+2. **Всегда задавай `focus_areas`** для `critic_review` — целенаправленное ревью полезнее размытого.
+3. **Читай ответ полностью** — критик может найти неожиданные проблемы.
+4. **🔴 CRITICAL — исправляй до продолжения.** Не переходи к следующей задаче с открытым критическим замечанием.
+5. **Отвечай критику через `critic_followup`.** Если не согласен — приведи аргументы; если критик не учёл контекст — объясни; если переоценил проблему — оспорь. **Не «глотай» замечания молча.**
+6. **Не вызывай критика для только что сгенерированного, ещё не прочитанного тобой кода** — сначала прочитай, что написал.
+7. **Следи за балансом** через `check_health` (показывает ₽) и предупреждай пользователя при низком балансе.
+
+### Когда вызывать (триггеры)
+
+| Ситуация                                                        | Инструмент            |   Приоритет   |
+| --------------------------------------------------------------- | --------------------- | :-----------: |
+| Завершено планирование / архитектура / system-design            | `architecture_review` |  Обязательно  |
+| Написан существенный код (> 50 строк)                           | `critic_review`       |  Обязательно  |
+| Баг-фикс не удался с первой попытки                             | `critic_review`       |  Обязательно  |
+| Security-чувствительный код (auth, payments, crypto, user data) | `security_audit`      |  Обязательно  |
+| Перед merge / PR                                                | `critic_review`       | Рекомендуется |
+| Спорное архитектурное решение                                   | `architecture_review` | Рекомендуется |
+
+Не вызывать для тривиального (переименование, форматирование, правка нескольких строк) — типичный вызов с 16 агентами платный.
 
 ---
 
 ## Kilo Code Skill
 
-Репозиторий включает готовый скилл для Kilo Code: [`skill/SKILL.md`](skill/SKILL.md).
+Репозиторий включает готовый скилл: [`skill/SKILL.md`](skill/SKILL.md) — инструкция для агента о том, когда и как вызывать критика (триггеры, сигнатуры, workflow-примеры, cost awareness, правила).
 
-### Установка скилла
-
-Скопируйте `skill/SKILL.md` в `~/.kilocode/skills/grok-critic/SKILL.md`:
+Установка:
 
 ```bash
 mkdir -p ~/.kilocode/skills/grok-critic
 cp skill/SKILL.md ~/.kilocode/skills/grok-critic/SKILL.md
 ```
 
-### Что даёт скилл
+Типовые сценарии из скилла:
 
-Скилл — это **инструкция для любого агента** в Kilo Code о том, когда и как вызывать критика. Без скилла агенты не знают о существовании MCP-инструментов.
+- **Post-implementation review** → `critic_review` → при 🔴 исправить и повторить → при разногласии `critic_followup`.
+- **Architecture validation** → `architecture_review` → `critic_followup` («а что если event sourcing вместо…?»).
+- **Security audit** → `security_audit` → все 🔴 исправить обязательно, все 🟡 — перед продакшеном.
 
-Скилл определяет:
+### Интеграция в правила агента
 
-1. **Triggers** — когда вызывать критика обязательно:
-   - Planning / architecture / system-design завершён → `architecture_review`
-   - Написан существенный код (>50 строк) → `critic_review`
-   - Баг-фикс не получился с первой попытки → `critic_review`
-   - Security-sensitive код → `security_audit`
+В `instructions.md` (глобально):
 
-2. **Agent count guide** — 4 vs 16 агентов
+```markdown
+## Критик (grok-critic MCP) — см. skill `grok-critic`
+Обязателен при: планировании архитектуры, баг-фиксе со 2-й попытки, после > 50 строк кода.
+```
 
-3. **Workflow examples** — типовые сценарии
-
-4. **Cost awareness** — типичный вызов $0.10–0.25
-
-5. **Rules** — правила взаимодействия с критиком
+В `AGENTS.md` (на уровне проекта) — четыре обязательных точки вызова: после планирования (`architecture_review`), после существенного кода (`critic_review`), при неудачном баг-фиксе (`critic_review`), для security-кода (`security_audit`).
 
 ---
 
-## Интеграция с агентами
-
-Чтобы ваши AI-агенты автоматически использовали критика, добавьте правила в их инструкции.
-
-### В `instructions.md` (глобально для всех агентов)
-
-```markdown
-## 🔴 Критик (grok-critic MCP) — см. skill `grok-critic`
-
-Полная документация: skill `grok-critic` (triggers, tools, workflow, cost awareness).
-Обязателен при: планировании архитектуры, баг-фиксе со 2-й попытки, после >50 строк кода.
-```
-
-### В `AGENTS.md` (на уровне проекта)
-
-```markdown
-## Обязательный вызов критика
-
-1. **Планирование** — после завершения `grace-plan`, `system-design`, `requirements-analysis`
-   вызвать `architecture_review` с результатом планирования.
-
-2. **Код** — после написания существенного кода (>50 строк) вызвать `critic_review`
-   с контекстом проекта и фокусом на соответствующих областях.
-
-3. **Баг-фикс** — если фикс не получился с первой попытки, вызвать `critic_review`
-   с кодом фикса и описанием бага как context.
-
-4. **Security** — любой код связанный с auth, payments, crypto, user data
-   обязан пройти `security_audit`.
-```
-
-### В конкретном агенте (`.kilocode/agent/my-agent.md`)
-
-```markdown
-## Code Review Protocol
-
-После завершения задачи:
-1. Вызвать `critic_review` с написанным кодом
-2. Если найдены 🔴 CRITICAL — исправить и вызвать повторно
-3. Если не согласен — вызвать `critic_followup` с аргументацией
-4. Результат ревью приложить к коммиту
-```
-
-### Как MCP + Skill работают вместе
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   AI Agent (Kilo Code)              │
-│                                                     │
-│  instructions.md ──► "вызови критика после кода"    │
-│         │                                           │
-│         ▼                                           │
-│  skill/grok-critic ──► КАК вызывать, параметры,    │
-│  │                      триггеры, cost awareness    │
-│  │                                                  │
-│  └──────────► MCP Tool: critic_review(content=...)  │
-│                        │                            │
-│                        ▼                            │
-│              ┌─────────────────────┐                │
-│              │  grok-critic-mcp    │                │
-│              │  (Python process)   │                │
-│              │                     │                │
-│              │  server.py ◄── MCP protocol (stdio)  │
-│              │    │                │                │
-│              │    ▼                │                │
-│              │  critic.py          │                │
-│              │    │                │                │
-│              │    ▼                │                │
-│              │  api_client.py ────►│──► Polza.AI    │
-│              │                     │    API         │
-│              │  config.py ◄── .env │      │        │
-│              └─────────────────────┘      │        │
-│                                           ▼        │
-│                                  grok-4.20-multi-agent│
-│                                  (16 reasoning agents)│
-└─────────────────────────────────────────────────────┘
-```
-
-**MCP-сервер** — это транспортный слой (Python процесс на stdio). Он принимает tool calls от MCP-клиента, делает HTTP-запросы к Polza.AI, парсит ответы, считает токены и стоимость.
-
-**Skill** — это инструкция (markdown файл), которая говорит AI-агенту КОГДА и КАК использовать MCP-инструменты. Без скилла агент не знает о существовании инструментов.
-
-**Instructions / AGENTS.md** — глобальные правила, обязывающие агента использовать критика в определённых ситуациях.
-
----
-
-## Architecture
+## Архитектура
 
 ### Структура проекта
 
 ```
 grok-critic-mcp/
 ├── src/grok_critic/
-│   ├── __init__.py          # Package exports
-│   ├── config.py            # Pydantic Settings, env vars, logging
-│   ├── api_client.py        # Async HTTP client, retry, cost calculation
-│   ├── critic.py            # System prompts, review orchestration
-│   └── server.py            # FastMCP server, 8 tools, metadata formatting
-├── tests/
-│   ├── test_config.py       # Config defaults, env overrides, reload
-│   ├── test_api_client.py   # Effort mapping, response parsing, retry, cost
-│   ├── test_critic.py       # Prompts, review flow, followup, health check
-│   └── test_server.py       # Tool registration, parameter parsing, metadata
-├── skill/
-│   └── SKILL.md             # Kilo Code skill (инструкция для агентов)
-├── docs/                    # GRACE framework artifacts
-├── .env.example             # Template for environment variables
-├── pyproject.toml            # Package metadata, dependencies, entry points
+│   ├── __init__.py          # Публичный API пакета
+│   ├── config.py            # M-CONFIG: pydantic-settings, env, логирование, hot-reload
+│   ├── api_client.py        # M-API: async HTTP → Polza.AI, retry, usage/cost, CritiqueResult
+│   ├── critic.py            # M-CRITIC: 4 system-промпта, orchestration, health_check
+│   └── server.py            # M-SERVER: FastMCP, 8 tools, декоратор, metadata footer
+├── tests/                   # 157 тестов (config / api_client / critic / server)
+├── skill/SKILL.md           # Kilo Code skill (инструкция для агентов)
+├── docs/                    # GRACE-артефакты + этот отчёт/план
+├── .env.example             # Шаблон окружения
+├── pyproject.toml           # Метаданные, зависимости, entry point
 └── README.md
 ```
 
-### Module contracts
+### Модули и контракты
 
-| Module | PURPOSE |
-|--------|---------|
-| `config.py` | Загрузка и валидация конфигурации из `.env` через pydantic-settings. **api_key обязательный** (min_length=1), agent_count (ge=1, le=64), timeout_seconds (ge=1). Hot reload. |
-| `api_client.py` | Async HTTP-клиент к Polza.AI Responses API. Retry, dynamic timeout, cost calculation. |
-| `critic.py` | System prompts (3 специализированных), orchestration functions, health check. |
-| `server.py` | FastMCP сервер с 8 инструментами. **Декоратор `_review_tool`** (DRY, try/except, agent_count validation), `_validate_agent_count` (clamp 1-64), `_read_file_content`, metadata footer formatting, self-update. |
+| Модуль          | Роль        | PURPOSE                                                                                                                                                                           |
+| --------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.py`     | UTILITY     | Загрузка/валидация конфигурации из `.env` (pydantic-settings). `api_key` обязателен (`SecretStr`, `min_length=1`), `agent_count` 1–64, `timeout_seconds` ≥1. Hot-reload in-place. |
+| `api_client.py` | INTEGRATION | Async HTTP-клиент к Responses API. Persistent client, динамический таймаут, retry с backoff, разбор usage/cost, `CritiqueResult`.                                                 |
+| `critic.py`     | CORE_LOGIC  | 4 system-промпта, сборка user-промпта, валидация размера (`MAX_CONTENT_CHARS`), три режима ревью + followup, `health_check` с балансом.                                           |
+| `server.py`     | ENTRY_POINT | FastMCP-сервер (stdio), 8 инструментов, декоратор `_review_tool`, `_validate_agent_count`, `_read_file_content`, форматирование metadata.                                         |
+
+Зависимости строго линейные: `config ← api_client ← critic ← server`.
 
 ### Ключевые технические решения
 
-**Persistent AsyncClient** — httpx.AsyncClient создаётся один раз и переиспользуется между запросами. Timeout передаётся per-request через `httpx.Timeout` в `.post()`, не в конструктор клиента. Это позволяет динамически менять timeout в зависимости от agent_count.
-
-**Dynamic timeout** — 4 агента → max 90s, 16 агентов → полный timeout из конфига (default 300s). Уменьшает ожидание для быстрых запросов.
-
-**Retry with exponential backoff** — 429 (rate limit) и 5xx (server error) retry до 2 раз с ожиданием `2^attempt` секунд. 401 (auth error) не ретраится.
-
-**Cost calculation** — `(input_tokens / 1_000_000 * price_input) + (output_tokens / 1_000_000 * price_output)`. Цены из env vars за 1M токенов.
-
-**Hot reload** — `reload_config_tool()` обновляет module-level `config` in-place через `object.__setattr__` + `lru_cache.cache_clear()`. Все модули видят новые значения без restart. Закрывает stale HTTP-клиент.
+- **Persistent AsyncClient** — один httpx-клиент на весь процесс; таймаут per-request → можно менять динамически по `agent_count`.
+- **Динамический таймаут** — быстрые запросы (мало агентов) не ждут полный лимит.
+- **Retry c экспоненциальным backoff** — на таймаутах, сетевых ошибках транспорта (`httpx.TransportError`), `429` и `5xx`; `401` не ретраится.
+- **Расчёт стоимости** — `input/1M × price_input + output/1M × price_output`; параллельно берётся фактический `cost_rub` из ответа API.
+- **Hot-reload** — `reload_config_tool` обновляет `config` in-place (`object.__setattr__`) + сбрасывает `lru_cache`, все импортёры видят новые значения без рестарта.
+- **Защита ключа** — `SecretStr` + извлечение `.get_secret_value()` только в момент формирования заголовка; ключ не логируется.
 
 ---
 
-## Testing
+## Тестирование
 
 ```bash
-# Установить dev-зависимости
 pip install -e ".[dev]"
 
-# Запустить все тесты
-python -m pytest tests/ -v
+# все тесты
+python -m pytest tests/ -q
 
-# С выводом покрытия
+# с покрытием
 python -m pytest tests/ -v --cov=grok_critic --cov-report=term-missing
 ```
 
-**127 тестов** покрывают: config defaults, env overrides, **config validation** (api_key обязательный, agent_count ge=1/le=64, timeout_seconds ge=1), effort mapping, response parsing, usage extraction (включая cost_rub и cached_tokens), cost calculation, retry logic, persistent client, JSON decode error handling, error body parsing (402/502/503), tool registration (8 tools), parameter parsing, **decorator `_review_tool`** (error handling, agent_count clamping), metadata formatting с разделителями, hot reload, server restart, self_update flow, health check с balance API, **`_validate_agent_count`** (clamping 1-64), **`_read_file_content`**.
+**157 тестов** (config 33 · api_client 50 · critic 27 · server 44 · package 3) на `pytest` + `pytest-asyncio` (`asyncio_mode="auto"`). Все внешние HTTP-вызовы замоканы (`unittest.mock`, `AsyncMock`), реального ключа/сети не требуется. Покрыты: дефолты и env-override конфига, валидация полей, effort-mapping, разбор ответа и usage (включая cost_rub/cached/reasoning), расчёт стоимости, обработка статусов API, регистрация 8 инструментов, декоратор `_review_tool`, клэмп `agent_count`, чтение файла, hot-reload, restart, `self_update`, health-check с балансом.
 
 ---
 
-## Deployment на VM
+## Деплой на VM
 
-### 1. Подготовка VM
+Сервер работает по stdio, поэтому на удалённой машине его удобно запускать через SSH-обёртку MCP-клиента.
 
 ```bash
-# На VM — установить Python 3.11+
+# на VM
 sudo apt update && sudo apt install python3 python3-pip python3-venv
-
-# Создать директорию
 mkdir -p /opt/grok-critic-mcp
-```
 
-### 2. Деплой через SSH
-
-```bash
-# С локальной машины
+# с локальной машины
 scp -r grok-critic-mcp/ user@vm:/opt/grok-critic-mcp/
-```
 
-### 3. Установка на VM
-
-```bash
+# на VM
 cd /opt/grok-critic-mcp
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
-
-# Создать .env
-cp .env.example .env
-nano .env  # вставить API ключ
+cp .env.example .env && nano .env    # вставить POLZA_API_KEY
 ```
 
-### 4. Регистрация в MCP-клиенте на VM
-
-В конфиге MCP-клиента (на машине, где запущен AI-агент):
+Регистрация в MCP-клиенте (на машине агента), SSH-транспорт:
 
 ```json
 {
@@ -511,81 +534,38 @@ nano .env  # вставить API ключ
 }
 ```
 
-> **Note:** Для SSH-based MCP нужен настроенный SSH key без пароля (passwordless).
-
-### 5. Systemd service (опционально, для HTTP транспорта)
-
-Если нужен HTTP-based доступ вместо stdio:
-
-```ini
-# /etc/systemd/system/grok-critic.service
-[Unit]
-Description=Grok Critic MCP Server
-After=network.target
-
-[Service]
-Type=simple
-User=grok-critic
-WorkingDirectory=/opt/grok-critic-mcp
-ExecStart=/opt/grok-critic-mcp/.venv/bin/python -m grok_critic.server
-Restart=on-failure
-RestartSec=5
-EnvironmentFile=/opt/grok-critic-mcp/.env
-
-[Install]
-WantedBy=multi-user.target
-```
+> Нужен passwordless SSH-ключ. Для systemd-сервиса (если требуется постоянно запущенный процесс) используйте unit c `EnvironmentFile=/opt/grok-critic-mcp/.env` и `Restart=on-failure`.
 
 ---
 
-## Cost Estimation
+## Оценка стоимости
 
-При текущих ценах Polza.AI ($2.6 за 1M input, $6.6 за 1M output):
+При ориентировочных ценах Polza.AI ($2.6 / 1M input, $6.6 / 1M output):
 
-| Тип вызова | Input tokens | Output tokens | Стоимость |
-|------------|-------------|--------------|-----------|
-| Quick review (4 agents) | ~3,000 | ~2,000 | ~$0.02 |
-| Full review (16 agents) | ~18,000 | ~15,000 | ~$0.15 |
-| Architecture review (16 agents) | ~20,000 | ~18,000 | ~$0.18 |
-| Followup question | ~25,000 | ~10,000 | ~$0.13 |
+| Тип вызова                |   Input |  Output | ≈ Стоимость |
+| ------------------------- | ------: | ------: | ----------: |
+| Быстрое ревью (4 агента)  |  ~3 000 |  ~2 000 |      ~$0.02 |
+| Полное ревью (16 агентов) | ~18 000 | ~15 000 |      ~$0.15 |
+| Архитектурное ревью (16)  | ~20 000 | ~18 000 |      ~$0.18 |
+| Followup                  | ~25 000 | ~10 000 |      ~$0.13 |
 
-Цены могут меняться — проверяйте на [Polza.AI](https://polza.ai). Обновите `.env` и вызовите `reload_config_tool()`.
+Цены могут меняться — проверяйте на [Polza.AI](https://polza.ai), обновляйте `.env` и вызывайте `reload_config_tool`. Кеширование system-промпта на стороне Polza.AI удешевляет повторные вызовы (cached-токены дешевле).
 
 ---
 
 ## Troubleshooting
 
-### `Status: degraded` / `POLZA_API_KEY is not set`
+**`POLZA_API_KEY is not set` / падение при старте.** Ключ не найден. Проверьте, что `.env` в корне репозитория и `POLZA_API_KEY` заполнен; для MCP-клиента ключ можно передать через `env` в конфиге сервера.
 
-API-ключ не найден. Проверьте:
-1. Файл `.env` существует в корне проекта
-2. Переменная `POLZA_API_KEY` заполнена
-3. Для MCP-клиента — ключ можно передать через `env` в конфиге
+**Стоимость не показывается в ответе.** Цены в `.env` равны `0`. Задайте `POLZA_PRICE_INPUT_PER_1M`/`POLZA_PRICE_OUTPUT_PER_1M` и вызовите `reload_config_tool`. (Фактическая `cost_rub` приходит от API независимо от этих цен.)
 
-### Стоимость не отображается в ответе
+**Таймаут при 16 агентах.** Увеличьте `POLZA_TIMEOUT_SECONDS` (например, `300`) и таймаут в MCP-клиенте (`"timeout": 300000`, миллисекунды), затем `reload_config_tool`.
 
-Цены в `.env` равны `0` или отсутствуют. Установите:
-```ini
-POLZA_PRICE_INPUT_PER_1M=2.6
-POLZA_PRICE_OUTPUT_PER_1M=6.6
-```
-И вызовите `reload_config_tool()`.
+**`self_update` отвечает `is disabled`.** Флаг выключен по умолчанию. Установите `POLZA_ALLOW_SELF_UPDATE=true` в `.env` и вызовите `reload_config_tool`.
 
-### Timeout при 16 агентах
+**После `restart_server`/`self_update` сервер не поднялся.** MCP-клиент должен перезапускать процесс при выходе; если нет — перезапустите клиента вручную.
 
-grok-4.20-multi-agent с 16 агентами может работать 2–3 минуты. Увеличьте:
-```ini
-POLZA_TIMEOUT_SECONDS=300
-```
-И в MCP-клиенте: `"timeout": 300000` (в миллисекундах).
-
-### `os._exit(0)` в restart_server не работает
-
-MCP-клиент должен автоматически перезапускать сервер при падении процесса. Если этого не происходит — перезапустите MCP-клиент вручную.
-
-### LSP errors в IDE
-
-При установке через `pip install -e .` — это нормально. Пакет установлен в system-wide Python, LSP не видит его. Тесты при этом проходят корректно.
+**LSP-ошибки в IDE при `pip install -e .`.** Пакет ставится в system-wide Python — это нормально, тесты при этом проходят.
 
 ---
 

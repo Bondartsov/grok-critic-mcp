@@ -28,7 +28,7 @@
   <Testing>
     <module-level>
       <command>pytest tests/test_config.py tests/test_critic.py tests/test_api_client.py tests/test_server.py -v</command>
-      <focus>Fast deterministic unit checks with mocked API responses (127 tests total)</focus>
+      <focus>Fast deterministic unit checks with mocked API responses (157 tests total)</focus>
     </module-level>
     <wave-level>
       <command>pytest tests/ -v --timeout=30</command>

@@ -11,14 +11,14 @@ MCP-сервер `grok-critic` оборачивает модель `grok-4.20-mu
 
 ## When (triggers)
 
-| Trigger | Tool | Priority |
-|---------|------|----------|
-| Planning / architecture / system-design завершён | `architecture_review` | Obligatory |
-| Написан существенный код (>50 строк) | `critic_review` | Obligatory |
-| Баг-фикс не получился с первой попытки | `critic_review` | Obligatory |
-| Security-sensitive код (auth, payments, crypto) | `security_audit` | Obligatory |
-| Перед merge / PR | `critic_review` | Recommended |
-| Спорное архитектурное решение | `architecture_review` | Recommended |
+| Trigger                                          | Tool                  | Priority    |
+| ------------------------------------------------ | --------------------- | ----------- |
+| Planning / architecture / system-design завершён | `architecture_review` | Obligatory  |
+| Написан существенный код (>50 строк)             | `critic_review`       | Obligatory  |
+| Баг-фикс не получился с первой попытки           | `critic_review`       | Obligatory  |
+| Security-sensitive код (auth, payments, crypto)  | `security_audit`      | Obligatory  |
+| Перед merge / PR                                 | `critic_review`       | Recommended |
+| Спорное архитектурное решение                    | `architecture_review` | Recommended |
 
 ## MCP Tools
 
@@ -101,12 +101,23 @@ grok-critic_self_update()
 
 Без параметров. Делает `git pull` + `pip install -e .` + `os._exit(0)`. MCP-клиент автоматически перезапустит сервер с новым кодом. Использовать когда новая версия запушена в GitHub.
 
+**Feature flag:** инструмент выключен по умолчанию. Включается `POLZA_ALLOW_SELF_UPDATE=true` в `.env` + `reload_config_tool()` (или рестарт). Пока флаг выключен — возвращает отказ без побочных эффектов.
+
+## Параметр `file_path` (critic_review / architecture_review / security_audit)
+
+Вместо `content` можно передать `file_path` — сервер сам прочитает файл и подставит как content (context по умолчанию = `File: <путь>`).
+
+**Sandbox:** файл обязан лежать внутри разрешённых корней: рабочая директория сервера + директории из `POLZA_ALLOWED_READ_DIRS` (разделитель `;` на Windows). Выход через `..` отклоняется. Файлы-секреты (`.env`, `id_rsa`, `*.pem`, `*.key`, `credentials.json` и т.п.) блокируются всегда — их содержимое не должно уходить во внешний API. Лимит размера — 1 МБ. При отказе возвращается `Access denied` без обращения к API.
+
+`critic_followup` параметр `file_path` **не поддерживает** — вернёт явную ошибку.
+
 ## Agent Count Guide
 
-| Agents | Effort | Timeout | When to use |
-|--------|--------|---------|-------------|
-| 4 | low | ~90s | Quick sanity check, small snippets |
-| 16 | high | ~300s | Full review, architecture, security |
+| Agents | Effort | Timeout            | When to use                         |
+| ------ | ------ | ------------------ | ----------------------------------- |
+| 4      | low    | ~90s               | Quick sanity check, small snippets  |
+| 8      | high   | ~150s              | Medium review                       |
+| 16     | high   | ~180s (из конфига) | Full review, architecture, security |
 
 Default: 16 (из `.env`).
 
@@ -133,13 +144,13 @@ Default: 16 (из `.env`).
 
 Ошибки парсятся из тела ответа Polza.AI (`{error: {code, message}}`):
 
-| Код | Пример сообщения |
-|-----|-----------------|
-| 401 | `Auth error: API key invalid` |
-| 402 | `Payment required: Недостаточно средств на балансе` |
+| Код | Пример сообщения                                            |
+| --- | ----------------------------------------------------------- |
+| 401 | `Auth error: API key invalid`                               |
+| 402 | `Payment required: Недостаточно средств на балансе`         |
 | 429 | `Rate limited: Too many requests for grok-4.20-multi-agent` |
-| 502 | `Provider down: xAI provider unavailable` |
-| 503 | `No providers: No providers available` |
+| 502 | `Provider down: xAI provider unavailable`                   |
+| 503 | `No providers: No providers available`                      |
 
 ## Workflow Examples
 

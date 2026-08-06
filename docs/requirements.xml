@@ -35,7 +35,7 @@
       <AcceptanceCriteria>
         1. Параметр agent_count поддерживается (4 или 16)
         2. reasoning.effort автоматически устанавливается (low/high)
-        3. Динамический timeout: 4 агента → 90s, 16 агентов → из конфига (default 300s)
+        3. Динамический timeout: 4 агента → 90s, 16 агентов → из конфига (default 180s)
       </AcceptanceCriteria>
       <Priority>medium</Priority>
       <RelatedFlows>DF-001</RelatedFlows>
@@ -127,7 +127,7 @@
 
   <Risks>
     <risk-1>Polza.AI может не проксировать Responses API корректно — mitigated: подтверждено что работает.</risk-1>
-    <risk-2>Timeout: grok-4.20-multi-agent работает медленно — mitigated: динамический timeout 90s/300s.</risk-2>
+    <risk-2>Timeout: grok-4.20-multi-agent работает медленно — mitigated: динамический timeout 90s/150s/180s.</risk-2>
     <risk-3>Формат ответа Responses API отличается от Chat Completions — mitigated: парсинг output_text.</risk-3>
     <risk-4>Rate limiting: Polza.AI может иметь ограничения — mitigated: retry с backoff.</risk-4>
     <risk-5>Стоимость: 16 агентов → до 100k+ токенов за запрос — mitigated: MAX_CONTENT_CHARS, цена в metadata.</risk-5>

@@ -2,7 +2,7 @@
   <GlobalPolicy>
     <log-format>[Module][function][BLOCK_NAME] message</log-format>
     <deterministic-first>true</deterministic-first>
-    <module-level-focus>Fast deterministic checks with mocked HTTP responses (127 tests total)</module-level-focus>
+    <module-level-focus>Fast deterministic checks with mocked HTTP responses (157 tests total)</module-level-focus>
     <wave-level-focus>Integration between modules with realistic mock data</wave-level-focus>
     <phase-level-focus>Full pipeline from MCP tool call to response, including edge cases</phase-level-focus>
     <redaction>Never log API keys or full request/response payloads.</redaction>
@@ -94,7 +94,7 @@
       <scenarios>
         <scenario-1 kind="success">Config loads from env vars with valid API key</scenario-1>
         <scenario-2 kind="failure">Missing API key raises clear error</scenario-2>
-        <scenario-3 kind="success">Default values applied correctly (agent_count=16, timeout=300, log_level=INFO)</scenario-3>
+        <scenario-3 kind="success">Default values applied correctly (agent_count=16, timeout=180, log_level=WARNING)</scenario-3>
         <scenario-4 kind="success">reload_config picks up new .env values</scenario-4>
         <scenario-5 kind="success">Price fields loaded from POLZA_PRICE_INPUT_PER_1M / POLZA_PRICE_OUTPUT_PER_1M</scenario-5>
         <scenario-6 kind="failure">api_key is SecretStr — empty string rejected (min_length=1)</scenario-6>
@@ -118,7 +118,7 @@
         <scenario-3 kind="failure">API returns 401 → AUTH_FAILED error</scenario-3>
         <scenario-4 kind="failure">API timeout → TIMEOUT error</scenario-4>
         <scenario-5 kind="success">Response parsing extracts output_text correctly</scenario-5>
-        <scenario-6 kind="success">Retry on 429 with exponential backoff</scenario-7>
+        <scenario-6 kind="success">Retry on 429 with exponential backoff</scenario-6>
         <scenario-7 kind="success">Retry on 5xx (up to 2 retries)</scenario-7>
         <scenario-8 kind="success">Dynamic timeout: 4 agents → 90s, 16 agents → config timeout</scenario-8>
         <scenario-9 kind="success">MAX_CONTENT_CHARS truncation applied</scenario-9>
@@ -193,13 +193,13 @@
     </Gate-Phase-2>
 
     <Gate-Phase-3 PHASE="Phase-3">
-      <goal>MCP server runs with 7 tools accessible</goal>
+      <goal>MCP server runs with 8 tools accessible</goal>
       <commands>
         <command-1>pytest tests/test_server.py -v</command-1>
       </commands>
       <required-evidence>
         <evidence-1>MCP server starts without errors</evidence-1>
-        <evidence-2>7 tools registered and callable</evidence-2>
+        <evidence-2>8 tools registered and callable</evidence-2>
       </required-evidence>
     </Gate-Phase-3>
 
@@ -231,7 +231,7 @@
         <command-1>pytest tests/ -v</command-1>
       </commands>
       <required-evidence>
-        <evidence-1>127/127 tests pass on both Windows and VM</evidence-1>
+        <evidence-1>157/157 tests pass on Windows</evidence-1>
         <evidence-2>GitHub repo up to date</evidence-2>
         <evidence-3>GRACE artifacts synced with code</evidence-3>
       </required-evidence>
@@ -243,7 +243,7 @@
         <command-1>pytest tests/ -v</command-1>
       </commands>
       <required-evidence>
-        <evidence-1>127/127 tests pass including SecretStr, config validation, decorator tests</evidence-1>
+        <evidence-1>157/157 tests pass including SecretStr, config validation, decorator, file_path sandbox, transport-error retry tests</evidence-1>
         <evidence-2>api_key never appears in logs or repr output</evidence-2>
       </required-evidence>
     </Gate-Phase-7>

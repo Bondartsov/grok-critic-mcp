@@ -1,5 +1,5 @@
 <KnowledgeGraph>
-  <Project NAME="grok-critic-mcp" VERSION="1.8.0">
+  <Project NAME="grok-critic-mcp" VERSION="1.9.0">
     <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP, prompt caching, self-update, SecretStr, decorator</keywords>
     <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 8 MCP tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update. Декоратор _review_tool для DRY. SecretStr для api_key. Config валидации. Используется как субагент "Критик" в Kilo Code через skill.</annotation>
 
@@ -9,30 +9,30 @@
       <depends>none</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
       <annotations>
-        <type-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_, fields: api_key (SecretStr), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, price_input_per_1m, price_output_per_1m" />
+        <type-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_, fields: api_key (SecretStr), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, log_file, price_input_per_1m, price_output_per_1m, allow_self_update, allowed_read_dirs (sandbox roots for file_path), max_retries, retry_backoff_base, max_content_chars, timeout_low, timeout_mid" />
         <fn-load_config PURPOSE="Load config from env vars and .env file" />
         <fn-reload_config PURPOSE="Hot reload config from .env without process restart" />
-        <fn-setup_logging PURPOSE="Configure Python logging with level from env" />
+        <fn-_setup_logging PURPOSE="Configure Python logging with level from env (private)" />
         <export-config PURPOSE="Module-level config singleton" />
       </annotations>
     </M-CONFIG>
 
     <M-API NAME="APIClient" TYPE="INTEGRATION" STATUS="complete">
-      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff, динамический timeout, расчёт стоимости, защита от cost DoS. Использует config.api_key.get_secret_value().</purpose>
+      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff (TimeoutException + все httpx.TransportError: ConnectError/ReadError/RemoteProtocolError, с пересозданием клиента на ретрае), динамический timeout, расчёт стоимости, защита от cost DoS. Использует config.api_key.get_secret_value().</purpose>
       <path>src/grok_critic/api_client.py</path>
       <depends>M-CONFIG</depends>
       <verification-ref>V-M-API</verification-ref>
       <annotations>
-        <type-CritiqueResult PURPOSE="Dataclass: text, model, usage, cost_usd, cost_rub (from API), cached_tokens, effort, agent_count, review_id" />
+        <type-CritiqueResult PURPOSE="Dataclass: text, model, agent_count, effort, input/output/total_tokens, cost_usd, cost_rub (from API), cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
         <type-ResponsesClient PURPOSE="Async HTTP client wrapper with persistent httpx.AsyncClient" />
-        <fn-call PURPOSE="Send request to /v1/responses with retry, prompt_cache_key for caching, dynamic timeout" />
+        <fn-call PURPOSE="Send request to /v1/responses with retry (timeouts + transport errors), prompt_cache_key for caching, dynamic timeout" />
         <fn-get_client PURPOSE="Singleton factory for persistent AsyncClient" />
         <fn-close_client PURPOSE="Gracefully close persistent AsyncClient" />
         <fn-_extract_usage PURPOSE="Extract tokens, cost_rub, cached_tokens from usage payload" />
         <fn-_extract_text PURPOSE="Extract output_text from Responses API payload" />
         <fn-_calculate_cost PURPOSE="Calculate estimated USD cost from token counts and per-1M prices" />
-        <const-MAX_CONTENT_CHARS PURPOSE="100000 — DoS protection, truncates content beyond limit" />
-        <const-AGENT_COUNT_TO_EFFORT PURPOSE="Mapping: {4: 'low', 16: 'high'}" />
+        <const-MAX_CONTENT_CHARS PURPOSE="100000 — backward-compat alias; канонично config.max_content_chars (DoS protection)" />
+        <fn-_resolve_effort PURPOSE="Map agent_count to reasoning.effort: &lt;=4 → 'low', else 'high'" />
       </annotations>
       <CrossLink from="M-API" to="M-CONFIG" relation="reads-api-key-via-get_secret_value-base-url-and-timeout" />
     </M-API>
@@ -59,7 +59,7 @@
     </M-CRITIC>
 
     <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" STATUS="complete">
-      <purpose>FastMCP MCP сервер. 8 зарегистрированных tools. Декоратор _review_tool (DRY, try/except, agent_count validation). _validate_agent_count (clamp 1-64). _read_file_content. Unified error handling. Metadata footer с разделителями разрядов, ₽ и $, cached_tokens. SecretStr-aware reload.</purpose>
+      <purpose>FastMCP MCP сервер. 8 зарегистрированных tools. Декоратор _review_tool (DRY, try/except, agent_count validation). _validate_agent_count (clamp 1-64). _read_file_content с sandbox (allowed roots = cwd + POLZA_ALLOWED_READ_DIRS, denylist секретных файлов, лимит 1MB). Unified error handling. Metadata footer с разделителями разрядов, ₽ и $, cached_tokens. SecretStr-aware reload.</purpose>
       <path>src/grok_critic/server.py</path>
       <depends>M-CRITIC, M-CONFIG</depends>
       <verification-ref>V-M-SERVER</verification-ref>
@@ -74,7 +74,8 @@
         <tool-self_update PURPOSE="Auto-update from GitHub: git pull + pip install + restart" />
         <fn-_review_tool PURPOSE="Decorator: logging + try/except + _format_result for review tools. Validates agent_count, resolves file_path" />
         <fn-_validate_agent_count PURPOSE="Clamp agent_count to valid range 1-64" />
-        <fn-_read_file_content PURPOSE="Read file content for review, returns (content, error)" />
+        <fn-_read_file_content PURPOSE="Read file content for review with sandbox: allowed roots (cwd + POLZA_ALLOWED_READ_DIRS), sensitive-file denylist (.env, *.pem, *.key, id_rsa...), 1MB size cap. Returns (content, error)" />
+        <fn-_allowed_roots PURPOSE="Resolve allowed base dirs for file_path sandbox (cwd + config.allowed_read_dirs)" />
         <fn-_format_result PURPOSE="DRY: unified formatting for success (with metadata footer) and error results" />
         <fn-_fmt PURPOSE="Format numbers with space thousands separator" />
         <fn-main PURPOSE="Entry point: create FastMCP server and run stdio" />

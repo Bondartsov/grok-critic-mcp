@@ -3,7 +3,7 @@
     <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 8 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart, self-update.</objective>
     <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>
     <resolved-risk-1>Polza.AI поддерживает /v1/responses — подтверждено.</resolved-risk-1>
-    <risk-2>Timeout — grok multi-agent работает медленно (до 5 мин для 16 агентов). Mitigated: динамический timeout 90s/300s.</risk-2>
+    <risk-2>Timeout — grok multi-agent работает медленно (до 5 мин для 16 агентов). Mitigated: динамический timeout 90s/150s/180s.</risk-2>
     <risk-3>Стоимость — mitigated: MAX_CONTENT_CHARS=100000, цена в metadata footer каждого ответа.</risk-3>
   </ArchitectureNotes>
 
@@ -180,7 +180,7 @@
 
     <Phase-3 name="Integration" status="complete">
       <goal>MCP сервер, интеграция в Kilo Code</goal>
-      <step-1 module="M-SERVER" status="complete" verification="V-M-SERVER">Реализовать MCP сервер с FastMCP (7 tools)</step-1>
+      <step-1 module="M-SERVER" status="complete" verification="V-M-SERVER">Реализовать MCP сервер с FastMCP (8 tools)</step-1>
       <step-2 module="M-SERVER" status="complete">Зарегистрировать в kilo.json как MCP сервер</step-2>
       <step-3 module="M-SERVER" status="complete">Создать Kilo Code skill (SKILL.md) вместо агента</step-3>
     </Phase-3>
@@ -221,6 +221,17 @@
       <step-6 module="M-CRITIC" status="complete">health_check: api_key через get_secret_value()</step-6>
       <step-7 status="complete">28 новых тестов (99 → 127): SecretStr, валидации, декоратор, _validate_agent_count</step-7>
     </Phase-7>
+
+    <Phase-8 name="Hardening v1.9.0">
+      <goal>Устранение находок аудита: SEC-01, REL-01..05, BUG-01..03, QUAL-01/02, синхронизация документации</goal>
+      <step-1 module="M-SERVER" status="complete">SEC-01: file_path sandbox — allowed roots (cwd + POLZA_ALLOWED_READ_DIRS), denylist секретов, лимит 1MB</step-1>
+      <step-2 module="M-API" status="complete">REL-01: retry всех httpx.TransportError с пересозданием клиента; REL-04: follow_redirects; REL-05: empty response → error; BUG-03: sha256 prompt_cache_key</step-2>
+      <step-3 module="M-SERVER" status="complete">BUG-01: allow_file_path=False для critic_followup; REL-02: чтение файла через asyncio.to_thread</step-3>
+      <step-4 module="M-CRITIC" status="complete">REL-03: cost-guard в followup через общий _content_size_error</step-4>
+      <step-5 module="M-CONFIG" status="complete">QUAL-01/02: max_retries, retry_backoff_base, max_content_chars, timeout_low, timeout_mid — поля конфига</step-5>
+      <step-6 status="complete">30 новых тестов (127 → 157): sandbox, retry recovery, cache-key, size-guard, file_path integration, package exports, resolve_timeout</step-6>
+      <step-7 status="complete">DOC-01..12: AGENTS.md 1.9.0/8 tools/157 тестов, knowledge-graph (CritiqueResult, _resolve_effort, _setup_logging, M-CONFIG поля), requirements/verification-plan timeout=180, README config-таблица + sandbox + retry, SKILL.md file_path + feature flag, URL репозитория унифицирован</step-7>
+    </Phase-8>
   </ImplementationOrder>
 
   <ExecutionPolicy>
