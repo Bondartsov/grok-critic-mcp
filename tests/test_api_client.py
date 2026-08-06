@@ -1,5 +1,5 @@
 # FILE: tests/test_api_client.py
-# VERSION: 1.1.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-API ResponsesClient with mocked HTTP
 #   SCOPE: Test call(), error handling, response parsing, CritiqueResult, usage, cost
@@ -17,14 +17,18 @@ from pydantic import SecretStr
 import pytest
 
 from grok_critic.api_client import (
+    MAX_RETRIES,
     CritiqueResult,
     ResponsesClient,
     _calculate_cost,
     _extract_text,
     _extract_usage,
     _resolve_effort,
+    _resolve_timeout,
+    close_client,
     get_client,
 )
+from grok_critic.config import config
 
 
 # START_BLOCK_EFFORT_TESTS
@@ -340,13 +344,68 @@ class TestResponsesClientCall:
             assert "Too many requests for grok-4.20-multi-agent" in result.error
 
     async def test_timeout(self, client: ResponsesClient) -> None:
-        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
             mock_httpx = AsyncMock()
             mock_httpx.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
             assert "timed out" in result.error.lower()
+
+    async def test_network_error_retried_then_success(self, client: ResponsesClient) -> None:
+        """REL-01: ConnectError/ReadError ретраятся, запрос в итоге успешен."""
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(side_effect=[
+                httpx.ConnectError("connection refused"),
+                httpx.ReadError("connection reset"),
+                mock_response,
+            ])
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert result.success
+            assert result.text == "ok"
+            assert mock_httpx.post.call_count == 3
+            assert mock_sleep.call_count == 2
+
+    async def test_network_error_exhausted(self, client: ResponsesClient) -> None:
+        """REL-01: после исчерпания ретраев — понятная ошибка, а не падение."""
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "Network error" in result.error
+            assert "ConnectError" in result.error
+            assert mock_httpx.post.call_count == MAX_RETRIES + 1
+
+    async def test_remote_protocol_error_retried(self, client: ResponsesClient) -> None:
+        """REL-01: RemoteProtocolError (мёртвое keep-alive соединение) ретраится."""
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(side_effect=[
+                httpx.RemoteProtocolError("Server disconnected"),
+                mock_response,
+            ])
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert result.success
+            assert mock_httpx.post.call_count == 2
 
     async def test_system_prompt_included(self, client: ResponsesClient) -> None:
         captured_body: dict = {}
@@ -398,6 +457,10 @@ class TestResponsesClientCall:
             mock_cfg.base_url = "https://polza.ai/api/v1"
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
 
             mock_response = httpx.Response(
                 200,
@@ -415,3 +478,160 @@ class TestResponsesClientCall:
 
 
 # END_BLOCK_CLIENT_CALL
+
+
+# START_BLOCK_RESOLVE_TIMEOUT
+class TestResolveTimeout:
+    """TEST-01: три ветки динамического таймаута."""
+
+    def test_le_4_agents_uses_timeout_low(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "timeout_seconds", 180)
+        assert _resolve_timeout(4) == 90
+        assert _resolve_timeout(1) == 90
+
+    def test_le_8_agents_uses_timeout_mid(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "timeout_seconds", 180)
+        assert _resolve_timeout(8) == 150
+        assert _resolve_timeout(5) == 150
+
+    def test_over_8_agents_uses_base(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "timeout_seconds", 180)
+        assert _resolve_timeout(16) == 180
+        assert _resolve_timeout(64) == 180
+
+    def test_small_base_caps_all(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "timeout_seconds", 30)
+        assert _resolve_timeout(4) == 30
+        assert _resolve_timeout(8) == 30
+        assert _resolve_timeout(16) == 30
+
+    def test_env_override_thresholds(self, monkeypatch) -> None:
+        """QUAL-01: пороги конфигурируются через config."""
+        monkeypatch.setattr(config, "timeout_seconds", 500)
+        monkeypatch.setattr(config, "timeout_low", 45)
+        monkeypatch.setattr(config, "timeout_mid", 120)
+        assert _resolve_timeout(4) == 45
+        assert _resolve_timeout(8) == 120
+        assert _resolve_timeout(16) == 500
+
+
+# END_BLOCK_RESOLVE_TIMEOUT
+
+
+# START_BLOCK_CACHE_KEY
+class TestPromptCacheKey:
+    """BUG-03: prompt_cache_key детерминирован (sha256), не зависит от процесса."""
+
+    @pytest.fixture()
+    def client(self) -> ResponsesClient:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.price_input_per_1m = 0.0
+            mock_cfg.price_output_per_1m = 0.0
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            return ResponsesClient()
+
+    async def test_same_prompt_same_key(self, client: ResponsesClient) -> None:
+        import hashlib
+
+        captured: list[dict] = []
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+
+        async def capture_post(url: str, **kwargs: object) -> httpx.Response:
+            body = kwargs.get("json")
+            if isinstance(body, dict):
+                captured.append(body)
+            return mock_response
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = capture_post
+            mock_gc.return_value = mock_httpx
+            await client.call("p1", system_prompt="be critical")
+            await client.call("p2", system_prompt="be critical")
+
+        assert len(captured) == 2
+        expected = f"gc-{hashlib.sha256('be critical'.encode('utf-8')).hexdigest()[:8]}"
+        assert captured[0]["prompt_cache_key"] == expected
+        assert captured[1]["prompt_cache_key"] == expected
+
+    async def test_no_system_prompt_no_key(self, client: ResponsesClient) -> None:
+        captured: dict = {}
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+
+        async def capture_post(url: str, **kwargs: object) -> httpx.Response:
+            body = kwargs.get("json")
+            if isinstance(body, dict):
+                captured.update(body)
+            return mock_response
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = capture_post
+            mock_gc.return_value = mock_httpx
+            await client.call("prompt")
+
+        assert "prompt_cache_key" not in captured
+
+
+# END_BLOCK_CACHE_KEY
+
+
+# START_BLOCK_CLIENT_FEATURES
+class TestClientFeatures:
+    @pytest.fixture()
+    def client(self) -> ResponsesClient:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.price_input_per_1m = 0.0
+            mock_cfg.price_output_per_1m = 0.0
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            return ResponsesClient()
+
+    async def test_client_follows_redirects(self) -> None:
+        """REL-04: persistent client создаётся с follow_redirects=True."""
+        c = await get_client()
+        try:
+            assert c.follow_redirects is True
+        finally:
+            await close_client()
+
+    async def test_empty_response_is_error(self, client: ResponsesClient) -> None:
+        """REL-05: 200 OK с payload без текста — явная ошибка, не молчаливый пустой успех."""
+        mock_response = httpx.Response(200, json={"unexpected": "format"})
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "Empty response" in result.error
+
+    async def test_generic_4xx(self, client: ResponsesClient) -> None:
+        """TEST-10: прочие 4xx — Client error с сообщением провайдера."""
+        mock_response = httpx.Response(
+            400, json={"error": {"code": "BAD_REQUEST", "message": "model not found"}}
+        )
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert "Client error" in result.error
+            assert "model not found" in result.error
+
+
+# END_BLOCK_CLIENT_FEATURES

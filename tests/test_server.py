@@ -1,5 +1,5 @@
 # FILE: tests/test_server.py
-# VERSION: 1.2.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-SERVER MCP tool registration and invocation
 #   SCOPE: Verify tools are registered, parameters work, calls delegate correctly
@@ -15,6 +15,7 @@ import pytest
 from pydantic import SecretStr
 
 from grok_critic.api_client import CritiqueResult
+from grok_critic.config import config
 from grok_critic.server import (
     _read_file_content,
     _validate_agent_count,
@@ -417,14 +418,16 @@ class TestReadFileContent:
         assert content == ""
         assert "not found" in err.lower() or "not a file" in err.lower()
 
-    def test_empty_file(self, tmp_path) -> None:
+    def test_empty_file(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
         f = tmp_path / "empty.py"
         f.write_text("")
         content, err = _read_file_content(str(f))
         assert content == ""
         assert "empty" in err.lower()
 
-    def test_valid_file(self, tmp_path) -> None:
+    def test_valid_file(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
         f = tmp_path / "code.py"
         f.write_text("def hello(): pass", encoding="utf-8")
         content, err = _read_file_content(str(f))
@@ -435,6 +438,62 @@ class TestReadFileContent:
         content, err = _read_file_content(str(tmp_path))
         assert content == ""
         assert "not a file" in err.lower()
+
+    def test_outside_allowed_dirs_denied(self, tmp_path) -> None:
+        """SEC-01: файл вне cwd и POLZA_ALLOWED_READ_DIRS отклоняется."""
+        f = tmp_path / "code.py"
+        f.write_text("x = 1", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert content == ""
+        assert "denied" in err.lower()
+
+    def test_path_traversal_denied(self, tmp_path, monkeypatch) -> None:
+        """SEC-01: ../ из разрешённой директории наружу отклоняется."""
+        secret_dir = tmp_path / "secret"
+        secret_dir.mkdir()
+        (secret_dir / "passwords.txt").write_text("hunter2", encoding="utf-8")
+        allowed = tmp_path / "project"
+        allowed.mkdir()
+        monkeypatch.setattr(config, "allowed_read_dirs", str(allowed))
+        content, err = _read_file_content(str(allowed / ".." / "secret" / "passwords.txt"))
+        assert content == ""
+        assert "denied" in err.lower()
+
+    def test_sensitive_name_denied_inside_allowed(self, tmp_path, monkeypatch) -> None:
+        """SEC-01: .env/id_rsa блокируются даже внутри разрешённой директории."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        for name in (".env", "id_rsa", "credentials.json"):
+            f = tmp_path / name
+            f.write_text("SECRET=1", encoding="utf-8")
+            content, err = _read_file_content(str(f))
+            assert content == "", f"{name} should be blocked"
+            assert "sensitive" in err.lower()
+
+    def test_sensitive_suffix_denied_inside_allowed(self, tmp_path, monkeypatch) -> None:
+        """SEC-01: *.pem/*.key блокируются даже внутри разрешённой директории."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        for name in ("server.pem", "private.key"):
+            f = tmp_path / name
+            f.write_text("-----BEGIN PRIVATE KEY-----", encoding="utf-8")
+            content, err = _read_file_content(str(f))
+            assert content == "", f"{name} should be blocked"
+            assert "sensitive" in err.lower()
+
+    def test_multiple_allowed_dirs(self, tmp_path, monkeypatch) -> None:
+        """Несколько директорий через os.pathsep — обе доступны."""
+        import os
+
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "a.py").write_text("a = 1", encoding="utf-8")
+        (dir_b / "b.py").write_text("b = 2", encoding="utf-8")
+        monkeypatch.setattr(config, "allowed_read_dirs", f"{dir_a}{os.pathsep}{dir_b}")
+        content_a, err_a = _read_file_content(str(dir_a / "a.py"))
+        content_b, err_b = _read_file_content(str(dir_b / "b.py"))
+        assert err_a is None and "a = 1" in content_a
+        assert err_b is None and "b = 2" in content_b
 
 
 # END_BLOCK_READ_FILE_CONTENT
@@ -526,3 +585,44 @@ class TestSecurityAuditTool:
 
 
 # END_BLOCK_ARCHITECTURE_SECURITY_TOOLS
+
+
+# START_BLOCK_FILE_PATH_INTEGRATION
+class TestFilePathIntegration:
+    """BUG-01 / TEST-06: file_path через декоратор — интеграционные сценарии."""
+
+    async def test_review_with_file_path(self, tmp_path, monkeypatch) -> None:
+        """Валидный файл в разрешённой директории читается и уходит как content."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        f = tmp_path / "code.py"
+        f.write_text("def hello(): pass", encoding="utf-8")
+        mock = AsyncMock(return_value=CritiqueResult(
+            text="review ok", model="m", agent_count=4, effort="low", review_id="rev_1"
+        ))
+        with patch("grok_critic.server.structured_review", new=mock):
+            result = await critic_review(file_path=str(f))
+            assert "review ok" in result
+            assert mock.call_args.kwargs["content"] == "def hello(): pass"
+            assert mock.call_args.kwargs["context"] == f"File: {f}"
+
+    async def test_review_file_path_outside_sandbox(self, tmp_path) -> None:
+        """Файл вне sandbox — ошибка, structured_review НЕ вызывается."""
+        f = tmp_path / "code.py"
+        f.write_text("x = 1", encoding="utf-8")
+        mock = AsyncMock()
+        with patch("grok_critic.server.structured_review", new=mock):
+            result = await critic_review(file_path=str(f))
+            assert "❌" in result
+            assert "denied" in result.lower()
+            mock.assert_not_called()
+
+    async def test_followup_rejects_file_path(self) -> None:
+        """BUG-01: file_path у critic_followup — внятная ошибка, не TypeError."""
+        result = await critic_followup(
+            previous_review="review", question="why?", file_path="/any/file.py"
+        )
+        assert "❌" in result
+        assert "does not support file_path" in result
+
+
+# END_BLOCK_FILE_PATH_INTEGRATION

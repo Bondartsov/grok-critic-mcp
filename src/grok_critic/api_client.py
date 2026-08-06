@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.8.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -22,15 +23,17 @@ from grok_critic.config import config
 
 logger = logging.getLogger("grok-critic.api_client")
 
+# Backward-compat aliases — каноничные значения живут в config
+# (max_content_chars / max_retries / retry_backoff_base) и читаются на каждый вызов,
+# чтобы reload_config подхватывал их без рестарта.
 MAX_CONTENT_CHARS = 100_000  # ~100KB — защита от DoS по стоимости
+MAX_RETRIES = 2
+RETRY_BACKOFF_BASE = 2.0  # seconds
 
 # agent_count → reasoning.effort mapping.
 # According to xAI docs, only 2 modes exist:
 #   4 agents → effort "low"
 #  16 agents → effort "high"
-
-MAX_RETRIES = 2
-RETRY_BACKOFF_BASE = 2.0  # seconds
 
 
 # START_BLOCK_CRITIQUE_RESULT
@@ -78,9 +81,9 @@ def _resolve_timeout(agent_count: int) -> int:
     """Dynamic timeout: fewer agents → shorter timeout."""
     base = config.timeout_seconds
     if agent_count <= 4:
-        return min(base, 90)
+        return min(base, config.timeout_low)
     if agent_count <= 8:
-        return min(base, 150)
+        return min(base, config.timeout_mid)
     return base  # 16+ agents — full configured timeout (default 180s+)
 
 
@@ -150,7 +153,8 @@ async def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         # Базовый timeout = максимальный из конфига. Реальный — через timeout в .post()
-        _client = httpx.AsyncClient(timeout=config.timeout_seconds)
+        # follow_redirects=True: Polza.AI может отвечать 3xx при смене endpoint'ов.
+        _client = httpx.AsyncClient(timeout=config.timeout_seconds, follow_redirects=True)
         logger.info("[APIClient][get_client][INIT] Created persistent client")
     return _client
 
@@ -213,8 +217,9 @@ class ResponsesClient:
         # Enable prompt caching via Polza.AI's prompt_cache_key parameter.
         # Stable key per system prompt type maximises cache hit rate.
         if system_prompt:
-            # Use a hash of the system prompt as cache key
-            cache_key = f"gc-{hash(system_prompt) & 0xFFFFFFFF:x}"
+            # Детерминированный хэш: встроенный hash() рандомизирован PYTHONHASHSEED
+            # и менялся бы при каждом рестарте процесса, убивая prompt caching (BUG-03).
+            cache_key = f"gc-{hashlib.sha256(system_prompt.encode('utf-8')).hexdigest()[:8]}"
             body["prompt_cache_key"] = cache_key
 
         headers = {
@@ -228,18 +233,27 @@ class ResponsesClient:
         resp: httpx.Response | None = None
         last_error = ""
         request_timeout = httpx.Timeout(timeout)
-        for attempt in range(MAX_RETRIES + 1):
+        max_retries = config.max_retries
+        backoff = config.retry_backoff_base
+        for attempt in range(max_retries + 1):
             try:
                 client = await get_client()
                 resp = await client.post(url, json=body, headers=headers, timeout=request_timeout)
-            except httpx.TimeoutException:
+            except httpx.TransportError as exc:
+                # httpx.TransportError — базовый класс для ConnectError, ReadError,
+                # RemoteProtocolError, ConnectTimeout и пр. (TimeoutException — тоже его
+                # наследник). Сетевые сбои ретраим наравне с таймаутами (REL-01).
+                is_timeout = isinstance(exc, httpx.TimeoutException)
+                last_error = "Request timed out" if is_timeout else f"Network error: {type(exc).__name__}"
                 logger.error(
-                    "[APIClient][call][CALL] Timeout after %ds (attempt %d/%d)",
-                    timeout, attempt + 1, MAX_RETRIES + 1,
+                    "[APIClient][call][CALL] %s (attempt %d/%d): %s",
+                    last_error, attempt + 1, max_retries + 1, exc,
                 )
-                last_error = "Request timed out"
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_BACKOFF_BASE ** attempt)
+                if attempt < max_retries:
+                    # Пересоздаём клиент: пул мог сохранить мёртвое keep-alive соединение
+                    # (классическая причина RemoteProtocolError).
+                    await close_client()
+                    await asyncio.sleep(backoff ** attempt)
                     continue
                 return CritiqueResult(
                     text="", model=self._model, agent_count=agent_count,
@@ -247,11 +261,11 @@ class ResponsesClient:
                 )
 
             # Retryable status codes: 429 (rate limit) and 5xx (server error)
-            if resp.status_code in (429, *range(500, 600)) and attempt < MAX_RETRIES:
-                wait = RETRY_BACKOFF_BASE ** attempt
+            if resp.status_code in (429, *range(500, 600)) and attempt < max_retries:
+                wait = backoff ** attempt
                 logger.warning(
                     "[APIClient][call][RETRY] %d — retrying in %.1fs (attempt %d/%d)",
-                    resp.status_code, wait, attempt + 1, MAX_RETRIES + 1,
+                    resp.status_code, wait, attempt + 1, max_retries + 1,
                 )
                 await asyncio.sleep(wait)
                 continue
@@ -259,7 +273,7 @@ class ResponsesClient:
 
         if resp is None:
             # Safety net: all retry paths exhausted without a response.
-            logger.error("[APIClient][call][ERROR] No response received after %d attempts", MAX_RETRIES + 1)
+            logger.error("[APIClient][call][ERROR] No response received after %d attempts", max_retries + 1)
             return CritiqueResult(
                 text="", model=self._model, agent_count=agent_count,
                 effort=effort, review_id=review_id,
@@ -337,6 +351,19 @@ class ResponsesClient:
             )
 
         text = _extract_text(payload)
+        if not text.strip():
+            # REL-05: 200 OK, но текст не извлёкся — неожиданный формат payload.
+            # Возвращаем явную ошибку вместо молчаливого пустого "успеха".
+            logger.error(
+                "[APIClient][call][ERROR] Empty text in 200 response, payload keys: %s",
+                list(payload.keys()),
+            )
+            return CritiqueResult(
+                text="", model=self._model, agent_count=agent_count,
+                effort=effort, review_id=review_id,
+                error="Empty response from provider (unexpected payload format)",
+            )
+
         input_tokens, output_tokens, total_tokens, cost_rub, cached_tokens, reasoning_tokens = _extract_usage(payload)
         cost_usd = _calculate_cost(input_tokens, output_tokens)
 

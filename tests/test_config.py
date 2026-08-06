@@ -1,5 +1,5 @@
 # FILE: tests/test_config.py
-# VERSION: 1.2.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CONFIG configuration loading and validation
 #   SCOPE: Test env var reading, defaults, log_level validation, price fields

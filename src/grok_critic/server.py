@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.8.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing 8 tools for code review, architecture, security, admin
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
@@ -72,14 +72,57 @@ def _format_result(result) -> str:
 
 
 # START_BLOCK_HELPERS
+# Denylist файлов, которые нельзя отправлять во внешний API ни при каких настройках.
+# Содержимое попадает в prompt → уходит в Polza.AI, поэтому секреты режем на входе.
+_SENSITIVE_NAMES = frozenset({".env", "id_rsa", "id_ed25519", "id_dsa", "credentials.json"})
+_SENSITIVE_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx", ".kdbx"})
+
+# Верхний предел размера файла для file_path (1 МБ).
+# Достаточно для любого исходника; большие файлы всё равно режутся MAX_CONTENT_CHARS.
+_MAX_FILE_BYTES = 1_000_000
+
+
+def _allowed_roots() -> list[Path]:
+    """Allowed base directories for file_path reads.
+
+    Default: server CWD only. Extra roots come from POLZA_ALLOWED_READ_DIRS
+    (os.pathsep-separated). Resolved once per call — дёшево и всегда актуально
+    после reload_config.
+    """
+    roots = [Path.cwd().resolve()]
+    extra = config.allowed_read_dirs or ""
+    for part in extra.split(os.pathsep):
+        part = part.strip()
+        if part:
+            roots.append(Path(part).expanduser().resolve())
+    return roots
+
+
 def _read_file_content(file_path: str) -> tuple[str, str | None]:
-    """Read file content for review. Returns (content, error_message)."""
+    """Read file content for review. Returns (content, error_message).
+
+    Sandbox: файл обязан лежать внутри allowed roots (cwd + POLZA_ALLOWED_READ_DIRS)
+    и не быть типичным файлом секретов. Защита от path traversal и эксфильтрации
+    секретов во внешний API (SEC-01).
+    """
     try:
-        path = Path(file_path).resolve()
+        path = Path(file_path).expanduser().resolve()
         if not path.exists():
             return "", f"File not found: {path}"
         if not path.is_file():
             return "", f"Not a file: {path}"
+        name_lower = path.name.lower()
+        if name_lower in _SENSITIVE_NAMES or path.suffix.lower() in _SENSITIVE_SUFFIXES:
+            logger.warning("[Server][_read_file_content][DENIED] Sensitive file blocked: %s", path.name)
+            return "", f"Access denied: sensitive file type ({path.name})"
+        if not any(path.is_relative_to(root) for root in _allowed_roots()):
+            logger.warning("[Server][_read_file_content][DENIED] Outside allowed dirs: %s", path)
+            return "", (
+                f"Access denied: {path} is outside allowed directories. "
+                "Allowed: server working directory + POLZA_ALLOWED_READ_DIRS."
+            )
+        if path.stat().st_size > _MAX_FILE_BYTES:
+            return "", f"File too large: {path} ({path.stat().st_size} bytes > {_MAX_FILE_BYTES})"
         content = path.read_text(encoding="utf-8", errors="replace")
         if not content.strip():
             return "", f"File is empty: {path}"
@@ -103,11 +146,14 @@ def _validate_agent_count(agent_count: int | None) -> int | None:
 
 
 # START_BLOCK_DECORATOR
-def _review_tool(tool_name: str) -> Callable:
+def _review_tool(tool_name: str, *, allow_file_path: bool = True) -> Callable:
     """Decorator: logging + try/except + _format_result for review tools.
 
     Eliminates boilerplate across critic_review, architecture_review, security_audit.
     Wrapped function returns a CritiqueResult; decorator handles formatting and errors.
+
+    allow_file_path=False (critic_followup): file_path не поддерживается —
+    возвращается явная ошибка вместо TypeError от инъекции лишнего kwarg (BUG-01).
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -118,8 +164,11 @@ def _review_tool(tool_name: str) -> Callable:
 
             # Resolve file_path → content
             file_path = kwargs.pop("file_path", None)
+            if file_path and not allow_file_path:
+                return f"❌ {tool_name} does not support file_path (pass content directly)"
             if file_path:
-                file_content, err = _read_file_content(file_path)
+                # to_thread: синхронное чтение файла не блокирует event loop (REL-02)
+                file_content, err = await asyncio.to_thread(_read_file_content, file_path)
                 if err:
                     return f"❌ {err}"
                 kwargs["content"] = file_content
@@ -187,7 +236,7 @@ async def critic_review(
 
 # START_BLOCK_TOOL_CRITIC_FOLLOWUP
 @server.tool()
-@_review_tool("critic_followup")
+@_review_tool("critic_followup", allow_file_path=False)
 async def critic_followup(
     previous_review: str,
     question: str,

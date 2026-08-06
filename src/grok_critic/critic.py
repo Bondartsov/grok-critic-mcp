@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.7.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
@@ -13,10 +13,18 @@ import logging
 
 import httpx
 
-from grok_critic.api_client import CritiqueResult, ResponsesClient, MAX_CONTENT_CHARS
+from grok_critic.api_client import CritiqueResult, ResponsesClient
 from grok_critic.config import config
 
 logger = logging.getLogger("grok-critic.critic")
+
+
+def _content_size_error(total_len: int) -> str | None:
+    """Единый cost-guard: None, если размер допустим, иначе текст ошибки."""
+    limit = config.max_content_chars
+    if total_len > limit:
+        return f"Контент слишком большой ({total_len} символов). Максимум {limit}."
+    return None
 
 
 # START_BLOCK_SYSTEM_PROMPT
@@ -91,12 +99,12 @@ async def _perform_review(
             effort="low", error=f"Пустой контент для {error_label}",
         )
 
-    if len(content) > MAX_CONTENT_CHARS:
+    if size_err := _content_size_error(len(content)):
         return CritiqueResult(
             text="", model=config.model,
             agent_count=agent_count or config.agent_count,
             effort="low",
-            error=f"Контент слишком большой ({len(content)} символов). Максимум {MAX_CONTENT_CHARS}.",
+            error=size_err,
         )
 
     count = agent_count if agent_count is not None else config.agent_count
@@ -155,6 +163,17 @@ async def followup(
             agent_count=agent_count or config.agent_count,
             effort="low",
             error="Пустой предыдущий ревью или вопрос",
+        )
+
+    # REL-03: followup раньше обходил MAX_CONTENT_CHARS — гигантский previous_review
+    # уходил в платный API без ограничения.
+    if size_err := _content_size_error(len(previous_review) + len(question)):
+        return CritiqueResult(
+            text="",
+            model=config.model,
+            agent_count=agent_count or config.agent_count,
+            effort="low",
+            error=size_err,
         )
 
     count = agent_count if agent_count is not None else config.agent_count

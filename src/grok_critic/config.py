@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.6.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging
@@ -39,6 +39,16 @@ class AppConfig(BaseSettings):
     price_input_per_1m: float = Field(default=0.0)
     price_output_per_1m: float = Field(default=0.0)
     allow_self_update: bool = Field(default=False)
+    # Дополнительные директории, откуда разрешено читать файлы через file_path.
+    # Разделитель — os.pathsep (';' на Windows, ':' на Unix).
+    # Пусто = разрешена только текущая рабочая директория (cwd) сервера.
+    allowed_read_dirs: str = Field(default="")
+    # Тюнинг клиента (раньше — hardcoded константы в api_client.py)
+    max_retries: int = Field(default=2, ge=0, le=10)
+    retry_backoff_base: float = Field(default=2.0, ge=0.0)
+    max_content_chars: int = Field(default=100_000, ge=1)  # ~100KB — защита от DoS по стоимости
+    timeout_low: int = Field(default=90, ge=1)    # таймаут при agent_count <= 4
+    timeout_mid: int = Field(default=150, ge=1)   # таймаут при 4 < agent_count <= 8
 
     @field_validator("log_level")
     @classmethod

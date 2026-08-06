@@ -1,5 +1,5 @@
 # FILE: tests/test_critic.py
-# VERSION: 1.1.0
+# VERSION: 1.9.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CRITIC prompt building, review logic, followup, health_check
 #   SCOPE: Test _build_user_prompt, structured_review, followup, health_check
@@ -15,10 +15,15 @@ import pytest
 from pydantic import SecretStr
 
 from grok_critic.api_client import CritiqueResult
+from grok_critic.config import config
 from grok_critic.critic import (
+    ARCHITECTURE_SYSTEM_PROMPT,
     CRITIC_SYSTEM_PROMPT,
     FOLLOWUP_SYSTEM_PROMPT,
+    SECURITY_SYSTEM_PROMPT,
     _build_user_prompt,
+    do_architecture_review,
+    do_security_audit,
     followup,
     health_check,
     structured_review,
@@ -260,3 +265,77 @@ class TestHealthCheck:
 
 
 # END_BLOCK_HEALTH_CHECK
+
+
+# START_BLOCK_SIZE_GUARD
+class TestContentSizeGuard:
+    """TEST-03 / REL-03: единый cost-guard MAX_CONTENT_CHARS для всех путей ревью."""
+
+    async def test_structured_review_oversized(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "max_content_chars", 100)
+        call_mock = AsyncMock()
+        with patch("grok_critic.critic.ResponsesClient.call", new=call_mock):
+            result = await structured_review("x" * 101)
+            assert not result.success
+            assert "слишком большой" in result.error
+            call_mock.assert_not_called()
+
+    async def test_followup_oversized(self, monkeypatch) -> None:
+        """REL-03: followup раньше обходил cost-guard — гигантский previous_review уходил в платный API."""
+        monkeypatch.setattr(config, "max_content_chars", 100)
+        call_mock = AsyncMock()
+        with patch("grok_critic.critic.ResponsesClient.call", new=call_mock):
+            result = await followup(previous_review="x" * 90, question="y" * 20)
+            assert not result.success
+            assert "слишком большой" in result.error
+            call_mock.assert_not_called()
+
+    async def test_followup_within_limit(self, monkeypatch) -> None:
+        monkeypatch.setattr(config, "max_content_chars", 1000)
+        call_mock = AsyncMock(return_value=CritiqueResult(
+            text="answer", model="m", agent_count=4, effort="low", review_id="rev_1"
+        ))
+        with patch("grok_critic.critic.ResponsesClient.call", new=call_mock):
+            result = await followup(previous_review="review text", question="why?")
+            assert result.success
+            call_mock.assert_called_once()
+
+
+# END_BLOCK_SIZE_GUARD
+
+
+# START_BLOCK_SPECIALIZED_REVIEW_TESTS
+class TestSpecializedReviews:
+    """TEST-04: реальные do_architecture_review / do_security_audit — правильные system-промпты и focus_areas."""
+
+    async def test_architecture_review_uses_arch_prompt(self) -> None:
+        call_mock = AsyncMock(return_value=CritiqueResult(
+            text="ok", model="m", agent_count=4, effort="low", review_id="rev_1"
+        ))
+        with patch("grok_critic.critic.ResponsesClient.call", new=call_mock):
+            result = await do_architecture_review("monolith with layers", agent_count=4)
+            assert result.success
+            kwargs = call_mock.call_args.kwargs
+            assert kwargs["system_prompt"] == ARCHITECTURE_SYSTEM_PROMPT
+            assert "architecture" in kwargs["prompt"]
+            assert "scalability" in kwargs["prompt"]
+
+    async def test_security_audit_uses_security_prompt(self) -> None:
+        call_mock = AsyncMock(return_value=CritiqueResult(
+            text="ok", model="m", agent_count=4, effort="low", review_id="rev_1"
+        ))
+        with patch("grok_critic.critic.ResponsesClient.call", new=call_mock):
+            result = await do_security_audit("app.get('/u/<id>')", agent_count=4)
+            assert result.success
+            kwargs = call_mock.call_args.kwargs
+            assert kwargs["system_prompt"] == SECURITY_SYSTEM_PROMPT
+            assert "security" in kwargs["prompt"]
+            assert "vulnerabilities" in kwargs["prompt"]
+
+    async def test_architecture_review_empty_content(self) -> None:
+        result = await do_architecture_review("   ")
+        assert not result.success
+        assert "архитектурного ревью" in result.error
+
+
+# END_BLOCK_SPECIALIZED_REVIEW_TESTS
