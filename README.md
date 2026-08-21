@@ -65,31 +65,31 @@ AI-агент, который пишет код, склонен «глотать
 Три уровня, каждый отвечает за своё:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      AI-агент (Kilo / Claude Code / Cursor)    │
-│                                                                │
-│  instructions.md / AGENTS.md ──►  ПРАВИЛА: "когда обязан      │
-│         │                          вызвать критика"            │
-│         ▼                                                      │
-│  skill/grok-critic ───────────►  КАК вызывать: инструменты,   │
-│         │                          параметры, триггеры, cost   │
-│         ▼                                                      │
-│  MCP tool call: critic_review(content=..., ...)               │
-│         │                                                      │
-│         ▼                                                      │
-│  ┌─────────────────────────────────────────┐                 │
-│  │  grok-critic-mcp (Python, stdio)          │                 │
-│  │    server.py   ← FastMCP, 8 tools         │                 │
-│  │      │  _review_tool: file_path→content,  │                 │
-│  │      │  clamp agent_count, log, format    │                 │
-│  │      ▼                                     │                 │
-│  │    critic.py   ← system-промпты, сборка    │                 │
-│  │      ▼                                     │                 │
-│  │    api_client.py ─── HTTP ──► Polza.AI ──► grok-4.20-       │
-│  │      ▲                          /responses   multi-agent    │
-│  │    config.py  ← .env (POLZA_*)             │                 │
-│  └─────────────────────────────────────────┘                 │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│             AI-агент (Kilo / Claude Code / Cursor)               │
+│                                                                  │
+│  instructions.md / AGENTS.md ──►  ПРАВИЛА: "когда обязан         │
+│         │                          вызвать критика"              │
+│         ▼                                                        │
+│  skill/grok-critic ───────────►  КАК вызывать: инструменты,      │
+│         │                          параметры, триггеры, cost     │
+│         ▼                                                        │
+│  MCP tool call: critic_review(content=..., ...)                  │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌──────────────────────────────────────────┐                    │
+│  │  grok-critic-mcp (Python, stdio)         │                    │
+│  │    server.py   ← FastMCP, 8 tools        │                    │
+│  │      │  _review_tool: file_path→content, │                    │
+│  │      │   clamp agent_count, log, format  │                    │
+│  │      ▼                                   │                    │
+│  │    critic.py   ← system-промпты, сборка  │                    │
+│  │      ▼                                   │                    │
+│  │    api_client.py ─── HTTP ──► Polza.AI ──► grok-4.20-         │
+│  │      ▲                       /responses    multi-agent        │
+│  │    config.py  ← .env (POLZA_*)           │                    │
+│  └──────────────────────────────────────────┘                    │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 - **MCP-сервер** — транспортный слой (Python-процесс на stdio). Принимает tool-вызовы, ходит в Polza.AI, парсит ответ, считает стоимость.
