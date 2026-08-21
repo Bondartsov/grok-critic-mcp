@@ -1,22 +1,26 @@
 # FILE: tests/test_server.py
-# VERSION: 1.9.0
+# VERSION: 1.10.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-SERVER MCP tool registration and invocation
-#   SCOPE: Verify tools are registered, parameters work, calls delegate correctly
+#   SCOPE: Registration, params, delegation, sandbox denylist, file_path opt-in,
+#          heartbeat/elapsed, JSON mode, reload/restart/self_update
 #   DEPENDS: M-SERVER, M-CRITIC
 #   LINKS: M-SERVER
 # END_MODULE_CONTRACT
 
 from __future__ import annotations
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from pydantic import SecretStr
 
 from grok_critic.api_client import CritiqueResult
 from grok_critic.config import config
 from grok_critic.server import (
+    _heartbeat,
+    _parse_json_loose,
     _read_file_content,
     _validate_agent_count,
     architecture_review,
@@ -53,9 +57,11 @@ class TestToolRegistration:
         assert "context" in properties
         assert "agent_count" in properties
         assert "focus_areas" in properties
+        assert "output_format" in properties  # FEAT-JSON
         assert "content" in schema.get("required", [])
 
     def test_critic_followup_tool_has_params(self) -> None:
+        """FEAT-FOLLOWUP-ID: required только question; review_id доступен."""
         tools = server._tool_manager.list_tools()
         followup_tool = next(t for t in tools if t.name == "critic_followup")
         schema = followup_tool.parameters
@@ -63,8 +69,8 @@ class TestToolRegistration:
         assert "previous_review" in properties
         assert "question" in properties
         assert "agent_count" in properties
-        assert "previous_review" in schema.get("required", [])
-        assert "question" in schema.get("required", [])
+        assert "review_id" in properties
+        assert schema.get("required", []) == ["question"]
 
 
 # END_BLOCK_TOOL_REGISTRATION
@@ -85,7 +91,7 @@ class TestCriticReviewTool:
             review_id="rev_abc123",
         )
         with patch(
-            "grok_critic.server.structured_review",
+            "grok_critic.server.general_review",
             new_callable=AsyncMock,
             return_value=mock_result,
         ):
@@ -97,7 +103,7 @@ class TestCriticReviewTool:
         mock = AsyncMock(return_value=CritiqueResult(
             text="ok", model="m", agent_count=8, effort="medium", review_id="rev_1"
         ))
-        with patch("grok_critic.server.structured_review", new=mock):
+        with patch("grok_critic.server.general_review", new=mock):
             await critic_review(
                 content="code",
                 context="FastAPI",
@@ -114,7 +120,7 @@ class TestCriticReviewTool:
         mock = AsyncMock(return_value=CritiqueResult(
             text="ok", model="m", agent_count=16, effort="high", review_id="rev_1"
         ))
-        with patch("grok_critic.server.structured_review", new=mock):
+        with patch("grok_critic.server.general_review", new=mock):
             await critic_review(content="code", focus_areas="  a , b , c  ")
             assert mock.call_args.kwargs["focus_areas"] == ["a", "b", "c"]
 
@@ -131,7 +137,7 @@ class TestCriticReviewTool:
             review_id="rev_test1234",
         )
         with patch(
-            "grok_critic.server.structured_review",
+            "grok_critic.server.general_review",
             new_callable=AsyncMock,
             return_value=mock_result,
         ):
@@ -143,6 +149,16 @@ class TestCriticReviewTool:
             assert "rev_test1234" in result
             assert "$0.0124" in result
 
+    async def test_elapsed_in_metadata(self) -> None:
+        """FEAT-PROGRESS: в metadata присутствует время выполнения."""
+        mock_result = CritiqueResult(
+            text="ok", model="m", agent_count=16, effort="high", review_id="rev_el1"
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            await asyncio.sleep(0.01)
+            result = await critic_review(content="code")
+            assert "⏱ Elapsed:" in result
+
     async def test_error_response(self) -> None:
         mock_result = CritiqueResult(
             text="",
@@ -152,7 +168,7 @@ class TestCriticReviewTool:
             error="API key invalid",
         )
         with patch(
-            "grok_critic.server.structured_review",
+            "grok_critic.server.general_review",
             new_callable=AsyncMock,
             return_value=mock_result,
         ):
@@ -160,8 +176,83 @@ class TestCriticReviewTool:
             assert "❌ Error:" in result
             assert "API key invalid" in result
 
+    async def test_json_output_normalized(self) -> None:
+        """FEAT-JSON: валидный JSON от модели нормализуется к чистому pretty-JSON."""
+        raw = 'Вот разбор:\n```json\n{"summary": "s", "findings": []}\n```'
+        mock_result = CritiqueResult(
+            text=raw, model="m", agent_count=16, effort="high", review_id="rev_js1"
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="code", output_format="json")
+        # до metadata-footer идёт чистый JSON
+        body = result.split("\n---")[0]
+        parsed = json.loads(body)
+        assert parsed["summary"] == "s"
+
+    async def test_json_output_fallback_when_not_json(self) -> None:
+        mock_result = CritiqueResult(
+            text="модель ответила текстом", model="m", agent_count=4, effort="low", review_id="rev_js2"
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="code", output_format="json")
+            assert "⚠️ Модель вернула не-JSON" in result
+            assert "модель ответила текстом" in result
+
 
 # END_BLOCK_CRITIC_REVIEW_TOOL
+
+
+# START_BLOCK_PARSE_JSON_LOOSE
+class TestParseJsonLoose:
+    def test_plain_json(self) -> None:
+        assert _parse_json_loose('{"a": 1}') == {"a": 1}
+
+    def test_json_code_fence(self) -> None:
+        text = "```json\n{\"a\": 2}\n```"
+        assert _parse_json_loose(text) == {"a": 2}
+
+    def test_json_embedded_in_text(self) -> None:
+        text = "Вывод: {\"a\": 3} конец"
+        assert _parse_json_loose(text) == {"a": 3}
+
+    def test_not_json_returns_none(self) -> None:
+        assert _parse_json_loose("совсем не json") is None
+
+    def test_non_dict_json_returns_none(self) -> None:
+        assert _parse_json_loose("[1, 2, 3]") is None
+
+
+# END_BLOCK_PARSE_JSON_LOOSE
+
+
+# START_BLOCK_HEARTBEAT_TESTS
+class TestHeartbeat:
+    async def test_heartbeat_sends_info_until_stopped(self) -> None:
+        """FEAT-PROGRESS: heartbeat шлёт уведомления, пока не установлен stop."""
+        ctx = AsyncMock()
+        stop = asyncio.Event()
+        task = asyncio.create_task(_heartbeat(ctx, "critic_review", stop, interval=0.01))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+        assert ctx.info.await_count >= 1
+
+    async def test_heartbeat_silent_after_immediate_stop(self) -> None:
+        ctx = AsyncMock()
+        stop = asyncio.Event()
+        stop.set()  # ревью завершилось мгновенно
+        await _heartbeat(ctx, "t", stop, interval=0.01)
+        assert ctx.info.await_count == 0
+
+    async def test_decorator_without_ctx_no_crash(self) -> None:
+        """Прямые вызовы без ctx (как в тестах/клиентах без progress) работают."""
+        mock_result = CritiqueResult(text="ok", model="m", agent_count=4, effort="low", review_id="rev_hb")
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="x")
+            assert "ok" in result
+
+
+# END_BLOCK_HEARTBEAT_TESTS
 
 
 # START_BLOCK_CRITIC_FOLLOWUP_TOOL
@@ -221,6 +312,17 @@ class TestCriticFollowupTool:
             )
             assert mock.call_args.kwargs["agent_count"] == 4
 
+    async def test_followup_with_review_id(self) -> None:
+        """FEAT-FOLLOWUP-ID: review_id пробрасывается в critic.followup."""
+        mock = AsyncMock(return_value=CritiqueResult(
+            text="answer", model="m", agent_count=16, effort="high", review_id="rev_new"
+        ))
+        with patch("grok_critic.server.followup", new=mock):
+            await critic_followup(question="why?", review_id="rev_orig123")
+            kwargs = mock.call_args.kwargs
+            assert kwargs["review_id"] == "rev_orig123"
+            assert kwargs["question"] == "why?"
+
 
 # END_BLOCK_CRITIC_FOLLOWUP_TOOL
 
@@ -241,6 +343,24 @@ class TestHealthCheckTool:
             result = await check_health()
             assert "ok" in result
             assert "grok-4.20-multi-agent" in result
+
+    async def test_usage_today_rendered(self) -> None:
+        """FEAT-BUDGET: суточная статистика видна в выводе health_check."""
+        with patch(
+            "grok_critic.server.health_check",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "ok",
+                "model": "m",
+                "base_url": "https://polza.ai/api/v1",
+                "issues": [],
+                "usage_today": {"calls": 3, "errors": 1, "cost_usd": 0.1234, "cost_rub": 45.6},
+            },
+        ):
+            result = await check_health()
+            assert "Today: 3 calls" in result
+            assert "$0.1234" in result
+            assert "45.60 ₽" in result
 
     async def test_with_pricing_info(self) -> None:
         with patch(
@@ -278,6 +398,10 @@ class TestReloadConfigTool:
                 "log_level": "WARNING",
                 "price_input_per_1m": 2.6,
                 "price_output_per_1m": 6.6,
+                "allow_file_path": False,
+                "daily_budget_usd": 5.0,
+                "max_concurrent_requests": 2,
+                "retry_deadline_seconds": 0.0,
             })(),
         ), patch("grok_critic.server.close_client", new_callable=AsyncMock):
             result = await reload_config_tool()
@@ -286,6 +410,8 @@ class TestReloadConfigTool:
             assert "$2.6" in result
             assert "$6.6" in result
             assert "y123" in result  # masked key last 4 chars
+            assert "daily_budget_usd: $5.0" in result
+            assert "(auto = timeout_seconds)" in result
 
     async def test_reload_failure(self) -> None:
         with patch(
@@ -360,7 +486,7 @@ class TestSelfUpdateTool:
 
         pip_proc = AsyncMock()
         pip_proc.communicate = AsyncMock(return_value=(
-            b"Successfully installed grok-critic-mcp-1.5.2",
+            b"Successfully installed grok-critic-mcp-1.10.0",
             b"",
         ))
         pip_proc.returncode = 0
@@ -479,6 +605,60 @@ class TestReadFileContent:
             assert content == "", f"{name} should be blocked"
             assert "sensitive" in err.lower()
 
+    def test_sensitive_glob_variants_denied(self, tmp_path, monkeypatch) -> None:
+        """SEC-02: точечный denylist обходился вариантами имён — глобы их ловят."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        blocked = (
+            ".env.local",              # вариант .env
+            ".env.production",
+            "credentials.prod.json",   # вариант credentials.json
+            "my-credentials.txt",
+            "id_rsa.pub",              # публичный ключ той же пары
+            "backup_id_rsa_old",
+            ".git-credentials",
+            ".netrc",
+            ".htpasswd",
+            "service.pfx",
+            "vault.kdbx",
+        )
+        for name in blocked:
+            f = tmp_path / name
+            f.write_text("SECRET=1", encoding="utf-8")
+            content, err = _read_file_content(str(f))
+            assert content == "", f"{name} should be blocked by glob denylist"
+            assert "sensitive" in err.lower(), f"{name}: wrong error"
+
+    def test_git_config_denied(self, tmp_path, monkeypatch) -> None:
+        """SEC-02: .git/config содержит токены remote-URL — заблокирован."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        cfg = git_dir / "config"
+        cfg.write_text("[remote \"origin\"]\n url = https://token@github.com/x/y.git", encoding="utf-8")
+        content, err = _read_file_content(str(cfg))
+        assert content == ""
+        assert "sensitive" in err.lower()
+
+    def test_case_insensitive_denylist(self, tmp_path, monkeypatch) -> None:
+        """SEC-02: регистр имени не обходит denylist (SECRET.PEM)."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        f = tmp_path / "SECRET.PEM"
+        f.write_text("-----BEGIN CERTIFICATE-----", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert content == ""
+        assert "sensitive" in err.lower()
+
+    def test_normal_files_not_blocked_by_globs(self, tmp_path, monkeypatch) -> None:
+        """SEC-02: легитимные имена, похожие на секреты, НЕ блокируются лишний раз."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        ok_names = ("keyboard.py", "monkey.py", "secrets.py", "config.yaml", ".github-workflow.yml")
+        for name in ok_names:
+            f = tmp_path / name
+            f.write_text("# ok", encoding="utf-8")
+            content, err = _read_file_content(str(f))
+            assert err is None, f"{name} should be readable"
+            assert "# ok" in content
+
     def test_multiple_allowed_dirs(self, tmp_path, monkeypatch) -> None:
         """Несколько директорий через os.pathsep — обе доступны."""
         import os
@@ -504,7 +684,7 @@ class TestDecoratorBehavior:
     async def test_decorator_catches_exception(self) -> None:
         """Decorator wraps unexpected exceptions into user-friendly error strings."""
         with patch(
-            "grok_critic.server.structured_review",
+            "grok_critic.server.general_review",
             new_callable=AsyncMock,
             side_effect=RuntimeError("unexpected boom"),
         ):
@@ -517,19 +697,15 @@ class TestDecoratorBehavior:
         mock = AsyncMock(return_value=CritiqueResult(
             text="ok", model="m", agent_count=1, effort="low", review_id="rev_1"
         ))
-        with patch("grok_critic.server.structured_review", new=mock):
+        with patch("grok_critic.server.general_review", new=mock):
             await critic_review(content="code", agent_count=100)
-            # Decorator clamped 100 → 64, but the underlying function still
-            # receives the clamped value which then goes to structured_review.
-            # structured_review uses config default if None, so we check that
-            # agent_count was clamped (64, not 100).
             assert mock.call_args.kwargs["agent_count"] == 64
 
     async def test_decorator_clamps_negative_agent_count(self) -> None:
         mock = AsyncMock(return_value=CritiqueResult(
             text="ok", model="m", agent_count=1, effort="low", review_id="rev_1"
         ))
-        with patch("grok_critic.server.structured_review", new=mock):
+        with patch("grok_critic.server.general_review", new=mock):
             await critic_review(content="code", agent_count=-1)
             assert mock.call_args.kwargs["agent_count"] == 1
 
@@ -589,35 +765,64 @@ class TestSecurityAuditTool:
 
 # START_BLOCK_FILE_PATH_INTEGRATION
 class TestFilePathIntegration:
-    """BUG-01 / TEST-06: file_path через декоратор — интеграционные сценарии."""
+    """BUG-01 / TEST-06 / SEC-03: file_path через декоратор — интеграционные сценарии."""
 
     async def test_review_with_file_path(self, tmp_path, monkeypatch) -> None:
-        """Валидный файл в разрешённой директории читается и уходит как content."""
+        """Валидный файл в разрешённой директории читается и уходит как content (при включённом opt-in)."""
+        monkeypatch.setattr(config, "allow_file_path", True)
         monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
         f = tmp_path / "code.py"
         f.write_text("def hello(): pass", encoding="utf-8")
         mock = AsyncMock(return_value=CritiqueResult(
             text="review ok", model="m", agent_count=4, effort="low", review_id="rev_1"
         ))
-        with patch("grok_critic.server.structured_review", new=mock):
+        with patch("grok_critic.server.general_review", new=mock):
             result = await critic_review(file_path=str(f))
             assert "review ok" in result
             assert mock.call_args.kwargs["content"] == "def hello(): pass"
             assert mock.call_args.kwargs["context"] == f"File: {f}"
 
-    async def test_review_file_path_outside_sandbox(self, tmp_path) -> None:
-        """Файл вне sandbox — ошибка, structured_review НЕ вызывается."""
+    async def test_file_path_disabled_by_default(self, tmp_path, monkeypatch) -> None:
+        """SEC-03: по умолчанию file_path отключён — ошибка с подсказкой, API не вызывается."""
+        monkeypatch.setattr(config, "allow_file_path", False)  # дефолт, явно для теста
+        monkeypatch.delenv("POLZA_ALLOW_FILE_PATH", raising=False)
         f = tmp_path / "code.py"
         f.write_text("x = 1", encoding="utf-8")
         mock = AsyncMock()
-        with patch("grok_critic.server.structured_review", new=mock):
+        with patch("grok_critic.server.general_review", new=mock):
+            result = await critic_review(file_path=str(f))
+            assert "❌" in result
+            assert "POLZA_ALLOW_FILE_PATH" in result
+            mock.assert_not_called()
+
+    async def test_review_file_path_outside_sandbox(self, tmp_path, monkeypatch) -> None:
+        """Файл вне sandbox при включённом file_path — ошибка, general_review НЕ вызывается."""
+        monkeypatch.setattr(config, "allow_file_path", True)
+        f = tmp_path / "code.py"
+        f.write_text("x = 1", encoding="utf-8")
+        mock = AsyncMock()
+        with patch("grok_critic.server.general_review", new=mock):
             result = await critic_review(file_path=str(f))
             assert "❌" in result
             assert "denied" in result.lower()
             mock.assert_not_called()
 
-    async def test_followup_rejects_file_path(self) -> None:
+    async def test_sensitive_file_via_decorator_denied(self, tmp_path, monkeypatch) -> None:
+        """SEC-02: даже при включённом file_path секрет не уходит в API."""
+        monkeypatch.setattr(config, "allow_file_path", True)
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        env_local = tmp_path / ".env.local"
+        env_local.write_text("API_TOKEN=supersecret", encoding="utf-8")
+        mock = AsyncMock()
+        with patch("grok_critic.server.general_review", new=mock):
+            result = await critic_review(file_path=str(env_local))
+            assert "❌" in result
+            assert "sensitive" in result.lower()
+            mock.assert_not_called()
+
+    async def test_followup_rejects_file_path(self, monkeypatch) -> None:
         """BUG-01: file_path у critic_followup — внятная ошибка, не TypeError."""
+        monkeypatch.setattr(config, "allow_file_path", True)
         result = await critic_followup(
             previous_review="review", question="why?", file_path="/any/file.py"
         )

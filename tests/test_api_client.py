@@ -1,21 +1,23 @@
 # FILE: tests/test_api_client.py
-# VERSION: 1.9.0
+# VERSION: 1.10.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-API ResponsesClient with mocked HTTP
-#   SCOPE: Test call(), error handling, response parsing, CritiqueResult, usage, cost
+#   SCOPE: call(), error handling, parsing, usage/cost, retry deadline, dedup, budget guard
 #   DEPENDS: M-API, M-CONFIG
 #   LINKS: M-API
 # END_MODULE_CONTRACT
 
 from __future__ import annotations
 
-import json
+import asyncio
+import datetime
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from pydantic import SecretStr
 import pytest
+from pydantic import SecretStr
 
+import grok_critic.api_client as api_mod
 from grok_critic.api_client import (
     MAX_RETRIES,
     CritiqueResult,
@@ -27,8 +29,31 @@ from grok_critic.api_client import (
     _resolve_timeout,
     close_client,
     get_client,
+    get_usage_stats,
 )
 from grok_critic.config import config
+
+
+# START_BLOCK_RUNTIME_STATE_RESET
+@pytest.fixture(autouse=True)
+def _reset_api_runtime_state():
+    """Чистит module-level состояние (stats/inflight/semaphore) между тестами."""
+    api_mod._usage_stats.update(
+        {
+            "date": datetime.date.today().isoformat(),
+            "calls": 0,
+            "errors": 0,
+            "cost_usd": 0.0,
+            "cost_rub": 0.0,
+        }
+    )
+    api_mod._inflight.clear()
+    api_mod._semaphore = None
+    api_mod._semaphore_limit = None
+    yield
+
+
+# END_BLOCK_RUNTIME_STATE_RESET
 
 
 # START_BLOCK_EFFORT_TESTS
@@ -201,27 +226,23 @@ class TestCritiqueResult:
 # START_BLOCK_PERSISTENT_CLIENT
 class TestGetClient:
     async def test_creates_client(self) -> None:
-        import grok_critic.api_client as mod
-
-        mod._client = None
+        api_mod._client = None
         with patch("grok_critic.api_client.config") as mock_cfg:
             mock_cfg.timeout_seconds = 30
             client = await get_client()
             assert isinstance(client, httpx.AsyncClient)
             await client.aclose()
-            mod._client = None
+            api_mod._client = None
 
     async def test_reuses_client(self) -> None:
-        import grok_critic.api_client as mod
-
-        mod._client = None
+        api_mod._client = None
         with patch("grok_critic.api_client.config") as mock_cfg:
             mock_cfg.timeout_seconds = 30
             c1 = await get_client()
             c2 = await get_client()
             assert c1 is c2
             await c1.aclose()
-            mod._client = None
+            api_mod._client = None
 
 
 # END_BLOCK_PERSISTENT_CLIENT
@@ -238,6 +259,13 @@ class TestResponsesClientCall:
             mock_cfg.timeout_seconds = 30
             mock_cfg.price_input_per_1m = 0.0
             mock_cfg.price_output_per_1m = 0.0
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.max_concurrent_requests = 2
             return ResponsesClient()
 
     async def test_successful_call(self, client: ResponsesClient) -> None:
@@ -268,7 +296,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Auth error" in result.error
+            assert "Ошибка авторизации" in result.error
             assert "Unauthorized" in result.error
 
     async def test_429_error(self, client: ResponsesClient) -> None:
@@ -279,7 +307,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Rate limited" in result.error
+            assert "Превышен лимит запросов" in result.error
 
     async def test_500_error(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(500, text="Internal Server Error")
@@ -289,7 +317,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Server error" in result.error
+            assert "Ошибка сервера" in result.error
 
     async def test_402_insufficient_funds(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(
@@ -302,8 +330,8 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Payment required" in result.error
             assert "Недостаточно средств" in result.error
+            assert "Недостаточно средств на балансе" in result.error
 
     async def test_502_provider_down(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(
@@ -316,7 +344,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Provider down" in result.error
+            assert "Провайдер недоступен" in result.error
             assert "xAI provider unavailable" in result.error
 
     async def test_503_no_providers(self, client: ResponsesClient) -> None:
@@ -327,7 +355,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "No providers" in result.error
+            assert "Нет доступных провайдеров" in result.error
 
     async def test_error_body_parsed(self, client: ResponsesClient) -> None:
         """Polza.AI returns structured error: {"error": {"code": "...", "message": "..."}}"""
@@ -353,7 +381,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "timed out" in result.error.lower()
+            assert "таймаут" in result.error.lower()
 
     async def test_network_error_retried_then_success(self, client: ResponsesClient) -> None:
         """REL-01: ConnectError/ReadError ретраятся, запрос в итоге успешен."""
@@ -386,7 +414,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Network error" in result.error
+            assert "Сетевая ошибка" in result.error
             assert "ConnectError" in result.error
             assert mock_httpx.post.call_count == MAX_RETRIES + 1
 
@@ -425,6 +453,30 @@ class TestResponsesClientCall:
             assert captured_body["input"][0]["role"] == "system"
             assert captured_body["input"][0]["content"] == "be critical"
 
+    async def test_messages_override(self, client: ResponsesClient) -> None:
+        """FEAT-FOLLOWUP-ID: полный диалог можно передать через messages."""
+        captured_body: dict = {}
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+
+        async def capture_post(url: str, **kwargs: object) -> httpx.Response:
+            body = kwargs.get("json")
+            if isinstance(body, dict):
+                captured_body.update(body)
+            return mock_response
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = capture_post
+            mock_gc.return_value = mock_httpx
+            messages = [
+                {"role": "system", "content": "dialog system"},
+                {"role": "user", "content": "original"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "question"},
+            ]
+            await client.call("question", messages=messages)
+            assert captured_body["input"] == messages
+
     async def test_json_decode_error(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(
             200,
@@ -437,7 +489,7 @@ class TestResponsesClientCall:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Invalid JSON" in result.error
+            assert "Некорректный JSON" in result.error
 
     async def test_review_id_generated(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(200, json={"output_text": "ok"})
@@ -453,7 +505,7 @@ class TestResponsesClientCall:
         with patch.object(client, "_api_key", "test-key"), \
              patch("grok_critic.api_client.config") as mock_cfg:
             mock_cfg.price_input_per_1m = 10.0   # $10 per 1M → 1000 tokens = $0.01
-            mock_cfg.price_output_per_1m = 30.0   # $30 per 1M → 500 tokens = $0.015
+            mock_cfg.price_output_per_1m = 30.0  # $30 per 1M → 500 tokens = $0.015
             mock_cfg.base_url = "https://polza.ai/api/v1"
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
@@ -461,6 +513,9 @@ class TestResponsesClientCall:
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.max_concurrent_requests = 2
 
             mock_response = httpx.Response(
                 200,
@@ -535,6 +590,9 @@ class TestPromptCacheKey:
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.max_concurrent_requests = 2
             return ResponsesClient()
 
     async def test_same_prompt_same_key(self, client: ResponsesClient) -> None:
@@ -557,7 +615,7 @@ class TestPromptCacheKey:
             await client.call("p2", system_prompt="be critical")
 
         assert len(captured) == 2
-        expected = f"gc-{hashlib.sha256('be critical'.encode('utf-8')).hexdigest()[:8]}"
+        expected = f"gc-{hashlib.sha256(b'be critical').hexdigest()[:8]}"
         assert captured[0]["prompt_cache_key"] == expected
         assert captured[1]["prompt_cache_key"] == expected
 
@@ -579,6 +637,32 @@ class TestPromptCacheKey:
 
         assert "prompt_cache_key" not in captured
 
+    async def test_key_from_messages_override(self, client: ResponsesClient) -> None:
+        """При messages-override system берётся из первого system-сообщения."""
+        import hashlib
+
+        captured: list[dict] = []
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+
+        async def capture_post(url: str, **kwargs: object) -> httpx.Response:
+            body = kwargs.get("json")
+            if isinstance(body, dict):
+                captured.append(body)
+            return mock_response
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = capture_post
+            mock_gc.return_value = mock_httpx
+            messages = [
+                {"role": "system", "content": "dialog system"},
+                {"role": "user", "content": "q"},
+            ]
+            await client.call("q", messages=messages)
+
+        expected = f"gc-{hashlib.sha256(b'dialog system').hexdigest()[:8]}"
+        assert captured[0]["prompt_cache_key"] == expected
+
 
 # END_BLOCK_CACHE_KEY
 
@@ -598,6 +682,9 @@ class TestClientFeatures:
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.max_concurrent_requests = 2
             return ResponsesClient()
 
     async def test_client_follows_redirects(self) -> None:
@@ -617,10 +704,10 @@ class TestClientFeatures:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Empty response" in result.error
+            assert "Пустой ответ" in result.error
 
     async def test_generic_4xx(self, client: ResponsesClient) -> None:
-        """TEST-10: прочие 4xx — Client error с сообщением провайдера."""
+        """TEST-10: прочие 4xx — ошибка клиента с сообщением провайдера."""
         mock_response = httpx.Response(
             400, json={"error": {"code": "BAD_REQUEST", "message": "model not found"}}
         )
@@ -630,8 +717,261 @@ class TestClientFeatures:
             mock_gc.return_value = mock_httpx
             result = await client.call("test")
             assert not result.success
-            assert "Client error" in result.error
+            assert "Ошибка клиента" in result.error
             assert "model not found" in result.error
 
 
 # END_BLOCK_CLIENT_FEATURES
+
+
+# START_BLOCK_RETRY_DEADLINE
+class TestRetryDeadline:
+    """REL-06: общий дедлайн retry-цикла не должен превышать таймаут клиента."""
+
+    async def test_deadline_stops_timeout_retries(self, monkeypatch) -> None:
+        """После исчерпания дедлайна таймауты НЕ ретраятся (клиент бы всё равно отвалился)."""
+        monkeypatch.setattr(config, "retry_deadline_seconds", 0.05)
+        client = ResponsesClient()
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert mock_httpx.post.call_count == 1
+            assert "таймаут" in result.error.lower()
+
+    async def test_deadline_auto_allows_fast_error_retries(self, monkeypatch) -> None:
+        """retry_deadline_seconds=0 → дедлайн = per-attempt timeout;
+        быстрые сетевые ошибки успевают ретраиться."""
+        monkeypatch.setattr(config, "retry_deadline_seconds", 0.0)
+        client = ResponsesClient()
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(side_effect=[httpx.ConnectError("x"), mock_response])
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert result.success
+            assert mock_httpx.post.call_count == 2
+
+    async def test_deadline_exhausted_error_message(self, monkeypatch) -> None:
+        """Явное сообщение об исчерпании дедлайна, если последний error — не таймаут."""
+        monkeypatch.setattr(config, "retry_deadline_seconds", 0.05)
+        monkeypatch.setattr(config, "max_retries", 3)
+        client = ResponsesClient()
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
+            mock_gc.return_value = mock_httpx
+            result = await client.call("test")
+            assert not result.success
+            assert mock_httpx.post.call_count < 4
+
+
+# END_BLOCK_RETRY_DEADLINE
+
+
+# START_BLOCK_INFLIGHT_DEDUP
+class TestInFlightDedup:
+    """Параллельные вызовы с тем же контентом присоединяются к летящему запросу."""
+
+    @pytest.fixture()
+    def client(self) -> ResponsesClient:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.price_input_per_1m = 0.0
+            mock_cfg.price_output_per_1m = 0.0
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.max_concurrent_requests = 4
+            return ResponsesClient()
+
+    async def test_parallel_same_content_single_api_call(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        post_calls = 0
+        release = asyncio.Event()
+
+        async def slow_post(url: str, **kwargs: object) -> httpx.Response:
+            nonlocal post_calls
+            post_calls += 1
+            await release.wait()
+            return mock_response
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = slow_post
+            mock_gc.return_value = mock_httpx
+            t1 = asyncio.create_task(client.call("same", system_prompt="s"))
+            await asyncio.sleep(0.02)
+            t2 = asyncio.create_task(client.call("same", system_prompt="s"))
+            await asyncio.sleep(0.02)
+            release.set()
+            r1, r2 = await asyncio.gather(t1, t2)
+
+        assert post_calls == 1
+        assert r1.text == "ok"
+        assert r2.text == "ok"
+
+    async def test_different_content_not_deduped(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            r1, r2 = await asyncio.gather(
+                client.call("first"),
+                client.call("second"),
+            )
+        assert r1.success and r2.success
+        assert mock_httpx.post.call_count == 2
+
+    async def test_sequential_same_content_not_deduped(self, client: ResponsesClient) -> None:
+        """Dedup только in-flight: завершённый запрос не кэшируется."""
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            await client.call("same")
+            await client.call("same")
+        assert mock_httpx.post.call_count == 2
+
+
+# END_BLOCK_INFLIGHT_DEDUP
+
+
+# START_BLOCK_BUDGET_GUARD
+class TestBudgetGuard:
+    """FEAT-BUDGET: превышение дневного лимита — отказ ДО платного вызова."""
+
+    async def test_budget_exceeded_no_api_call(self) -> None:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.max_concurrent_requests = 2
+            mock_cfg.daily_budget_usd = 0.01
+
+            api_mod._usage_stats["date"] = datetime.date.today().isoformat()
+            api_mod._usage_stats["cost_usd"] = 0.5  # уже потрачено больше лимита
+
+            client = ResponsesClient()
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_gc.return_value = mock_httpx
+                result = await client.call("test")
+                assert not result.success
+                assert "бюджет" in result.error.lower()
+                mock_httpx.post.assert_not_called()
+
+    async def test_budget_disabled_by_default(self) -> None:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.max_concurrent_requests = 2
+            mock_cfg.daily_budget_usd = 0.0  # выключен
+
+            api_mod._usage_stats["date"] = datetime.date.today().isoformat()
+            api_mod._usage_stats["cost_usd"] = 100.0  # много потрачено, но лимита нет
+
+            client = ResponsesClient()
+            mock_response = httpx.Response(200, json={"output_text": "ok"})
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = AsyncMock(return_value=mock_response)
+                mock_gc.return_value = mock_httpx
+                result = await client.call("test")
+                assert result.success
+
+
+# END_BLOCK_BUDGET_GUARD
+
+
+# START_BLOCK_USAGE_STATS
+class TestUsageStats:
+    """FEAT-BUDGET: суточная статистика вызовов и стоимости."""
+
+    @pytest.fixture()
+    def client(self) -> ResponsesClient:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.max_concurrent_requests = 2
+            mock_cfg.price_input_per_1m = 2.6
+            mock_cfg.price_output_per_1m = 6.6
+            return ResponsesClient()
+
+    async def test_success_recorded(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(
+            200,
+            json={
+                "output_text": "ok",
+                "usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
+            },
+        )
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            await client.call("test")
+
+        stats = get_usage_stats()
+        assert stats["calls"] == 1
+        assert stats["errors"] == 0
+        assert stats["cost_usd"] == pytest.approx((1000 / 1e6 * 2.6) + (500 / 1e6 * 6.6))
+
+    async def test_error_recorded(self, client: ResponsesClient) -> None:
+        mock_response = httpx.Response(500, text="boom")
+        with (
+            patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc,
+            patch("grok_critic.api_client.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            await client.call("test")
+
+        stats = get_usage_stats()
+        assert stats["calls"] == 0
+        assert stats["errors"] == 1
+
+
+# END_BLOCK_USAGE_STATS

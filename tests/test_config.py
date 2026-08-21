@@ -1,5 +1,5 @@
 # FILE: tests/test_config.py
-# VERSION: 1.9.0
+# VERSION: 1.10.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CONFIG configuration loading and validation
 #   SCOPE: Test env var reading, defaults, log_level validation, price fields
@@ -13,6 +13,7 @@ import os
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 from pydantic_settings import SettingsConfigDict
 
 from grok_critic.config import AppConfig
@@ -62,8 +63,54 @@ class TestAppConfigDefaults:
         cfg = _make_no_env(api_key="test-key")
         assert cfg.price_output_per_1m == 0.0
 
+    def test_default_allow_file_path_false(self) -> None:
+        """SEC-03: чтение файлов через file_path выключено по умолчанию."""
+        cfg = _make_no_env(api_key="test-key")
+        assert cfg.allow_file_path is False
+
+    def test_default_daily_budget_usd(self) -> None:
+        cfg = _make_no_env(api_key="test-key")
+        assert cfg.daily_budget_usd == 0.0
+
+    def test_default_max_concurrent_requests(self) -> None:
+        cfg = _make_no_env(api_key="test-key")
+        assert cfg.max_concurrent_requests == 2
+
+    def test_default_retry_deadline_seconds(self) -> None:
+        """REL-06: 0 = авто (= per-attempt timeout)."""
+        cfg = _make_no_env(api_key="test-key")
+        assert cfg.retry_deadline_seconds == 0.0
+
 
 # END_BLOCK_DEFAULTS
+
+
+# START_BLOCK_ENV_FILE_RESOLUTION
+class TestEnvFileResolution:
+    """FIX-ENV-PATH: путь к .env — POLZA_ENV_FILE → cwd/.env → legacy."""
+
+    def test_explicit_env_var_wins(self, monkeypatch) -> None:
+        from grok_critic.config import _resolve_env_file
+
+        monkeypatch.setenv("POLZA_ENV_FILE", "/custom/path/.env")
+        assert _resolve_env_file() == "/custom/path/.env"
+
+    def test_fallback_returns_dotenv_path(self, monkeypatch) -> None:
+        from grok_critic.config import _resolve_env_file
+
+        monkeypatch.delenv("POLZA_ENV_FILE", raising=False)
+        result = _resolve_env_file()
+        assert result.endswith(".env")
+
+    def test_empty_env_var_ignored(self, monkeypatch) -> None:
+        from grok_critic.config import _resolve_env_file
+
+        monkeypatch.setenv("POLZA_ENV_FILE", "   ")
+        result = _resolve_env_file()
+        assert result.endswith(".env")
+
+
+# END_BLOCK_ENV_FILE_RESOLUTION
 
 
 # START_BLOCK_ENV_OVERRIDE
@@ -103,6 +150,27 @@ class TestEnvOverride:
             cfg = AppConfig(api_key="test-key")
             assert cfg.price_output_per_1m == 6.6
 
+    def test_allow_file_path_override(self) -> None:
+        """SEC-03: file_path включается явным флагом."""
+        with patch.dict(os.environ, {"POLZA_ALLOW_FILE_PATH": "true"}):
+            cfg = AppConfig(api_key="test-key")
+            assert cfg.allow_file_path is True
+
+    def test_daily_budget_override(self) -> None:
+        with patch.dict(os.environ, {"POLZA_DAILY_BUDGET_USD": "5.5"}):
+            cfg = AppConfig(api_key="test-key")
+            assert cfg.daily_budget_usd == 5.5
+
+    def test_max_concurrent_requests_override(self) -> None:
+        with patch.dict(os.environ, {"POLZA_MAX_CONCURRENT_REQUESTS": "4"}):
+            cfg = AppConfig(api_key="test-key")
+            assert cfg.max_concurrent_requests == 4
+
+    def test_retry_deadline_override(self) -> None:
+        with patch.dict(os.environ, {"POLZA_RETRY_DEADLINE_SECONDS": "120"}):
+            cfg = AppConfig(api_key="test-key")
+            assert cfg.retry_deadline_seconds == 120.0
+
 
 # END_BLOCK_ENV_OVERRIDE
 
@@ -130,13 +198,13 @@ class TestLogLevelValidation:
 class TestApiKeyValidation:
     def test_api_key_required(self) -> None:
         """api_key is mandatory — creating AppConfig without it raises error."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             # _make_no_env bypasses .env, so no api_key is available
             _make_no_env()
 
     def test_api_key_empty_string_rejected(self) -> None:
         """Empty string is not valid for api_key (min_length=1)."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _make_no_env(api_key="")
 
     def test_api_key_valid(self) -> None:
@@ -151,11 +219,11 @@ class TestApiKeyValidation:
 # START_BLOCK_TIMEOUT_VALIDATION
 class TestTimeoutValidation:
     def test_timeout_zero_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _make_no_env(api_key="test-key", timeout_seconds=0)
 
     def test_timeout_negative_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _make_no_env(api_key="test-key", timeout_seconds=-1)
 
     def test_timeout_minimum_valid(self) -> None:
@@ -173,15 +241,15 @@ class TestTimeoutValidation:
 # START_BLOCK_AGENT_COUNT_VALIDATION
 class TestAgentCountValidation:
     def test_agent_count_zero_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _make_no_env(api_key="test-key", agent_count=0)
 
     def test_agent_count_negative_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _make_no_env(api_key="test-key", agent_count=-1)
 
     def test_agent_count_too_large_rejected(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _make_no_env(api_key="test-key", agent_count=65)
 
     def test_agent_count_minimum_valid(self) -> None:
@@ -204,7 +272,7 @@ class TestAgentCountValidation:
 class TestReloadConfig:
     def test_reload_returns_appconfig(self) -> None:
         """reload_config() должен возвращать AppConfig с актуальными полями."""
-        from grok_critic.config import reload_config, config
+        from grok_critic.config import reload_config
         result = reload_config()
         assert hasattr(result, "model")
         assert hasattr(result, "api_key")

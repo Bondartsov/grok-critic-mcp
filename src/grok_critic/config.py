@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -20,11 +21,32 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger("grok-critic.config")
 
 
+# START_BLOCK_ENV_FILE_RESOLUTION
+def _resolve_env_file() -> str:
+    """Путь к .env с приоритетом: POLZA_ENV_FILE → cwd/.env → legacy (рядом с пакетом).
+
+    FIX-ENV-PATH: старый путь вычислялся от расположения config.py и при обычном
+    ``pip install`` указывал на site-packages, где .env не бывает. Теперь сначала
+    ищем .env в текущей рабочей директории (как запущен сервер), затем падаем
+    на legacy-путь (pip install -e . из клона репозитория).
+    """
+    explicit = os.getenv("POLZA_ENV_FILE", "").strip()
+    if explicit:
+        return explicit
+    cwd_candidate = Path.cwd() / ".env"
+    if cwd_candidate.is_file():
+        return str(cwd_candidate)
+    return str(Path(__file__).resolve().parent.parent.parent / ".env")
+
+
+# END_BLOCK_ENV_FILE_RESOLUTION
+
+
 # START_BLOCK_SETTINGS_MODEL
 class AppConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="POLZA_",
-        env_file=str(Path(__file__).resolve().parent.parent.parent / ".env"),
+        env_file=_resolve_env_file(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -49,6 +71,18 @@ class AppConfig(BaseSettings):
     max_content_chars: int = Field(default=100_000, ge=1)  # ~100KB — защита от DoS по стоимости
     timeout_low: int = Field(default=90, ge=1)    # таймаут при agent_count <= 4
     timeout_mid: int = Field(default=150, ge=1)   # таймаут при 4 < agent_count <= 8
+    # SEC-03: file_path выключен по умолчанию — cwd MCP-клиента непредсказуем
+    # (часто это $HOME), поэтому чтение файлов включается явным opt-in.
+    allow_file_path: bool = Field(default=False)
+    # REL-06: общий дедлайн retry-цикла (сек). 0 = авто (= timeout_seconds):
+    # суммарное время попыток не должно превышать таймаут MCP-клиента,
+    # иначе клиент отваливается и платно ретраит поверх живого запроса.
+    retry_deadline_seconds: float = Field(default=0.0, ge=0.0)
+    # FEAT-BUDGET: дневной лимит расходов в $ по расчётной стоимости (cost_usd).
+    # 0 = без лимита. Превышение → ошибка ДО обращения к платному API.
+    daily_budget_usd: float = Field(default=0.0, ge=0.0)
+    # FEAT-BUDGET: максимум одновременных платных запросов к API (semaphore).
+    max_concurrent_requests: int = Field(default=2, ge=1, le=16)
 
     @field_validator("log_level")
     @classmethod
