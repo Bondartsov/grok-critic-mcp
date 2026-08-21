@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Pre-commit: проверка выравнивания GFM-таблиц и box-арта в индексируемых .md.
+# Активация (один раз, нужен Node >= 18):
+#   git config core.hooksPath .githooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.md' '*.markdown')
+[ -z "$files" ] && exit 0
+
+# shellcheck disable=SC2086
+exec node scripts/align-md-tables.mjs --check $files

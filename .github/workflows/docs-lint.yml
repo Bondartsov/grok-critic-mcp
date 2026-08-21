@@ -1,0 +1,41 @@
+name: docs-lint
+
+# Линт markdown: выравнивание GFM-таблиц и box-арта в code-fence.
+# Скрипт вендорится в репо (scripts/align-md-tables.mjs) — на раннере
+# нет доступа к глобальным скриптам разработчика.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.md'
+      - '**/*.markdown'
+      - 'scripts/align-md-tables.mjs'
+      - '.github/workflows/docs-lint.yml'
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '**/*.markdown'
+      - 'scripts/align-md-tables.mjs'
+      - '.github/workflows/docs-lint.yml'
+  workflow_dispatch:
+
+jobs:
+  md-align:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check tables & box-art alignment
+        run: |
+          files=$(git ls-files '*.md' '*.markdown')
+          if [ -z "$files" ]; then
+            echo "Нет markdown-файлов — нечего проверять"
+            exit 0
+          fi
+          # shellcheck disable=SC2086
+          node scripts/align-md-tables.mjs --check $files

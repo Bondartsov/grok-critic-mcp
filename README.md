@@ -458,6 +458,8 @@ grok-critic-mcp/
 ├── tests/                   # 157 тестов (config / api_client / critic / server)
 ├── skill/SKILL.md           # Kilo Code skill (инструкция для агентов)
 ├── docs/                    # GRACE-артефакты + этот отчёт/план
+├── scripts/                 # align-md-tables.mjs — линт таблиц/box-арта в .md (CI + pre-commit)
+├── .github/workflows/       # docs-lint: проверка markdown на push/PR
 ├── .env.example             # Шаблон окружения
 ├── pyproject.toml           # Метаданные, зависимости, entry point
 └── README.md
@@ -498,6 +500,18 @@ python -m pytest tests/ -v --cov=grok_critic --cov-report=term-missing
 ```
 
 **157 тестов** (config 33 · api_client 50 · critic 27 · server 44 · package 3) на `pytest` + `pytest-asyncio` (`asyncio_mode="auto"`). Все внешние HTTP-вызовы замоканы (`unittest.mock`, `AsyncMock`), реального ключа/сети не требуется. Покрыты: дефолты и env-override конфига, валидация полей, effort-mapping, разбор ответа и usage (включая cost_rub/cached/reasoning), расчёт стоимости, обработка статусов API, регистрация 8 инструментов, декоратор `_review_tool`, клэмп `agent_count`, чтение файла, hot-reload, restart, `self_update`, health-check с балансом.
+
+### Линт документации (таблицы и box-арт)
+
+Все `.md` проверяются скриптом [`scripts/align-md-tables.mjs`](scripts/align-md-tables.mjs) (нужен Node ≥ 18): выравнивание GFM-таблиц по display-width и выравнивание ASCII-схем (`┌─┐│└┘`) внутри code-fence. Запуск вручную:
+
+```bash
+node scripts/align-md-tables.mjs --check $(git ls-files '*.md')
+```
+
+- **CI**: workflow [`.github/workflows/docs-lint.yml`](.github/workflows/docs-lint.yml) гоняет проверку на push в `main` и в PR; расхождение → exit 1.
+- **Локально перед коммитом** (опционально): активируйте pre-commit один раз —
+  `git config core.hooksPath .githooks`.
 
 ---
 
