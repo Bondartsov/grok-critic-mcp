@@ -18,7 +18,7 @@
 - [Внутренняя логика запроса](#внутренняя-логика-запроса)
 - [Формат ответа](#формат-ответа)
 - [Правила работы с критиком](#правила-работы-с-критиком)
-- [Kilo Code Skill](#kilo-code-skill)
+- [Skill (глобально, из репо)](#skill-глобально-из-репо)
 - [Архитектура](#архитектура)
 - [Тестирование](#тестирование)
 - [Деплой на VM](#деплой-на-vm)
@@ -441,20 +441,34 @@ self_update() -> str
 
 ---
 
-## Kilo Code Skill
+## Skill (глобально, из репо)
 
-Репозиторий включает готовый скилл: [`skill/SKILL.md`](skill/SKILL.md) — инструкция для агента о том, когда и как вызывать критика (триггеры, сигнатуры, workflow-примеры, cost awareness, правила).
+Репозиторий включает готовый скилл: [`skill/SKILL.md`](skill/SKILL.md) — универсальная инструкция для агента о том, когда и как вызывать критика (триггеры, сигнатуры, workflow-примеры, cost awareness, правила, поведение при недоступности MCP). Подходит для любых MCP-клиентов (Kilo Code, ZCode, Claude Code, Cursor).
 
-Установка:
+**Мастер-копия — в репозитории.** Рекомендуемый способ установки — джанкшен/симлинк из скилл-директории клиента на `skill/` репо: скилл обновляется вместе с `git pull` / `self_update`, без ручного копирования.
+
+Windows (PowerShell, junction без прав администратора):
+
+```powershell
+# ZCode
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.zcode\skills\grok-critic" -Target "<repo>\skill"
+# Kilo Code (заменяет устаревшую копию)
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.kilocode\skills\grok-critic" -Target "<repo>\skill"
+# Agents (cross-line)
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\grok-critic" -Target "<repo>\skill"
+```
+
+Unix (симлинк):
 
 ```bash
-mkdir -p ~/.kilocode/skills/grok-critic
-cp skill/SKILL.md ~/.kilocode/skills/grok-critic/SKILL.md
+ln -sfn <repo>/skill ~/.kilocode/skills/grok-critic
 ```
+
+Копирование (`cp skill/SKILL.md ~/.kilocode/skills/grok-critic/SKILL.md`) тоже работает, но копия устаревает при обновлении сервера.
 
 Типовые сценарии из скилла:
 
-- **Post-implementation review** → `critic_review` → при 🔴 исправить и повторить → при разногласии `critic_followup`.
+- **Post-implementation review** → `critic_review` → при 🔴 исправить и повторить → при разногласии `critic_followup` (по `review_id`).
 - **Architecture validation** → `architecture_review` → `critic_followup` («а что если event sourcing вместо…?»).
 - **Security audit** → `security_audit` → все 🔴 исправить обязательно, все 🟡 — перед продакшеном.
 
