@@ -4,7 +4,7 @@
 MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP
 
 ## Annotation
-MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). 8 MCP tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через ReviewStore, JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill (SKILL.md). Версия 1.10.0, все модули STATUS=complete, 218 тестов.
+MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). 8 MCP tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через дисковый ReviewStore (db/reviews.json, переживает рестарты, общий с CLI), JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill (SKILL.md). Версия 1.11.0, все модули STATUS=complete, 248 тестов.
 
 ## Core Principles
 
