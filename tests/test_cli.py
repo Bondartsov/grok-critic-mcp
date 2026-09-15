@@ -1,5 +1,5 @@
 # FILE: tests/test_cli.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CLI terminal interface (serve/health/doctor/review/followup/logs/config)
 #   SCOPE: argparse wiring, exit codes, mocked API calls, store interaction, output formats
@@ -45,11 +45,9 @@ def _args(**kwargs) -> argparse.Namespace:
 
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
-    """Дисковый store изолируем в tmp_path."""
-    monkeypatch.setattr(review_store, "_path", tmp_path / "reviews.json")
-    review_store._entries.clear()
+    """Дисковый store (директория per-id файлов) изолируем в tmp_path."""
+    monkeypatch.setattr(review_store, "_dir", tmp_path / "reviews")
     yield
-    review_store._entries.clear()
 
 
 # END_BLOCK_HELPERS
@@ -65,7 +63,7 @@ class TestHealthCommand:
     def test_no_ping_store_broken(self, tmp_path, monkeypatch, capsys) -> None:
         blocker = tmp_path / "blocker"
         blocker.write_text("x", encoding="utf-8")
-        monkeypatch.setattr(review_store, "_path", blocker / "db" / "reviews.json")
+        monkeypatch.setattr(review_store, "_dir", blocker / "db" / "reviews")
         rc = cli.cmd_health(_args(ping=False, json=False))
         assert rc == cli.EXIT_ERR
         assert "Store" in capsys.readouterr().err

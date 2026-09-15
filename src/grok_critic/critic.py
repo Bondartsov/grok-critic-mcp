@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import time
-from collections import OrderedDict
 from pathlib import Path
 
 import httpx
@@ -51,90 +50,115 @@ def _content_size_error(total_len: int) -> str | None:
 
 
 # START_BLOCK_REVIEW_STORE
-# FEAT-CLI/FEAT-FOLLOWUP-ID: store живёт на диске (по умолчанию <repo>/db/reviews.json,
-# override — POLZA_STORE_PATH). MCP-сервер и CLI видят один store, поэтому review_id
-# переживает рестарты сервера и доступен из терминала. TTL записей — 24 часа.
+# FEAT-CLI/FEAT-FOLLOWUP-ID: store живёт на диске — ОДИН ФАЙЛ НА REVIEW_ID
+# (по умолчанию <repo>/db/reviews/<rev_*.json>, override — POLZA_STORE_PATH).
+# Нет общего мутируемого файла → нет read-modify-write гонок между процессами
+# MCP-сервера и CLI (находка ревью rev_4e2fb8bca326). TTL записи — 24 часа
+# с последнего обращения; лимит — max_entries файлов (вытесняются самые старые).
 STORE_TTL_SECONDS = 24 * 3600
 
 
-def _default_store_path() -> Path:
-    """Путь store'а: config.store_path (POLZA_STORE_PATH) → <repo>/db/reviews.json."""
+def _default_store_dir() -> Path:
+    """Директория store'а: config.store_path (POLZA_STORE_PATH) → <repo>/db/reviews."""
     if config.store_path:
         return Path(config.store_path)
-    return Path(__file__).resolve().parents[2] / "db" / "reviews.json"
+    return Path(__file__).resolve().parents[2] / "db" / "reviews"
 
 
 class ReviewStore:
-    """Дисковый LRU-хранилище диалогов ревью для followup по review_id.
+    """Пер-файловое хранилище диалогов ревью для followup по review_id.
 
     Экономит токены: вместо передачи полного текста предыдущего ревью
     (~25k input-токенов на вызов) клиент передаёт только review_id.
-    Записи персистентны между рестартами процесса и общие для MCP-сервера
-    и CLI (атомарная запись tmp+replace). Ошибки диска не ломают ревью —
-    store деградирует до in-memory с warning в лог.
+    Каждый review_id — отдельный JSON-файл с атомарной записью (tmp+replace),
+    поэтому параллельные процессы (MCP-сервер + CLI) не затирают друг друга.
+    Ошибки диска не ломают ревью — store деградирует до отсутствия памяти
+    с warning в лог. TTL и лимит файлов чистятся лениво при save().
     """
 
     def __init__(self, max_entries: int = 50, path: Path | None = None) -> None:
-        self._entries: OrderedDict[str, dict] = OrderedDict()  # rid -> {"ts": float, "messages": [...]}
+        self._dir = path if path is not None else _default_store_dir()
         self._max_entries = max_entries
-        self._path = path if path is not None else _default_store_path()
-        self._load_disk()
 
-    # -- persistence -------------------------------------------------------
+    # -- paths --------------------------------------------------------------
 
-    def _load_disk(self) -> None:
+    def _entry_path(self, review_id: str) -> Path:
+        # review_id генерируется самим сервером (rev_<hex>), но на всякий случай
+        # оставляем только безопасные символы — путь строится из него напрямую.
+        safe = "".join(c for c in review_id if c.isalnum() or c in "_-")
+        return self._dir / f"{safe or 'invalid'}.json"
+
+    # -- persistence --------------------------------------------------------
+
+    def _atomic_write(self, path: Path, payload: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _read_entry(self, path: Path) -> dict | None:
+        """Читает файл записи; None — если нет/битый/просрочен."""
         try:
-            if not self._path.is_file():
-                return
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-            now = time.time()
-            for rid, entry in raw.get("entries", {}).items():
-                if now - entry.get("ts", 0) <= STORE_TTL_SECONDS:
-                    self._entries[rid] = entry
-            # самый свежий — в конец OrderedDict
-            for rid in sorted(self._entries, key=lambda r: self._entries[r].get("ts", 0)):
-                self._entries.move_to_end(rid)
-        except Exception as exc:  # битый файл / нет прав — не критично
-            logger.warning("[Critic][ReviewStore][LOAD] store load failed: %s", exc)
-
-    def _persist(self) -> None:
-        try:
-            now = time.time()
-            # TTL-чистка перед записью
-            for rid in [r for r, e in self._entries.items() if now - e.get("ts", 0) > STORE_TTL_SECONDS]:
-                del self._entries[rid]
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(
-                {"version": 1, "entries": dict(self._entries)}, ensure_ascii=False
-            )
-            tmp = self._path.with_suffix(".json.tmp")
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, self._path)
+            if not path.is_file():
+                return None
+            entry = json.loads(path.read_text(encoding="utf-8"))
+            if time.time() - entry.get("ts", 0) > STORE_TTL_SECONDS:
+                path.unlink(missing_ok=True)
+                return None
+            return entry
         except Exception as exc:
-            logger.warning("[Critic][ReviewStore][SAVE] store persist failed: %s", exc)
+            logger.warning("[Critic][ReviewStore][READ] entry load failed (%s): %s", path.name, exc)
+            return None
+
+    def _prune(self) -> None:
+        """Ленивая чистка: просроченные файлы + лимит по количеству (старые по ts)."""
+        try:
+            entries: list[tuple[Path, float]] = []
+            now = time.time()
+            for p in self._dir.glob("rev_*.json"):
+                try:
+                    ts = float(json.loads(p.read_text(encoding="utf-8")).get("ts", 0))
+                except Exception:
+                    entries.append((p, 0.0))
+                    continue
+                if now - ts > STORE_TTL_SECONDS:
+                    p.unlink(missing_ok=True)
+                else:
+                    entries.append((p, ts))
+            if len(entries) > self._max_entries:
+                entries.sort(key=lambda kv: kv[1])
+                for p, _ts in entries[: len(entries) - self._max_entries]:
+                    p.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("[Critic][ReviewStore][PRUNE] prune failed: %s", exc)
 
     # -- public API (не изменился) ------------------------------------------
 
     def save(self, review_id: str, messages: list[dict[str, str]], answer: str) -> None:
         if not review_id or not answer.strip():
             return
-        self._load_disk()  # подтянуть записи других процессов (MCP <-> CLI)
         conversation = [*messages, {"role": "assistant", "content": answer}]
-        self._entries[review_id] = {"ts": time.time(), "messages": conversation}
-        self._entries.move_to_end(review_id)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem(last=False)
-        self._persist()
+        entry = {"ts": time.time(), "messages": conversation}
+        try:
+            self._atomic_write(
+                self._entry_path(review_id),
+                json.dumps(entry, ensure_ascii=False),
+            )
+            self._prune()
+        except Exception as exc:
+            logger.warning("[Critic][ReviewStore][SAVE] store persist failed: %s", exc)
 
     def load(self, review_id: str) -> list[dict[str, str]] | None:
-        self._load_disk()
-        entry = self._entries.get(review_id)
+        path = self._entry_path(review_id)
+        entry = self._read_entry(path)
         if entry is None:
             return None
-        # touch: обновляем ts (порядок LRU и TTL считаются от последнего обращения)
+        # touch: ts от последнего обращения (TTL и LRU считаются от него)
         entry["ts"] = time.time()
-        self._entries.move_to_end(review_id)
-        self._persist()
+        try:
+            self._atomic_write(path, json.dumps(entry, ensure_ascii=False))
+        except Exception as exc:
+            logger.warning("[Critic][ReviewStore][TOUCH] touch failed: %s", exc)
         return entry["messages"]
 
 

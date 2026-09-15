@@ -1,5 +1,5 @@
 # FILE: tests/test_api_client.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-API ResponsesClient with mocked HTTP
 #   SCOPE: call(), error handling, parsing, usage/cost, retry deadline, dedup, budget guard

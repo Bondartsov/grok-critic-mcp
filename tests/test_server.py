@@ -1,5 +1,5 @@
 # FILE: tests/test_server.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-SERVER MCP tool registration and invocation
 #   SCOPE: Registration, params, delegation, sandbox denylist, file_path opt-in,

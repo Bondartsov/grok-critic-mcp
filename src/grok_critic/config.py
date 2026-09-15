@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging
@@ -84,7 +84,7 @@ class AppConfig(BaseSettings):
     # FEAT-BUDGET: максимум одновременных платных запросов к API (semaphore).
     max_concurrent_requests: int = Field(default=2, ge=1, le=16)
     # FEAT-CLI: файл store'а диалогов (review_id переживает рестарты, работает из CLI).
-    # Пусто = <repo>/db/reviews.json (db/ в .gitignore).
+    # Пусто = <repo>/db/reviews/ (per-id файлы, db/ в .gitignore).
     store_path: str = Field(default="")
 
     @field_validator("log_level")

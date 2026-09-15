@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing 8 tools for code review, architecture, security, admin
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server

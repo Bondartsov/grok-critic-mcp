@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/cli.py
-# VERSION: 1.11.0
+# VERSION: 1.11.1
 # START_MODULE_CONTRACT
 #   PURPOSE: Terminal CLI over critic/api_client — agents can use/fix the critic via Bash when MCP is down
 #   SCOPE: serve (stdio MCP), health, doctor, review, followup, logs, config; exit codes; --json
@@ -18,6 +18,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from collections import deque
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _metadata_version
 from pathlib import Path
@@ -120,7 +121,7 @@ def cmd_health(args: argparse.Namespace) -> int:
     problems: list[str] = []
     if not config.api_key.get_secret_value():
         problems.append("POLZA_API_KEY не задан")
-    store_path = review_store._path
+    store_path = review_store._dir
     if not _store_writable(store_path):
         problems.append(f"Store недоступен для записи: {store_path}")
 
@@ -133,14 +134,27 @@ def cmd_health(args: argparse.Namespace) -> int:
 
 
 def _store_writable(path: Path) -> bool:
+    """Проверяет, что директорию store'а можно создать и писать в неё."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        probe = path.with_suffix(".probe")
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".probe-{os.getpid()}"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         return True
     except Exception:
         return False
+
+
+def _emit_result(result, as_json: bool) -> int:
+    """DRY-вывод CritiqueResult для review/followup: stdout или stderr + exit code."""
+    if not result.success:
+        print(f"❌ {result.error}", file=sys.stderr)
+        return EXIT_ERR
+    if as_json:
+        print(json.dumps(_result_payload(result), ensure_ascii=False, indent=2))
+    else:
+        print(_format_result(result))
+    return EXIT_OK
 
 
 # --------------------------------------------------------------- doctor ----
@@ -198,7 +212,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     checks.append((tcp_ok, tcp_detail))
 
     # 6. Store
-    store_path = review_store._path
+    store_path = review_store._dir
     store_ok = _store_writable(store_path)
     checks.append((store_ok, f"Store диалогов: {store_path} {'✅' if store_ok else '— НЕ ПИШЕТСЯ'}"))
 
@@ -267,11 +281,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         result.review_id, result.total_tokens,
         f"{result.cost_rub:.2f}" if result.cost_rub is not None else "n/a",
     )
-    if args.json:
-        print(json.dumps(_result_payload(result), ensure_ascii=False, indent=2))
-    else:
-        print(_format_result(result))
-    return EXIT_OK
+    return _emit_result(result, args.json)
 
 
 # ------------------------------------------------------------- followup ----
@@ -285,7 +295,7 @@ def cmd_followup(args: argparse.Namespace) -> int:
         # store общий с MCP-сервером — диалог достанет сам server-side followup
         if review_store.load(args.review_id) is None:
             print(
-                f"❌ review_id не найден: {args.review_id} (TTL 24ч, файл store: {review_store._path})",
+                f"❌ review_id не найден: {args.review_id} (TTL 24ч, store: {review_store._dir})",
                 file=sys.stderr,
             )
             return EXIT_ERR
@@ -311,14 +321,7 @@ def cmd_followup(args: argparse.Namespace) -> int:
             review_id=args.review_id,
         )
     )
-    if not result.success:
-        print(f"❌ {result.error}", file=sys.stderr)
-        return EXIT_ERR
-    if args.json:
-        print(json.dumps(_result_payload(result), ensure_ascii=False, indent=2))
-    else:
-        print(_format_result(result))
-    return EXIT_OK
+    return _emit_result(result, args.json)
 
 
 # ----------------------------------------------------------------- logs ----
@@ -335,8 +338,13 @@ def cmd_logs(args: argparse.Namespace) -> int:
     if not path.is_file():
         print(f"❌ Лог-файл не найден: {path}", file=sys.stderr)
         return EXIT_ERR
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    for line in lines[-args.tail :]:
+    # deque: держим только последние tail строк — большой лог не уедет в память
+    # (находка ревью rev_4e2fb8bca326)
+    tail: deque[str] = deque(maxlen=args.tail)
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            tail.append(line.rstrip("\n"))
+    for line in tail:
         print(line)
     return EXIT_OK
 
@@ -361,7 +369,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "daily_budget_usd": config.daily_budget_usd,
         "max_concurrent_requests": config.max_concurrent_requests,
         "retry_deadline_seconds": config.retry_deadline_seconds,
-        "store_path": str(review_store._path),
+        "store_path": str(review_store._dir),
         "env_file": _resolve_env_file(),
     }
     if args.json:
@@ -423,10 +431,15 @@ def main(argv: list[str] | None = None) -> int:
     _utf8_console()
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command is None:
-        # без подкоманды — совместимое поведение: запускаем MCP stdio-сервер
-        return cmd_serve(args)
-    return args.func(args)
+    try:
+        if args.command is None:
+            # без подкоманды — совместимое поведение: запускаем MCP stdio-сервер
+            return cmd_serve(args)
+        return args.func(args)
+    except KeyboardInterrupt:
+        # Ctrl+C в интерактивном терминале — стандартный код 130 (128+SIGINT)
+        print("\n⏹ Прервано пользователем", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
