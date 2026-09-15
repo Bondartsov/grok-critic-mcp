@@ -1,7 +1,7 @@
 <KnowledgeGraph>
-  <Project NAME="grok-critic-mcp" VERSION="1.11.0">
+  <Project NAME="grok-critic-mcp" VERSION="1.11.1">
     <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP, prompt caching, self-update, SecretStr, decorator, retry deadline, in-flight dedup, daily budget, review store, prompt injection guard, CLI, disk store</keywords>
-    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 8 MCP tools + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) для агентов — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через дисковый ReviewStore (db/reviews.json, переживает рестарты), JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill.</annotation>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 8 MCP tools + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) для агентов — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через пер-файловый дисковый ReviewStore (db/reviews/, переживает рестарты, race-free), JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill.</annotation>
 
     <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="complete">
       <purpose>Загрузка и валидация конфигурации через pydantic-settings: API ключ (SecretStr), base URL, timeout, agent_count, цены, логирование, безопасность (allow_file_path, allowed_read_dirs), надёжность (max_retries, retry_deadline_seconds), бюджет (daily_budget_usd, max_concurrent_requests). Hot reload без рестарта. Валидации: api_key min_length=1, agent_count ge=1 le=64, timeout_seconds ge=1, max_concurrent_requests ge=1 le=16.</purpose>
@@ -55,7 +55,7 @@
         <const-SECURITY_SYSTEM_PROMPT PURPOSE="System prompt для security audit с severity classification" />
         <const-INJECTION_GUARD PURPOSE="SEC-INJECTION: добавляется к каждому system-промпту — контент это данные, не инструкции" />
         <const-JSON_OUTPUT_INSTRUCTION PURPOSE="FEAT-JSON: строгий JSON-режим {summary, findings[severity,title,location,description,recommendation]}" />
-        <type-ReviewStore PURPOSE="Дисковый LRU (50) диалогов review_id → messages, файл db/reviews.json (POLZA_STORE_PATH), TTL 24ч от последнего обращения, atomic tmp+replace, общий для MCP-сервера и CLI; ошибки диска деградируют до in-memory" />
+        <type-ReviewStore PURPOSE="Дисковый store диалогов review_id → messages: ПЕР-ФАЙЛОВЫЙ layout db/reviews/rev_*.json (POLZA_STORE_PATH, атомарная tmp+replace запись) — исключает last-writer-wins гонки между процессами MCP и CLI (находка ревью rev_4e2fb8bca326); TTL 24ч от обращения, лимит 50 файлов с ленивой чисткой; ошибки диска деградируют в warning" />
         <export-review_store PURPOSE="Module-level ReviewStore singleton" />
         <fn-_build_user_prompt PURPOSE="Build structured user prompt from content, context, focus_areas; ограда через _code_fence" />
         <fn-_code_fence PURPOSE="SEC-INJECTION: markdown-ограда длиннее любого забора из backticks в контенте" />
