@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.10.0
+# VERSION: 1.11.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
@@ -9,9 +9,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 import httpx
 
@@ -48,34 +51,91 @@ def _content_size_error(total_len: int) -> str | None:
 
 
 # START_BLOCK_REVIEW_STORE
+# FEAT-CLI/FEAT-FOLLOWUP-ID: store живёт на диске (по умолчанию <repo>/db/reviews.json,
+# override — POLZA_STORE_PATH). MCP-сервер и CLI видят один store, поэтому review_id
+# переживает рестарты сервера и доступен из терминала. TTL записей — 24 часа.
+STORE_TTL_SECONDS = 24 * 3600
+
+
+def _default_store_path() -> Path:
+    """Путь store'а: config.store_path (POLZA_STORE_PATH) → <repo>/db/reviews.json."""
+    if config.store_path:
+        return Path(config.store_path)
+    return Path(__file__).resolve().parents[2] / "db" / "reviews.json"
+
+
 class ReviewStore:
-    """In-memory хранилище диалогов ревью для followup по review_id.
+    """Дисковый LRU-хранилище диалогов ревью для followup по review_id.
 
     Экономит токены: вместо передачи полного текста предыдущего ревью
     (~25k input-токенов на вызов) клиент передаёт только review_id.
-    Хранит список сообщений, оканчивающийся ответом ассистента.
-    LRU на 50 записей; теряется при рестарте процесса — тогда клиент
-    падает обратно на явную передачу previous_review.
+    Записи персистентны между рестартами процесса и общие для MCP-сервера
+    и CLI (атомарная запись tmp+replace). Ошибки диска не ломают ревью —
+    store деградирует до in-memory с warning в лог.
     """
 
-    def __init__(self, max_entries: int = 50) -> None:
-        self._entries: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
+    def __init__(self, max_entries: int = 50, path: Path | None = None) -> None:
+        self._entries: OrderedDict[str, dict] = OrderedDict()  # rid -> {"ts": float, "messages": [...]}
         self._max_entries = max_entries
+        self._path = path if path is not None else _default_store_path()
+        self._load_disk()
+
+    # -- persistence -------------------------------------------------------
+
+    def _load_disk(self) -> None:
+        try:
+            if not self._path.is_file():
+                return
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            now = time.time()
+            for rid, entry in raw.get("entries", {}).items():
+                if now - entry.get("ts", 0) <= STORE_TTL_SECONDS:
+                    self._entries[rid] = entry
+            # самый свежий — в конец OrderedDict
+            for rid in sorted(self._entries, key=lambda r: self._entries[r].get("ts", 0)):
+                self._entries.move_to_end(rid)
+        except Exception as exc:  # битый файл / нет прав — не критично
+            logger.warning("[Critic][ReviewStore][LOAD] store load failed: %s", exc)
+
+    def _persist(self) -> None:
+        try:
+            now = time.time()
+            # TTL-чистка перед записью
+            for rid in [r for r, e in self._entries.items() if now - e.get("ts", 0) > STORE_TTL_SECONDS]:
+                del self._entries[rid]
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                {"version": 1, "entries": dict(self._entries)}, ensure_ascii=False
+            )
+            tmp = self._path.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, self._path)
+        except Exception as exc:
+            logger.warning("[Critic][ReviewStore][SAVE] store persist failed: %s", exc)
+
+    # -- public API (не изменился) ------------------------------------------
 
     def save(self, review_id: str, messages: list[dict[str, str]], answer: str) -> None:
         if not review_id or not answer.strip():
             return
+        self._load_disk()  # подтянуть записи других процессов (MCP <-> CLI)
         conversation = [*messages, {"role": "assistant", "content": answer}]
-        self._entries[review_id] = conversation
+        self._entries[review_id] = {"ts": time.time(), "messages": conversation}
         self._entries.move_to_end(review_id)
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)
+        self._persist()
 
     def load(self, review_id: str) -> list[dict[str, str]] | None:
-        conversation = self._entries.get(review_id)
-        if conversation is not None:
-            self._entries.move_to_end(review_id)
-        return conversation
+        self._load_disk()
+        entry = self._entries.get(review_id)
+        if entry is None:
+            return None
+        # touch: обновляем ts (порядок LRU и TTL считаются от последнего обращения)
+        entry["ts"] = time.time()
+        self._entries.move_to_end(review_id)
+        self._persist()
+        return entry["messages"]
 
 
 review_store = ReviewStore()

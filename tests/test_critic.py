@@ -1,5 +1,5 @@
 # FILE: tests/test_critic.py
-# VERSION: 1.10.0
+# VERSION: 1.11.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CRITIC prompt building, review logic, followup, health_check
 #   SCOPE: _build_user_prompt, general_review, followup (+review_id), ReviewStore,
@@ -34,6 +34,19 @@ from grok_critic.critic import (
     health_check,
     review_store,
 )
+
+
+# START_BLOCK_STORE_ISOLATION
+@pytest.fixture(autouse=True)
+def _isolated_review_store(tmp_path, monkeypatch):
+    """FEAT-CLI: store дисковый — изолируем каждый тест в tmp_path."""
+    monkeypatch.setattr(review_store, "_path", tmp_path / "reviews.json")
+    review_store._entries.clear()
+    yield
+    review_store._entries.clear()
+
+
+# END_BLOCK_STORE_ISOLATION
 
 
 # START_BLOCK_PROMPT_BUILDING
@@ -238,8 +251,8 @@ class TestGeneralReview:
 
 # START_BLOCK_REVIEW_STORE
 class TestReviewStore:
-    def test_save_and_load(self) -> None:
-        store = ReviewStore(max_entries=3)
+    def test_save_and_load(self, tmp_path) -> None:
+        store = ReviewStore(max_entries=3, path=tmp_path / "store.json")
         messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
         store.save("rev_1", messages, "assistant answer")
         loaded = store.load("rev_1")
@@ -247,31 +260,75 @@ class TestReviewStore:
         assert len(loaded) == 3
         assert loaded[-1] == {"role": "assistant", "content": "assistant answer"}
 
-    def test_load_missing_returns_none(self) -> None:
-        store = ReviewStore()
+    def test_load_missing_returns_none(self, tmp_path) -> None:
+        store = ReviewStore(path=tmp_path / "store.json")
         assert store.load("rev_missing") is None
 
-    def test_empty_answer_not_saved(self) -> None:
-        store = ReviewStore()
+    def test_empty_answer_not_saved(self, tmp_path) -> None:
+        store = ReviewStore(path=tmp_path / "store.json")
         store.save("rev_1", [{"role": "user", "content": "u"}], "   ")
         assert store.load("rev_1") is None
 
-    def test_lru_eviction(self) -> None:
-        store = ReviewStore(max_entries=2)
+    def test_lru_eviction(self, tmp_path) -> None:
+        store = ReviewStore(max_entries=2, path=tmp_path / "store.json")
         for i in range(3):
             store.save(f"rev_{i}", [{"role": "user", "content": str(i)}], f"a{i}")
         assert store.load("rev_0") is None      # вытеснена первой
         assert store.load("rev_1") is not None
         assert store.load("rev_2") is not None
 
-    def test_touch_refreshes_recency(self) -> None:
-        store = ReviewStore(max_entries=2)
+    def test_touch_refreshes_recency(self, tmp_path) -> None:
+        store = ReviewStore(max_entries=2, path=tmp_path / "store.json")
         store.save("rev_a", [], "a")
         store.save("rev_b", [], "b")
         store.load("rev_a")                      # rev_a снова свежая
         store.save("rev_c", [], "c")             # вытеснится rev_b
         assert store.load("rev_a") is not None
         assert store.load("rev_b") is None
+
+    def test_persists_across_instances(self, tmp_path) -> None:
+        """FEAT-CLI: store на диске — review_id переживает 'рестарт' (новый инстанс/процесс)."""
+        path = tmp_path / "db" / "store.json"    # вложенная директория создаётся сама
+        store1 = ReviewStore(path=path)
+        store1.save("rev_persist", [{"role": "user", "content": "q"}], "answer")
+        store2 = ReviewStore(path=path)
+        loaded = store2.load("rev_persist")
+        assert loaded is not None
+        assert loaded[-1]["content"] == "answer"
+
+    def test_corrupted_store_tolerated(self, tmp_path) -> None:
+        """Битый JSON не роняет сервер — store деградирует до пустого."""
+        path = tmp_path / "store.json"
+        path.write_text("{not json at all", encoding="utf-8")
+        store = ReviewStore(path=path)
+        assert store.load("rev_x") is None
+        # и перезапись работает
+        store.save("rev_ok", [{"role": "user", "content": "u"}], "a")
+        assert ReviewStore(path=path).load("rev_ok") is not None
+
+    def test_ttl_expiry(self, tmp_path) -> None:
+        """Записи старше 24ч вычищаются при загрузке."""
+        import time as _time
+
+        from grok_critic.critic import STORE_TTL_SECONDS
+
+        path = tmp_path / "store.json"
+        store = ReviewStore(path=path)
+        store.save("rev_old", [{"role": "user", "content": "u"}], "a")
+        store.save("rev_fresh", [{"role": "user", "content": "u"}], "b")
+        store._entries["rev_old"]["ts"] = _time.time() - STORE_TTL_SECONDS - 10
+        store._persist()
+        fresh = ReviewStore(path=path)
+        assert fresh.load("rev_old") is None
+        assert fresh.load("rev_fresh") is not None
+
+    def test_cross_instance_shares_entries(self, tmp_path) -> None:
+        """MCP-сервер и CLI (два инстанса) видят записи друг друга: save->load без перезаписи."""
+        path = tmp_path / "store.json"
+        writer = ReviewStore(path=path)
+        reader = ReviewStore(path=path)
+        writer.save("rev_shared", [{"role": "user", "content": "u"}], "shared answer")
+        assert reader.load("rev_shared") is not None
 
 
 # END_BLOCK_REVIEW_STORE
