@@ -182,6 +182,7 @@ critic followup "почему это блокер?" --review-id rev_xxxxxxxxxxxx
 ## Миграция с 1.11.x на 1.12.0
 
 - Деньги — только в ₽. Убраны `POLZA_PRICE_INPUT_PER_1M` / `POLZA_PRICE_OUTPUT_PER_1M` / `POLZA_DAILY_BUDGET_USD` — если остались в `.env`/окружении, сервер стартует как обычно, но пишет один DEPRECATED-warning с именами ключей (без значений); их стоит удалить. Вместо `POLZA_DAILY_BUDGET_USD` — `POLZA_DAILY_BUDGET_RUB` (soft limit по фактической `cost_rub`).
+- Удаление из `.env` — скриптом `python scripts/migrate_env_1_12.py .env .env.example` (dry-run) → `--apply` (**пути указывать явно**). Он **не выводит содержимое** `.env` (только имена устаревших ключей и номера строк), поэтому агент может запускать его сам, не нарушая запрет на чтение `.env`. Комментарии в реальном `.env` не удаляет: номера строк для ручной проверки передай пользователю. Перед записью сверяет значения остальных ключей: exit 2 — отказ, файл не тронут.
 - CLI `--json` (`review`/`followup`): поле `cost_usd` удалено, есть `cost_rub` и новый `cost_is_estimate` (`true` — цена оценена по тарифу, а не пришла из API).
 - `check_health` / `grok-critic health --ping`: новый блок тарифа модели в ₽ (вход/выход/кэш + лимиты контекста/ответа) и `usage_today.date` в формате `DD.MM.YYYY`.
 

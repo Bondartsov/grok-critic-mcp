@@ -11,6 +11,8 @@
 #     (цены берутся из тарифа Polza.AI GET /models/{model}); добавлен daily_budget_rub.
 #     Устаревшие POLZA_PRICE_* / POLZA_DAILY_BUDGET_USD не ломают запуск — один
 #     DEPRECATED-warning с именами ключей (значения не логируются). datefmt логов — DD.MM.YYYY.
+#   DEPRECATED-PARITY: _find_deprecated_keys раскрывает ~ в POLZA_ENV_FILE (как pydantic-settings)
+#     и сопоставляет только ASCII-ключи ("ı".upper() == "I" давало ложный DEPRECATED).
 # END_CHANGE_SUMMARY
 
 from __future__ import annotations
@@ -153,10 +155,12 @@ def _find_deprecated_keys() -> list[str]:
     Ошибка чтения .env не ломает загрузку конфига.
     """
     found: set[str] = {key for key in DEPRECATED_ENV_KEYS if key in os.environ}
-    env_path = Path(_resolve_env_file())
+    # expanduser — как pydantic-settings при чтении env_file (иначе POLZA_ENV_FILE=~/… не проверялся).
+    env_path = Path(_resolve_env_file()).expanduser()
     try:
         if env_path.is_file():
-            file_keys = {str(k).upper() for k in dotenv_values(env_path)}
+            # Только ASCII-ключи: "ı".upper() == "I" дал бы ложное совпадение, а pydantic такой ключ не сопоставит.
+            file_keys = {str(k).upper() for k in dotenv_values(env_path) if str(k).isascii()}
             found.update(key for key in DEPRECATED_ENV_KEYS if key in file_keys)
     except Exception as exc:  # битый/недоступный .env — не повод падать
         logger.debug("[Config][_find_deprecated_keys][DEPRECATED] .env scan failed: %s", type(exc).__name__)

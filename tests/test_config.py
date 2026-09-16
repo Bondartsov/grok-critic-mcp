@@ -450,6 +450,20 @@ class TestDeprecatedKeysWarning:
         assert "POLZA_PRICE_OUTPUT_PER_1M" in caplog.text
         assert "6.6456" not in caplog.text
 
+    def test_env_file_with_tilde_is_expanded(self, tmp_path, monkeypatch) -> None:
+        """pydantic-settings раскрывает ~ в env_file — проверка устаревших ключей должна тоже."""
+        (tmp_path / "grok.env").write_text("POLZA_DAILY_BUDGET_USD=1\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("POLZA_ENV_FILE", "~/grok.env")
+        assert config_mod._find_deprecated_keys() == ["POLZA_DAILY_BUDGET_USD"]
+
+    def test_non_ascii_lookalike_key_not_reported(self, tmp_path, monkeypatch) -> None:
+        env_file = tmp_path / "lookalike.env"
+        env_file.write_text("POLZA_PRICE_ıNPUT_PER_1M=1\n", encoding="utf-8")  # ı.upper() == "I"
+        monkeypatch.setenv("POLZA_ENV_FILE", str(env_file))
+        assert config_mod._find_deprecated_keys() == []
+
     def test_load_config_emits_warning(self, monkeypatch, caplog) -> None:
         monkeypatch.setenv("POLZA_DAILY_BUDGET_USD", "9.8765")
         logger = logging.getLogger("grok-critic")

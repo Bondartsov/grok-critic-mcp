@@ -8,6 +8,9 @@ build/
 
 # Environment
 .env
+.env.*
+!.env.example
+*.migrate-tmp
 .venv/
 venv/
 
