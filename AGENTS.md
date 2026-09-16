@@ -4,7 +4,7 @@
 MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP
 
 ## Annotation
-MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). 8 MCP tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через пер-файловый дисковый ReviewStore (db/reviews/, race-free, переживает рестарты, общий с CLI), JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill (SKILL.md). Версия 1.11.1, все модули STATUS=complete, 249 тестов.
+MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). 8 MCP tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path — в MCP-схеме у трёх content-инструментов (content не обязателен при file_path; critic_followup file_path не принимает); sandbox — opt-in POLZA_ALLOW_FILE_PATH, разрешённые корни = директория проекта сессии (cwd процесса сервера, не используется как корень если внутри неё лежит $HOME) + POLZA_ALLOWED_READ_DIRS, плюс glob-denylist секретов (SEC-02/03/DENY). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через пер-файловый дисковый ReviewStore (db/reviews/, race-free, переживает рестарты, общий с CLI), JSON-режим, injection-guard. Внешний критик через MCP + универсальный skill в Kilo Code, ZCode, Claude Code, Cursor. Версия 1.11.2, все модули STATUS=complete, 358 тестов.
 
 ## Core Principles
 
@@ -72,8 +72,12 @@ src/
     api_client.py
     critic.py
     config.py
+    cli.py
 tests/
+  test_server.py
   test_api_client.py
   test_critic.py
   test_config.py
+  test_cli.py
+  test_package.py
 ```

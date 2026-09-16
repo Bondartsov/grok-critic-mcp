@@ -1,4 +1,4 @@
-<TechnologyStack VERSION="1.8.0">
+<TechnologyStack VERSION="1.11.2">
   <Runtime>Python 3.11+</Runtime>
   <Language>Python 3.11+</Language>
   <Framework>FastMCP (mcp Python SDK) 1.6+</Framework>
@@ -27,8 +27,8 @@
 
   <Testing>
     <module-level>
-      <command>pytest tests/test_config.py tests/test_critic.py tests/test_api_client.py tests/test_server.py -v</command>
-      <focus>Fast deterministic unit checks with mocked API responses (157 tests total)</focus>
+      <command>pytest tests/test_config.py tests/test_critic.py tests/test_api_client.py tests/test_server.py tests/test_cli.py -v</command>
+      <focus>Fast deterministic unit checks with mocked API responses (322 tests total: 321 passed + 1 skipped POSIX-only on Windows)</focus>
     </module-level>
     <wave-level>
       <command>pytest tests/ -v --timeout=30</command>
@@ -49,6 +49,6 @@
   </Observability>
 
   <DeliveryShape>
-    <shape>Single Python package installed via pip install -e . Runs as MCP stdio server invoked by Kilo Code. No HTTP server, no Docker, no database. Deployed on VM (10.61.11.54:/opt/grok-critic-mcp/repo) via systemd service.</shape>
+    <shape>Single Python package installed via pip install -e . Runs as MCP stdio server, invoked by MCP-клиентами (Kilo Code, ZCode, Claude Code, Cursor) плюс терминальный CLI (grok-critic) как fallback. No HTTP server, no database. Опциональный Dockerfile (python:3.12-slim, stdio, non-root) для контейнерного запуска. Деплой на VM (10.61.11.54:/opt/grok-critic-mcp/repo) через systemd service.</shape>
   </DeliveryShape>
 </TechnologyStack>

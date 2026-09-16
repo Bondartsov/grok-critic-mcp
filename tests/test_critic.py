@@ -1,5 +1,5 @@
 # FILE: tests/test_critic.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CRITIC prompt building, review logic, followup, health_check
 #   SCOPE: _build_user_prompt, general_review, followup (+review_id), ReviewStore,
@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -330,6 +331,25 @@ class TestReviewStore:
         assert fresh.load("rev_bad") is None
         assert fresh.load("rev_ok") is not None
 
+    @pytest.mark.skipif(os.name != "posix", reason="NEW-SEC-store-perms: права POSIX-only")
+    def test_store_dir_and_file_perms_posix(self, tmp_path) -> None:
+        """NEW-SEC-store-perms: каталог store — 0700, записанный файл — 0600."""
+        path = tmp_path / "reviews"
+        store = ReviewStore(path=path)
+        store.save("rev_perm", [{"role": "user", "content": "u"}], "a")
+        dir_mode = path.stat().st_mode & 0o777
+        file_mode = (path / "rev_perm.json").stat().st_mode & 0o777
+        assert dir_mode == 0o700
+        assert file_mode == 0o600
+
+    def test_save_and_load_works_on_current_platform(self, tmp_path) -> None:
+        """NEW-SEC-store-perms: chmod (POSIX) не ломает обычную запись/чтение ни на одной платформе."""
+        store = ReviewStore(path=tmp_path / "reviews")
+        store.save("rev_cross_platform", [{"role": "user", "content": "u"}], "answer")
+        loaded = store.load("rev_cross_platform")
+        assert loaded is not None
+        assert loaded[-1]["content"] == "answer"
+
     def test_ttl_expiry(self, tmp_path) -> None:
         """Записи старше 24ч удаляются при обращении/чистке."""
         import time as _time
@@ -348,6 +368,85 @@ class TestReviewStore:
         fresh = ReviewStore(path=path)
         assert fresh.load("rev_old") is None
         assert fresh.load("rev_fresh") is not None
+
+    def test_tmp_file_opened_with_excl_and_0600(self, tmp_path) -> None:
+        """STORE-TMP-0600: на POSIX tmp создаётся через os.open(O_EXCL, 0o600) —
+        без промежуточного write_text() + chmod() (окно с широкими правами по umask).
+        Мокаем os.name, чтобы тест был воспроизводим независимо от платформы CI."""
+        path = tmp_path / "reviews"
+        store = ReviewStore(path=path)
+        real_open = os.open
+        opened: list[tuple[str, int, int]] = []
+
+        def fake_open(file, flags, mode=0o777):
+            opened.append((file, flags, mode))
+            return real_open(file, flags, mode)
+
+        with patch("grok_critic.critic.os.name", "posix"), \
+                patch("grok_critic.critic.os.chmod"), \
+                patch("grok_critic.critic.os.open", side_effect=fake_open):
+            store.save("rev_excl", [{"role": "user", "content": "u"}], "a")
+
+        assert len(opened) == 1
+        _file, flags, mode = opened[0]
+        assert flags & os.O_EXCL
+        assert flags & os.O_CREAT
+        assert mode == 0o600
+        # финальный файл всё равно на месте и читаем
+        assert store.load("rev_excl") is not None
+
+    def test_two_writers_same_review_id_unique_tmp_names(self, tmp_path) -> None:
+        """STORE-TMP-UNIQUE: два «писателя» (разные процессы/инстансы) сохраняют
+        ОДИН и тот же review_id подряд — уникальные tmp-имена не сталкиваются,
+        итоговый JSON корректен и содержит последнюю запись."""
+        path = tmp_path / "reviews"
+        writer_a = ReviewStore(path=path)
+        writer_b = ReviewStore(path=path)
+
+        writer_a.save("rev_shared", [{"role": "user", "content": "q1"}], "answer from a")
+        writer_b.save("rev_shared", [{"role": "user", "content": "q2"}], "answer from b")
+
+        # никаких осиротевших .tmp-файлов не осталось
+        assert list(path.glob("*.tmp")) == []
+        loaded = writer_a.load("rev_shared")
+        assert loaded is not None
+        assert loaded[-1] == {"role": "assistant", "content": "answer from b"}
+
+    def test_tmp_name_unique_per_call(self, tmp_path) -> None:
+        """Прямая проверка уникальности имени tmp-файла между двумя вызовами
+        _atomic_write для одного и того же целевого path (без реальной гонки потоков)."""
+        path = tmp_path / "reviews"
+        store = ReviewStore(path=path)
+        target = path / "rev_x.json"
+        seen: list[str] = []
+        real_replace = os.replace
+
+        def fake_replace(src, dst):
+            seen.append(str(src))
+            real_replace(src, dst)
+
+        with patch("grok_critic.critic.os.replace", side_effect=fake_replace):
+            store._atomic_write(target, json.dumps({"ts": 1, "messages": []}))
+            store._atomic_write(target, json.dumps({"ts": 2, "messages": []}))
+
+        assert len(seen) == 2
+        assert seen[0] != seen[1]
+
+    def test_orphaned_tmp_file_does_not_break_load_or_prune(self, tmp_path) -> None:
+        """Осиротевший .tmp-файл (например, после аварийного завершения писателя
+        между os.open и os.replace) не мешает load() существующих записей и не
+        считается записью в _prune (glob только rev_*.json)."""
+        path = tmp_path / "reviews"
+        store = ReviewStore(max_entries=5, path=path)
+        store.save("rev_ok", [{"role": "user", "content": "u"}], "a")
+
+        orphan = path / ".rev_ok.json.99999.deadbeef.tmp"
+        orphan.write_text("{not valid json at all", encoding="utf-8")
+
+        assert store.load("rev_ok") is not None
+        store._prune()  # не должен упасть и не должен тронуть orphan/rev_ok
+        assert orphan.exists()
+        assert store.load("rev_ok") is not None
 
 
 # END_BLOCK_REVIEW_STORE
@@ -437,10 +536,14 @@ class TestFollowupById:
             assert messages[0]["content"].startswith(FOLLOWUP_SYSTEM_PROMPT)
 
     async def test_followup_by_unknown_review_id(self) -> None:
+        """A4: сообщение про TTL/лимит store, а не про 'теряется при рестарте'
+        (store теперь дисковый и переживает рестарт — см. test_persists_across_instances)."""
         result = await followup(question="why?", review_id="rev_nope")
         assert not result.success
         assert "не найден" in result.error
         assert "previous_review" in result.error  # подсказка о fallback
+        assert "TTL" in result.error
+        assert "рестарте" not in result.error
 
     async def test_followup_by_id_result_also_stored(self, seeded_store) -> None:
         call_mock = AsyncMock(return_value=CritiqueResult(
@@ -458,6 +561,15 @@ class TestFollowupById:
 
 # START_BLOCK_HEALTH_CHECK
 class TestHealthCheck:
+    @pytest.fixture(autouse=True)
+    def _reset_balance_cache(self):
+        """A2/TEST-05: TTL-кэш баланса (60с) не должен маскировать ошибки между тестами."""
+        import grok_critic.critic as critic_module
+
+        critic_module._balance_cache = None
+        yield
+        critic_module._balance_cache = None
+
     @pytest.fixture()
     def mock_balance(self):
         """Mock balance API to return a fake balance."""
@@ -530,6 +642,62 @@ class TestHealthCheck:
             mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert "pricing" not in result
+
+    # -- A2/TEST-05: status пересчитывается ПОСЛЕ блока Balance API -----------
+
+    async def test_degraded_when_balance_api_returns_500(self) -> None:
+        """A2: без бага status оставался бы 'ok', хотя Balance API вернул 500."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_resp
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("grok_critic.critic.httpx.AsyncClient", return_value=mock_client), patch(
+            "grok_critic.critic.config"
+        ) as mock_cfg:
+            mock_cfg.api_key = SecretStr("valid-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.price_input_per_1m = 0.0
+            mock_cfg.price_output_per_1m = 0.0
+            result = await health_check()
+            assert result["status"] == "degraded"
+            assert any("Balance API" in issue for issue in result["issues"])
+
+    async def test_degraded_when_balance_api_connect_error(self) -> None:
+        """A2/TEST-05: транспортная ошибка (httpx.ConnectError) тоже должна давать degraded."""
+        import httpx
+
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = httpx.ConnectError("connection refused")
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("grok_critic.critic.httpx.AsyncClient", return_value=mock_client), patch(
+            "grok_critic.critic.config"
+        ) as mock_cfg:
+            mock_cfg.api_key = SecretStr("valid-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.price_input_per_1m = 0.0
+            mock_cfg.price_output_per_1m = 0.0
+            result = await health_check()
+            assert result["status"] == "degraded"
+            assert any("Balance API" in issue for issue in result["issues"])
+
+    async def test_ok_when_balance_api_succeeds(self, mock_balance) -> None:
+        """A2: успешный ответ Balance API не должен деградировать статус."""
+        with patch("grok_critic.critic.config") as mock_cfg:
+            mock_cfg.api_key = SecretStr("valid-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.price_input_per_1m = 0.0
+            mock_cfg.price_output_per_1m = 0.0
+            result = await health_check()
+            assert result["status"] == "ok"
+            assert result["issues"] == []
 
 
 # END_BLOCK_HEALTH_CHECK

@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import functools
 import hashlib
 import json
 import logging
@@ -82,8 +83,9 @@ def _get_semaphore(limit: int) -> asyncio.Semaphore:
 
 # REL-06 companion: in-flight dedup — параллельный вызов с тем же контентом
 # присоединяется к уже летящему запросу вместо второго платного вызова.
-# Значения — asyncio.Task; подписчики ждут через asyncio.shield, поэтому
-# отмена одного подписчика не убивает общий запрос и не подвешивает остальных.
+# Значения — asyncio.Task; ВСЕ вызывающие (включая создателя) ждут через
+# asyncio.shield, поэтому отмена любого из них не убивает общий запрос и не
+# подвешивает остальных. Запись удаляется только done-callback'ом самой задачи.
 _inflight: dict[str, asyncio.Task[CritiqueResult]] = {}
 
 
@@ -92,6 +94,23 @@ def _inflight_get(key: str) -> asyncio.Task[CritiqueResult] | None:
     if task is not None and task.done():
         return None
     return task
+
+
+def _inflight_discard(key: str, task: asyncio.Task[CritiqueResult]) -> None:
+    """Done-callback общей задачи: удалить запись, только если она всё ещё указывает
+    на эту задачу (identity) — более новый запрос с тем же ключом не трогаем (I3)."""
+    if _inflight.get(key) is task:
+        _inflight.pop(key, None)
+    if task.cancelled():
+        logger.warning("[APIClient][_inflight_discard][DEDUP] in-flight task cancelled key=%s…", key[:12])
+        return
+    exc = task.exception()  # помечает исключение как полученное даже без ожидающих
+    if exc is not None:
+        logger.error(
+            "[APIClient][_inflight_discard][DEDUP] in-flight task failed key=%s…: %s",
+            key[:12],
+            type(exc).__name__,
+        )
 
 
 # END_BLOCK_RUNTIME_GUARDS
@@ -173,6 +192,26 @@ def _extract_text(payload: dict[str, Any]) -> str:
 # END_BLOCK_RESPONSE_PARSER
 
 
+# START_BLOCK_INPUT_MESSAGES
+def _build_input_messages(
+    prompt: str,
+    system_prompt: str | None,
+    messages: list[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    """Собрать итоговый список input-сообщений — ТОЧНО так же, как при реальной
+    отправке в API (см. _request_once). Общая точка правды для dedup-ключа и
+    тела запроса, чтобы они никогда не разошлись (A3)."""
+    input_messages: list[dict[str, str]] = list(messages) if messages else []
+    if not messages:
+        if system_prompt:
+            input_messages.append({"role": "system", "content": system_prompt})
+        input_messages.append({"role": "user", "content": prompt})
+    return input_messages
+
+
+# END_BLOCK_INPUT_MESSAGES
+
+
 # START_BLOCK_USAGE_EXTRACTION
 def _extract_usage(payload: dict[str, Any]) -> tuple[int, int, int, float | None, int, int]:
     usage = payload.get("usage", {})
@@ -251,18 +290,25 @@ class ResponsesClient:
             self._timeout_seconds,
         )
 
-    @staticmethod
     def _dedup_key(
+        self,
         prompt: str,
         agent_count: int,
         system_prompt: str | None,
         messages: list[dict[str, str]] | None,
     ) -> str:
-        """Стабильный ключ in-flight dedup: модель + усилие + полный payload сообщений."""
-        sys_part = system_prompt or ""
-        if messages:
-            sys_part = next((m["content"] for m in messages if m.get("role") == "system"), "")
-        raw = json.dumps({"p": prompt, "a": agent_count, "s": sys_part}, ensure_ascii=False)
+        """Стабильный ключ in-flight dedup: хэш от модели + agent_count + ФАКТИЧЕСКОГО
+        списка input-сообщений, который уйдёт в тело запроса (см. _build_input_messages).
+
+        Это отличает followup-запросы с разной историей диалога (messages) даже при
+        одинаковом prompt (A3) — ключ построен из sort_keys=True JSON, чтобы порядок
+        ключей словаря не влиял на хэш."""
+        input_messages = _build_input_messages(prompt, system_prompt, messages)
+        raw = json.dumps(
+            {"m": input_messages, "a": agent_count, "model": self._model},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     async def call(
@@ -272,8 +318,31 @@ class ResponsesClient:
         system_prompt: str | None = None,
         messages: list[dict[str, str]] | None = None,
     ) -> CritiqueResult:
-        """Публичная точка входа: budget-guard → in-flight dedup → semaphore → транспорт."""
-        # FEAT-BUDGET: превышение дневного лимита — отказ ДО обращения к платному API.
+        """Публичная точка входа: in-flight dedup → общая задача (semaphore → budget-guard → транспорт).
+
+        Все вызывающие (включая создателя) — лишь ожидающие общей задачи через
+        asyncio.shield: их отмена не отменяет запрос, не освобождает слот semaphore
+        и не удаляет запись _inflight (DEDUP-CANCEL / DEDUP-SEM)."""
+        # START_BLOCK_INFLIGHT_DEDUP
+        key = self._dedup_key(prompt, agent_count, system_prompt, messages)
+        existing = _inflight_get(key)
+        if existing is not None:
+            logger.info("[APIClient][call][DEDUP] join in-flight request key=%s…", key[:12])
+            return await asyncio.shield(existing)
+
+        # I1/I3: проверка отсутствия ключа, создание задачи, запись в _inflight и
+        # регистрация done-callback — синхронно, без await между ними (один event loop).
+        task = asyncio.create_task(
+            self._guarded_request(prompt, agent_count, system_prompt, messages)
+        )
+        _inflight[key] = task
+        task.add_done_callback(functools.partial(_inflight_discard, key))
+        logger.debug("[APIClient][call][DEDUP] registered in-flight request key=%s…", key[:12])
+        return await asyncio.shield(task)
+        # END_BLOCK_INFLIGHT_DEDUP
+
+    def _budget_exceeded_result(self, agent_count: int) -> CritiqueResult | None:
+        """FEAT-BUDGET: результат-отказ при исчерпанном дневном бюджете, иначе None."""
         budget = config.daily_budget_usd
         if isinstance(budget, (int, float)) and budget > 0:
             spent = get_usage_stats()["cost_usd"]
@@ -289,31 +358,34 @@ class ResponsesClient:
                         "Увеличьте POLZA_DAILY_BUDGET_USD или дождитесь следующего дня."
                     ),
                 )
+        return None
 
-        key = self._dedup_key(prompt, agent_count, system_prompt, messages)
-        existing = _inflight_get(key)
-        if existing is not None:
-            logger.info("[APIClient][call][DEDUP] join in-flight request key=%s…", key[:12])
-            return await asyncio.shield(existing)
+    async def _guarded_request(
+        self,
+        prompt: str,
+        agent_count: int,
+        system_prompt: str | None,
+        messages: list[dict[str, str]] | None,
+    ) -> CritiqueResult:
+        """Тело общей in-flight задачи: слот semaphore → budget-guard → транспорт.
 
+        Слот держит только эта задача (I4) — ожидающие её вызывающие слот не занимают,
+        а отмена вызывающих не освобождает слот раньше завершения HTTP-запроса."""
+        # START_BLOCK_GUARDED_REQUEST
         limit_raw = config.max_concurrent_requests
         limit = limit_raw if isinstance(limit_raw, int) and limit_raw >= 1 else 2
         async with _get_semaphore(limit):
-            # Double-check после ожидания слота: пока ждали semaphore,
-            # такой же запрос мог начать кто-то другой.
-            existing = _inflight_get(key)
-            if existing is not None:
-                logger.info("[APIClient][call][DEDUP] join after semaphore key=%s…", key[:12])
-                return await asyncio.shield(existing)
-            task = asyncio.create_task(
-                self._perform_request(prompt, agent_count, system_prompt, messages)
-            )
-            _inflight[key] = task
-            try:
-                return await asyncio.shield(task)
-            finally:
-                if _inflight.get(key) is task:
-                    _inflight.pop(key, None)
+            # I5: бюджет проверяется непосредственно перед тратой — после получения
+            # слота и до HTTP. Присоединившиеся к уже летящему запросу этой проверки
+            # не проходят и бюджетом не отклоняются.
+            # POLZA_DAILY_BUDGET_USD — SOFT limit: стоимость multi-agent запроса заранее
+            # неизвестна и учитывается только по завершении, поэтому возможен перерасход
+            # не более чем на max_concurrent_requests одновременно выполняющихся запросов.
+            rejected = self._budget_exceeded_result(agent_count)
+            if rejected is not None:
+                return rejected
+            return await self._perform_request(prompt, agent_count, system_prompt, messages)
+        # END_BLOCK_GUARDED_REQUEST
 
     async def _perform_request(
         self,
@@ -346,11 +418,7 @@ class ResponsesClient:
             review_id,
         )
 
-        input_messages: list[dict[str, str]] = list(messages) if messages else []
-        if not messages:
-            if system_prompt:
-                input_messages.append({"role": "system", "content": system_prompt})
-            input_messages.append({"role": "user", "content": prompt})
+        input_messages = _build_input_messages(prompt, system_prompt, messages)
 
         body: dict[str, Any] = {
             "model": self._model,

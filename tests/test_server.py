@@ -1,5 +1,5 @@
 # FILE: tests/test_server.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-SERVER MCP tool registration and invocation
 #   SCOPE: Registration, params, delegation, sandbox denylist, file_path opt-in,
@@ -12,16 +12,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+import sys
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from pydantic import SecretStr
 
 from grok_critic.api_client import CritiqueResult
 from grok_critic.config import config
 from grok_critic.server import (
+    _allowed_roots,
     _heartbeat,
+    _is_sensitive_file,
+    _is_unsafe_windows_path,
     _parse_json_loose,
     _read_file_content,
+    _run_cmd,
     _validate_agent_count,
     architecture_review,
     check_health,
@@ -58,7 +65,20 @@ class TestToolRegistration:
         assert "agent_count" in properties
         assert "focus_areas" in properties
         assert "output_format" in properties  # FEAT-JSON
-        assert "content" in schema.get("required", [])
+        assert "file_path" in properties  # A1
+        assert "content" not in (schema.get("required") or [])
+
+    async def test_content_tools_expose_file_path_in_mcp_schema(self) -> None:
+        """A1: публичный list_tools() — file_path в схеме, content не обязателен."""
+        tools = {t.name: t for t in await server.list_tools()}
+        for name in ("critic_review", "architecture_review", "security_audit"):
+            schema = tools[name].inputSchema
+            assert "file_path" in schema.get("properties", {}), name
+            assert "content" in schema.get("properties", {}), name
+            assert "content" not in (schema.get("required") or []), name
+            assert "ctx" not in schema.get("properties", {}), name
+        followup_schema = tools["critic_followup"].inputSchema
+        assert "file_path" not in followup_schema.get("properties", {})
 
     def test_critic_followup_tool_has_params(self) -> None:
         """FEAT-FOLLOWUP-ID: required только question; review_id доступен."""
@@ -197,6 +217,31 @@ class TestCriticReviewTool:
             result = await critic_review(content="code", output_format="json")
             assert "⚠️ Модель вернула не-JSON" in result
             assert "модель ответила текстом" in result
+
+    async def test_reasoning_and_cached_metadata(self) -> None:
+        """A8 / TEST-07: доли reasoning/cached в metadata-footer."""
+        mock_result = CritiqueResult(
+            text="ok", model="m", agent_count=16, effort="high",
+            input_tokens=3000, output_tokens=6000, total_tokens=9000,
+            reasoning_tokens=4200, cached_tokens=1800, review_id="rev_meta",
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="code")
+        assert "🧠 Reasoning: 4 200 (70% of output)" in result
+        assert "💾 Cached: 1 800/3 000 (60%)" in result
+
+    async def test_metadata_zero_denominators(self) -> None:
+        """A8 / TEST-07: output_tokens=0 и input_tokens=0 — без ZeroDivisionError."""
+        mock_result = CritiqueResult(
+            text="ok", model="m", agent_count=4, effort="low",
+            input_tokens=0, output_tokens=0, total_tokens=0,
+            reasoning_tokens=100, cached_tokens=50, review_id="rev_zero",
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="code")
+        assert "❌" not in result
+        assert "🧠 Reasoning: 100 (0% of output)" in result
+        assert "💾 Cached: 50/0 (0%)" in result
 
 
 # END_BLOCK_CRITIC_REVIEW_TOOL
@@ -453,58 +498,148 @@ class TestSelfUpdateTool:
             result = await self_update()
             assert "disabled" in result
 
-    async def test_already_up_to_date(self) -> None:
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(return_value=(b"Already up to date.", b""))
-        mock_proc.returncode = 0
+    @staticmethod
+    def _proc(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0,
+              exc: BaseException | None = None) -> AsyncMock:
+        proc = AsyncMock()
+        if exc is not None:
+            proc.communicate = AsyncMock(side_effect=exc)
+        else:
+            proc.communicate = AsyncMock(return_value=(stdout, stderr))
+        proc.returncode = returncode
+        # asyncio.subprocess.Process.kill() синхронный: AsyncMock вернул бы корутину,
+        # которую _run_cmd не ждёт (RuntimeWarning "never awaited" на путях таймаута).
+        proc.kill = MagicMock()
+        return proc
 
+    async def _run(self, procs: list[AsyncMock]) -> tuple[str, AsyncMock, AsyncMock]:
         with patch("grok_critic.server.config") as mock_cfg, \
-             patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
-            mock_cfg.allow_self_update = True
-            result = await self_update()
-            assert "Already up to date" in result
-
-    async def test_git_pull_fails(self) -> None:
-        mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(return_value=(b"", b"fatal: not a git repository"))
-        mock_proc.returncode = 128
-
-        with patch("grok_critic.server.config") as mock_cfg, \
-             patch("grok_critic.server.asyncio.create_subprocess_exec", return_value=mock_proc):
-            mock_cfg.allow_self_update = True
-            result = await self_update()
-            assert "❌ git pull failed" in result
-            assert "128" in result
-
-    async def test_full_update_flow(self) -> None:
-        git_proc = AsyncMock()
-        git_proc.communicate = AsyncMock(return_value=(
-            b"Updating abdc10d..de15bb0\nFast-forward\n src/server.py | 5 +++--\n 1 file changed",
-            b"",
-        ))
-        git_proc.returncode = 0
-
-        pip_proc = AsyncMock()
-        pip_proc.communicate = AsyncMock(return_value=(
-            b"Successfully installed grok-critic-mcp-1.10.0",
-            b"",
-        ))
-        pip_proc.returncode = 0
-
-        call_count = 0
-
-        async def mock_subprocess(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            return git_proc if call_count == 1 else pip_proc
-
-        with patch("grok_critic.server.config") as mock_cfg, \
-             patch("grok_critic.server.asyncio.create_subprocess_exec", side_effect=mock_subprocess), \
+             patch("grok_critic.server.asyncio.create_subprocess_exec",
+                   new_callable=AsyncMock, side_effect=procs) as mock_exec, \
              patch("grok_critic.server.close_client", new_callable=AsyncMock), \
              patch("grok_critic.server.os._exit") as mock_exit:
             mock_cfg.allow_self_update = True
-            await self_update()
-            mock_exit.assert_called_once_with(0)
+            result = await self_update()
+        return result, mock_exec, mock_exit
+
+    async def test_already_up_to_date(self) -> None:
+        """NEW-SERVER-1: HEAD не изменился → up to date, pip не запускается (локализованный git)."""
+        procs = [
+            self._proc(b"abc123\n"),
+            self._proc("Уже актуально.".encode()),
+            self._proc(b"abc123\n"),
+        ]
+        result, mock_exec, mock_exit = await self._run(procs)
+        assert "Already up to date" in result
+        assert mock_exec.await_count == 3
+        assert mock_exec.call_args_list[0].args == ("git", "rev-parse", "HEAD")
+        assert mock_exec.call_args_list[1].args == ("git", "pull")
+        mock_exit.assert_not_called()
+
+    async def test_english_message_but_head_changed_runs_pip(self) -> None:
+        """NEW-SERVER-1: решение по HEAD, а не по подстроке вывода."""
+        procs = [
+            self._proc(b"abc123"),
+            self._proc(b"Already up to date."),
+            self._proc(b"def456"),
+            self._proc(b"ok"),
+        ]
+        _, mock_exec, mock_exit = await self._run(procs)
+        assert mock_exec.await_count == 4
+        mock_exit.assert_called_once_with(0)
+
+    async def test_git_pull_fails(self) -> None:
+        procs = [
+            self._proc(b"abc123"),
+            self._proc(b"", b"fatal: not a git repository", returncode=128),
+        ]
+        result, _, mock_exit = await self._run(procs)
+        assert "❌ git pull failed" in result
+        assert "128" in result
+        mock_exit.assert_not_called()
+
+    async def test_git_rev_parse_fails(self) -> None:
+        result, mock_exec, _ = await self._run([self._proc(b"", b"fatal", returncode=128)])
+        assert "❌ git rev-parse failed" in result
+        assert mock_exec.await_count == 1
+
+    async def test_non_utf8_output_does_not_crash(self) -> None:
+        """NEW-SERVER-1: decode(errors='replace') для не-UTF-8 вывода."""
+        procs = [
+            self._proc(b"abc"),
+            self._proc(b"\xff\xfe cp1251 \xc0", b"\xff", returncode=1),
+        ]
+        result, _, _ = await self._run(procs)
+        assert "❌ git pull failed (code 1)" in result
+
+    async def test_full_update_flow(self) -> None:
+        """NEW-SERVER-3: pip запускается через sys.executable -m pip."""
+        procs = [
+            self._proc(b"abdc10d"),
+            self._proc(b"Updating abdc10d..de15bb0\nFast-forward\n src/server.py | 5 +++--\n 1 file changed"),
+            self._proc(b"de15bb0"),
+            self._proc(b"Successfully installed grok-critic-mcp-1.10.0"),
+        ]
+        _, mock_exec, mock_exit = await self._run(procs)
+        mock_exit.assert_called_once_with(0)
+        assert mock_exec.call_args_list[3].args == (sys.executable, "-m", "pip", "install", "-e", ".")
+
+    async def test_git_pull_timeout(self) -> None:
+        """A9 / TEST-08: TimeoutError из wait_for на git pull."""
+        procs = [self._proc(b"abc"), self._proc(exc=TimeoutError())]
+        result, _, mock_exit = await self._run(procs)
+        assert "git pull timed out" in result
+        mock_exit.assert_not_called()
+
+    async def test_pip_install_timeout(self) -> None:
+        """A9 / TEST-08: git ok, pip install по таймауту."""
+        procs = [
+            self._proc(b"abc"),
+            self._proc(b"Updating"),
+            self._proc(b"def"),
+            self._proc(exc=TimeoutError()),
+        ]
+        result, _, mock_exit = await self._run(procs)
+        assert "pip install timed out" in result
+        mock_exit.assert_not_called()
+
+    async def test_pip_install_failed(self) -> None:
+        """A9 / TEST-08: git ok (HEAD изменился), pip returncode=1."""
+        procs = [
+            self._proc(b"abc"),
+            self._proc(b"Updating"),
+            self._proc(b"def"),
+            self._proc(b"", b"ERROR: boom", returncode=1),
+        ]
+        result, _, mock_exit = await self._run(procs)
+        assert "pip install failed" in result
+        assert "boom" in result
+        mock_exit.assert_not_called()
+
+
+class TestRunCmdTimeout:
+    """Таймаут _run_cmd убивает подпроцесс, а не оставляет git/pip висеть."""
+
+    async def test_timeout_kills_process_and_reraises(self) -> None:
+        proc = MagicMock()
+        proc.pid = 4242
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.wait = AsyncMock(return_value=-9)
+        with patch("grok_critic.server.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            with pytest.raises(TimeoutError):
+                await _run_cmd("git", "pull", cwd=".", timeout=0.01)
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited_once()
+
+    async def test_timeout_with_already_exited_process_still_reraises(self) -> None:
+        proc = MagicMock()
+        proc.pid = 4243
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.kill = MagicMock(side_effect=ProcessLookupError)
+        proc.wait = AsyncMock(return_value=0)
+        with patch("grok_critic.server.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            with pytest.raises(TimeoutError):
+                await _run_cmd("pip", "install", cwd=".", timeout=0.01)
 
 
 # END_BLOCK_SELF_UPDATE_TOOL
@@ -539,10 +674,12 @@ class TestValidateAgentCount:
 
 # START_BLOCK_READ_FILE_CONTENT
 class TestReadFileContent:
-    def test_nonexistent_file(self) -> None:
-        content, err = _read_file_content("/nonexistent/path/file.py")
+    def test_nonexistent_file(self, tmp_path, monkeypatch) -> None:
+        """Несуществующий файл внутри корня — «File not found»."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        content, err = _read_file_content(str(tmp_path / "nope.py"))
         assert content == ""
-        assert "not found" in err.lower() or "not a file" in err.lower()
+        assert err is not None and err.startswith("File not found:")
 
     def test_empty_file(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
@@ -560,7 +697,8 @@ class TestReadFileContent:
         assert err is None
         assert "hello" in content
 
-    def test_directory_path(self, tmp_path) -> None:
+    def test_directory_path(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
         content, err = _read_file_content(str(tmp_path))
         assert content == ""
         assert "not a file" in err.lower()
@@ -677,6 +815,300 @@ class TestReadFileContent:
 
 
 # END_BLOCK_READ_FILE_CONTENT
+
+
+# START_BLOCK_SANDBOX_ORACLE
+class TestSandboxOracle:
+    """SEC-ORACLE: отказ не зависит от существования файла и не раскрывает resolved-путь."""
+
+    def test_nonexistent_inside_secret_dir_denied(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        ssh = tmp_path / ".ssh"
+        ssh.mkdir()
+        (ssh / "id_real").write_text("KEY", encoding="utf-8")
+        _, err_missing = _read_file_content(str(ssh / "nope"))
+        _, err_exists = _read_file_content(str(ssh / "id_real"))
+        for err in (err_missing, err_exists):
+            assert err is not None and err.startswith("Access denied: sensitive file type")
+            assert "not found" not in err.lower()
+
+    def test_nonexistent_outside_roots_denied(self, tmp_path, monkeypatch) -> None:
+        allowed = tmp_path / "project"
+        allowed.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "real.txt").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(config, "allowed_read_dirs", str(allowed))
+        missing = str(outside / "nope.txt")
+        existing = str(outside / "real.txt")
+        _, err_missing = _read_file_content(missing)
+        _, err_exists = _read_file_content(existing)
+        assert err_missing is not None and err_exists is not None
+        assert err_missing.startswith("Access denied:")
+        assert "not found" not in err_missing.lower()
+        # Ответ одинаков по форме: отличается только эхом переданной строки.
+        assert err_missing.replace(missing, "<P>") == err_exists.replace(existing, "<P>")
+
+    def test_denial_echoes_passed_string_not_resolved(self, tmp_path, monkeypatch) -> None:
+        allowed = tmp_path / "project"
+        allowed.mkdir()
+        monkeypatch.setattr(config, "allowed_read_dirs", str(allowed))
+        passed = str(allowed / ".." / "secret" / "x.txt")
+        resolved = str((tmp_path / "secret" / "x.txt").resolve())
+        _, err = _read_file_content(passed)
+        assert err is not None
+        assert f"Access denied: {passed} is outside allowed directories." in err
+        assert resolved not in err
+
+    def test_symlink_target_not_disclosed(self, tmp_path, monkeypatch) -> None:
+        allowed = tmp_path / "project"
+        allowed.mkdir()
+        target_dir = tmp_path / "hidden_target_dir"
+        target_dir.mkdir()
+        target = target_dir / "data.txt"
+        target.write_text("x", encoding="utf-8")
+        link = allowed / "link.txt"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation not permitted on this platform")
+        monkeypatch.setattr(config, "allowed_read_dirs", str(allowed))
+        content, err = _read_file_content(str(link))
+        assert content == ""
+        assert err is not None and err.startswith("Access denied:")
+        assert "hidden_target_dir" not in err
+        assert str(link) in err
+
+    def test_sensitive_denial_uses_passed_basename(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        _, err = _read_file_content(str(tmp_path / "server.pem"))
+        assert err == "Access denied: sensitive file type (server.pem)"
+
+    def test_unsafe_windows_form_denied(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        monkeypatch.setattr(sys.modules["grok_critic.server"], "_IS_WINDOWS", True)
+        passed = str(tmp_path / "a.txt") + ":secret"
+        _, err = _read_file_content(passed)
+        assert err == f"Access denied: unsupported path form ({passed})"
+
+
+# END_BLOCK_SANDBOX_ORACLE
+
+
+# START_BLOCK_WINDOWS_PATH_FORMS
+class TestWindowsPathForms:
+    """SEC-ADS: NTFS alternate data streams и хвостовые точки/пробелы."""
+
+    @pytest.mark.parametrize("rel", [
+        "repo/.git/config::$DATA",
+        "keys/server.pem::$DATA",
+        "infra/x.tfstate::$DATA",
+        "home/id_rsa:stream",
+        "keys/server.pem.",
+        "proj/.env ::$DATA",
+        "home/.ssh::$INDEX_ALLOCATION/known_hosts",
+    ])
+    def test_ads_and_trailing_forms_sensitive(self, rel: str) -> None:
+        assert _is_sensitive_file(PureWindowsPath("C:/p") / rel) is True
+        assert _is_sensitive_file(PurePosixPath("/p") / rel) is True
+
+    @pytest.mark.parametrize("rel", ["src/app.py", "notes.txt"])
+    def test_normal_files_not_sensitive(self, rel: str) -> None:
+        assert _is_sensitive_file(PureWindowsPath("C:/p") / rel) is False
+        assert _is_sensitive_file(PurePosixPath("/p") / rel) is False
+
+    @pytest.mark.parametrize("raw", [
+        r"C:\p\a.txt:secret",
+        r"C:\p\server.pem.",
+        "C:\\p\\name ",
+        r"C:\p\.git\config::$DATA",
+        r"C:\p\dir.\a.py",
+    ])
+    def test_unsafe_windows_forms(self, raw: str) -> None:
+        assert _is_unsafe_windows_path(raw) is True
+        assert _is_unsafe_windows_path(PureWindowsPath(raw)) is True
+
+    @pytest.mark.parametrize("raw", [
+        r"C:\p\src\app.py",
+        r"C:\p\..\q\app.py",
+        r"\\server\share\src\app.py",
+        "relative/src/app.py",
+    ])
+    def test_safe_windows_forms(self, raw: str) -> None:
+        assert _is_unsafe_windows_path(raw) is False
+
+    def test_posix_colon_not_denied(self, tmp_path, monkeypatch) -> None:
+        """На POSIX ':' в имени легален — форма пути не отклоняется."""
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        monkeypatch.setattr(sys.modules["grok_critic.server"], "_IS_WINDOWS", False)
+        _, err = _read_file_content(str(tmp_path / "a.txt") + ":x")
+        assert err is not None
+        assert "unsupported path form" not in err
+
+
+# END_BLOCK_WINDOWS_PATH_FORMS
+
+
+# START_BLOCK_SENSITIVE_DENYLIST
+class TestSensitiveDenylist:
+    """SEC-DENY: каталоги-секреты профиля, пары каталогов и новые глобы имён."""
+
+    @pytest.mark.parametrize("rel", [
+        # каталоги-секреты (любой компонент, без учёта регистра)
+        "home/.ssh/known_hosts",
+        "home/.gnupg/pubring.kbx",
+        "home/.aws/config",
+        "home/.azure/msal_token_cache.json",
+        "home/.AZURE/accessTokens.json",
+        "home/.azure-devops/settings.json",
+        "home/.kube/config",
+        "home/.kube/cache/discovery/x.json",
+        "home/.docker/config.json",
+        # пары каталогов подряд
+        "home/.config/gh/hosts.yml",
+        "home/.config/gcloud/application_default_credentials.json",
+        "home/.Config/GCloud/configurations/config_default",
+        # новые глобы имён
+        "home/.claude.json",
+        "home/.claude.json.backup",
+        "infra/terraform.tfstate",
+        "infra/terraform.tfstate.backup",
+        "home/_netrc",
+        "home/.vault-token",
+        "vpn/office.ovpn",
+        "ops/kubeconfig",
+        "ops/kubeconfig-prod.yaml",
+    ])
+    def test_new_rules_sensitive(self, tmp_path, rel: str) -> None:
+        assert _is_sensitive_file(tmp_path / rel) is True
+
+    @pytest.mark.parametrize("rel", [
+        # существующие правила сохранены
+        ".env.local",
+        "deploy/credentials.prod.json",
+        "repo/.git/config",
+        "keys/server.pem",
+    ])
+    def test_existing_rules_preserved(self, tmp_path, rel: str) -> None:
+        assert _is_sensitive_file(tmp_path / rel) is True
+
+    @pytest.mark.parametrize("rel", [
+        "project/.github/workflows/ci.yml",
+        "project/src/config.py",
+        "project/docs/azure.md",
+        "project/docs/docker.md",
+        "project/.config/app.toml",
+        "project/gh/readme.md",
+        "project/config/kube.py",
+        "project/src/claude_json.py",
+        "project/state.tf",
+    ])
+    def test_normal_project_files_not_sensitive(self, tmp_path, rel: str) -> None:
+        assert _is_sensitive_file(tmp_path / rel) is False
+
+    def test_file_named_like_secret_dir_is_not_dir_rule(self, tmp_path) -> None:
+        """Правило каталогов не применяется к имени самого файла (docs/.docker — файл)."""
+        assert _is_sensitive_file(tmp_path / "docs" / ".docker") is False
+
+    def test_secret_dir_blocked_via_read(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        aws = tmp_path / ".aws"
+        aws.mkdir()
+        cfg = aws / "config"
+        cfg.write_text("[default]\nregion=eu", encoding="utf-8")
+        content, err = _read_file_content(str(cfg))
+        assert content == ""
+        assert "sensitive" in err.lower()
+
+
+# END_BLOCK_SENSITIVE_DENYLIST
+
+
+# START_BLOCK_ALLOWED_ROOTS_CWD
+class TestAllowedRootsCwd:
+    """SEC-CWD: cwd не становится корнем, если домашняя директория лежит внутри cwd."""
+
+    @staticmethod
+    def _setup(tmp_path, monkeypatch, cwd: Path) -> Path:
+        home = tmp_path / "users" / "me"
+        home.mkdir(parents=True, exist_ok=True)
+        cwd.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: cwd))
+        monkeypatch.setattr(config, "allowed_read_dirs", "")
+        return home
+
+    def test_cwd_equals_home_denied(self, tmp_path, monkeypatch) -> None:
+        home = tmp_path / "users" / "me"
+        self._setup(tmp_path, monkeypatch, home)
+        f = home / "notes.txt"
+        f.write_text("x", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert content == ""
+        assert "denied" in err.lower()
+        assert "skipped" in err.lower()
+        assert home.resolve() not in _allowed_roots()
+
+    def test_cwd_ancestor_of_home_denied(self, tmp_path, monkeypatch) -> None:
+        home = self._setup(tmp_path, monkeypatch, tmp_path / "users")
+        f = home / "notes.txt"
+        f.write_text("x", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert content == ""
+        assert "denied" in err.lower()
+        assert _allowed_roots() == []
+
+    def test_cwd_skip_logs_warning(self, tmp_path, monkeypatch, caplog) -> None:
+        self._setup(tmp_path, monkeypatch, tmp_path / "users" / "me")
+        with caplog.at_level("WARNING", logger="grok-critic.server"):
+            _allowed_roots()
+        assert "[Server][_allowed_roots][CWD_SKIPPED]" in caplog.text
+
+    def test_cwd_skip_warns_once_per_cwd(self, tmp_path, monkeypatch, caplog) -> None:
+        """_allowed_roots() зовётся на каждый file_path-вызов — warning не должен повторяться."""
+        self._setup(tmp_path, monkeypatch, tmp_path / "users" / "me")
+        with caplog.at_level("WARNING", logger="grok-critic.server"):
+            _allowed_roots()
+            _allowed_roots()
+        assert caplog.text.count("[Server][_allowed_roots][CWD_SKIPPED]") == 1
+
+    def test_project_outside_home_allowed(self, tmp_path, monkeypatch) -> None:
+        proj = tmp_path / "work" / "proj"
+        self._setup(tmp_path, monkeypatch, proj)
+        f = proj / "main.py"
+        f.write_text("print(1)", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert err is None
+        assert "print(1)" in content
+
+    def test_project_inside_home_allowed(self, tmp_path, monkeypatch) -> None:
+        proj = tmp_path / "users" / "me" / "proj"
+        self._setup(tmp_path, monkeypatch, proj)
+        f = proj / "main.py"
+        f.write_text("print(2)", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert err is None
+        assert "print(2)" in content
+        # sibling в home вне проекта — запрещён
+        other = tmp_path / "users" / "me" / "other.txt"
+        other.write_text("y", encoding="utf-8")
+        _, err_other = _read_file_content(str(other))
+        assert err_other is not None and "denied" in err_other.lower()
+        assert "skipped" not in err_other.lower()
+
+    def test_explicit_allowed_dir_respected_when_cwd_skipped(self, tmp_path, monkeypatch) -> None:
+        home = self._setup(tmp_path, monkeypatch, tmp_path / "users" / "me")
+        explicit = home / "repos"
+        explicit.mkdir()
+        monkeypatch.setattr(config, "allowed_read_dirs", str(explicit))
+        f = explicit / "a.py"
+        f.write_text("a = 1", encoding="utf-8")
+        content, err = _read_file_content(str(f))
+        assert err is None
+        assert "a = 1" in content
+
+
+# END_BLOCK_ALLOWED_ROOTS_CWD
 
 
 # START_BLOCK_DECORATOR_TESTS
@@ -828,6 +1260,78 @@ class TestFilePathIntegration:
         )
         assert "❌" in result
         assert "does not support file_path" in result
+
+    async def test_call_tool_with_file_path_via_fastmcp_validation(self, tmp_path, monkeypatch) -> None:
+        """A1 регресс: server.call_tool проходит валидацию FastMCP с одним file_path."""
+        monkeypatch.setattr(config, "allow_file_path", True)
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        f = tmp_path / "code.py"
+        f.write_text("def via_mcp(): return 42", encoding="utf-8")
+        mock = AsyncMock(return_value=CritiqueResult(
+            text="mcp ok", model="m", agent_count=4, effort="low", review_id="rev_mcp"
+        ))
+        with patch("grok_critic.server.general_review", new=mock):
+            await server.call_tool("critic_review", {"file_path": str(f)})
+        mock.assert_awaited_once()
+        kwargs = mock.call_args.kwargs
+        assert kwargs["content"] == "def via_mcp(): return 42"
+        assert "file_path" not in kwargs
+
+    @pytest.mark.parametrize("tool_name, target", [
+        ("architecture_review", "do_architecture_review"),
+        ("security_audit", "do_security_audit"),
+    ])
+    async def test_call_tool_file_path_other_tools(self, tmp_path, monkeypatch, tool_name, target) -> None:
+        monkeypatch.setattr(config, "allow_file_path", True)
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        f = tmp_path / "arch.md"
+        f.write_text("# design", encoding="utf-8")
+        mock = AsyncMock(return_value=CritiqueResult(
+            text="ok", model="m", agent_count=4, effort="low", review_id="rev_o"
+        ))
+        with patch(f"grok_critic.server.{target}", new=mock):
+            await server.call_tool(tool_name, {"file_path": str(f)})
+        assert mock.call_args.kwargs["content"] == "# design"
+        assert "file_path" not in mock.call_args.kwargs
+
+    async def test_content_and_file_path_together_rejected(self, tmp_path, monkeypatch) -> None:
+        """A1: content + file_path одновременно — явная ошибка, API не вызывается."""
+        monkeypatch.setattr(config, "allow_file_path", True)
+        monkeypatch.setattr(config, "allowed_read_dirs", str(tmp_path))
+        f = tmp_path / "code.py"
+        f.write_text("x = 1", encoding="utf-8")
+        mock = AsyncMock()
+        with patch("grok_critic.server.general_review", new=mock):
+            result = await critic_review(content="y = 2", file_path=str(f))
+        assert result == "❌ critic_review: передайте либо content, либо file_path, не оба"
+        mock.assert_not_called()
+
+    async def test_neither_content_nor_file_path_empty_error(self) -> None:
+        """A1: без content и file_path — существующая ошибка пустого контента (без API)."""
+        with patch("grok_critic.critic.ResponsesClient") as client_cls:
+            result = await critic_review()
+        assert "❌ Error:" in result
+        assert "Пустой контент" in result
+        client_cls.assert_not_called()
+
+    async def test_denial_does_not_start_heartbeat(self, monkeypatch) -> None:
+        """NEW-SERVER-2: отказ по file_path не создаёт heartbeat-задачу."""
+        monkeypatch.setattr(config, "allow_file_path", False)
+        with patch("grok_critic.server._heartbeat") as hb, \
+             patch("grok_critic.server.asyncio.create_task") as create_task:
+            result = await critic_review(file_path="/any/file.py", ctx=AsyncMock())
+        assert "POLZA_ALLOW_FILE_PATH" in result
+        hb.assert_not_called()
+        create_task.assert_not_called()
+
+    async def test_heartbeat_started_with_ctx_on_success(self) -> None:
+        """NEW-SERVER-2: при успешном вызове с ctx heartbeat по-прежнему запускается."""
+        mock_result = CritiqueResult(text="ok", model="m", agent_count=4, effort="low", review_id="rev_hb2")
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result), \
+             patch("grok_critic.server._heartbeat", new_callable=AsyncMock) as hb:
+            result = await critic_review(content="x", ctx=AsyncMock())
+        assert "ok" in result
+        hb.assert_called_once()
 
 
 # END_BLOCK_FILE_PATH_INTEGRATION

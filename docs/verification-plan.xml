@@ -1,8 +1,8 @@
-<VerificationPlan VERSION="1.8.0">
+<VerificationPlan VERSION="1.11.2">
   <GlobalPolicy>
     <log-format>[Module][function][BLOCK_NAME] message</log-format>
     <deterministic-first>true</deterministic-first>
-    <module-level-focus>Fast deterministic checks with mocked HTTP responses (157 tests total)</module-level-focus>
+    <module-level-focus>Fast deterministic checks with mocked HTTP responses (358 tests total: 356 passed + 2 skipped — POSIX-only permissions and a symlink test without privileges on Windows — test_server 149, test_api_client 71, test_critic 60, test_config 49, test_cli 26, test_package 3)</module-level-focus>
     <wave-level-focus>Integration between modules with realistic mock data</wave-level-focus>
     <phase-level-focus>Full pipeline from MCP tool call to response, including edge cases</phase-level-focus>
     <redaction>Never log API keys or full request/response payloads.</redaction>
@@ -81,6 +81,76 @@
       <scenario>_review_tool decorator clamps agent_count: -5→1, 0→1, 100→64</scenario>
       <expected-outcome>Decorator validates and clamps before passing to critic functions</expected-outcome>
     </VF-012>
+
+    <VF-013 NAME="FilePathInSchema" PRIORITY="high">
+      <scenario>A1: list_tools возвращает JSON-схему critic_review/architecture_review/security_audit с полями content (str, default "") и file_path (str | None, default null); critic_followup — без file_path</scenario>
+      <expected-outcome>content необязателен на уровне MCP-схемы; вызов с content и file_path одновременно отклоняется до обращения к API; critic_followup(file_path=...) отбрасывается FastMCP без TypeError</expected-outcome>
+    </VF-013>
+
+    <VF-014 NAME="HealthDegradedOnBalanceError" USE_CASES="UC-003" PRIORITY="high">
+      <scenario>A2: Balance API возвращает ошибку/недоступен во время check_health</scenario>
+      <expected-outcome>Итоговый status пересчитывается ПОСЛЕ запроса баланса и становится degraded (не ok); `grok-critic health --ping` завершается с exit 1</expected-outcome>
+    </VF-014>
+
+    <VF-015 NAME="DedupKeyFromActualMessages" PRIORITY="high">
+      <scenario>A3: два параллельных запроса с разными input-сообщениями (разная followup-история или effective system prompt) либо разным model, но одинаковым agent_count</scenario>
+      <expected-outcome>_dedup_key различается — запросы НЕ склеиваются in-flight dedup'ом; параллельные followup по разным review_id обрабатываются независимо</expected-outcome>
+    </VF-015>
+
+    <VF-016 NAME="CwdHomeNotRoot" PRIORITY="high">
+      <scenario>SEC-CWD: сервер запущен с cwd = $HOME (или предок $HOME, или корень диска)</scenario>
+      <expected-outcome>_cwd_root() возвращает None, cwd НЕ становится allowed root; лог-предупреждение [Server][_allowed_roots][CWD_SKIPPED] выводится один раз на cwd; сообщение Access denied подсказывает добавить проект в POLZA_ALLOWED_READ_DIRS</expected-outcome>
+    </VF-016>
+
+    <VF-017 NAME="SensitiveDirDenylist" PRIORITY="high">
+      <scenario>SEC-DENY: file_path указывает на файл внутри .ssh/.gnupg/.aws/.azure/.azure-devops/.kube/.docker (любой компонент пути) или .config/gh, .config/gcloud, либо на .claude.json*/*.tfstate*/_netrc/.vault-token/*.ovpn/kubeconfig*</scenario>
+      <expected-outcome>_is_sensitive_file возвращает True, чтение отклоняется до открытия файла</expected-outcome>
+    </VF-017>
+
+    <VF-018 NAME="SelfUpdateProcessControl" PRIORITY="medium">
+      <scenario>self_update: git rev-parse HEAD до/после git pull; git/pip зависает дольше таймаута; pip install завершается с ошибкой</scenario>
+      <expected-outcome>"Уже актуально" определяется сравнением HEAD до/после (не текстом вывода git); по истечении таймаута _run_cmd убивает процесс и сообщает TIMEOUT; pip запускается как sys.executable -m pip; pip-fail возвращает информативную ошибку без os._exit</expected-outcome>
+    </VF-018>
+
+    <VF-019 NAME="LoggingHandlerCleanup" PRIORITY="medium">
+      <scenario>reload_config вызывается несколько раз подряд с POLZA_LOG_FILE, указывающим на файл</scenario>
+      <expected-outcome>_setup_logging закрывает (close()) и удаляет прежние handler'ы root-логгера перед добавлением новых — файловые дескрипторы не накапливаются</expected-outcome>
+    </VF-019>
+
+    <VF-020 NAME="MetadataReasoningAndCachedTokens" PRIORITY="low">
+      <scenario>API возвращает usage с reasoning_tokens>0 и/или cached_tokens>0</scenario>
+      <expected-outcome>CritiqueResult заполняет cached_tokens/reasoning_tokens; metadata footer в _format_result отображает эти значения, когда они больше нуля</expected-outcome>
+    </VF-020>
+
+    <VF-021 NAME="FileExistenceOracleClosed" PRIORITY="high">
+      <scenario>SEC-ORACLE: file_path указывает на несуществующий путь внутри allowed roots и на путь, реально существующий, но заблокированный (вне корней или в denylist)</scenario>
+      <expected-outcome>Тексты отказов идентичны по форме и не позволяют по ответу определить, существует ли файл; сообщение содержит только строку, переданную клиентом, resolved-путь есть только в серверном логе</expected-outcome>
+    </VF-021>
+
+    <VF-022 NAME="ADSAndTrailingFormsRejected" PRIORITY="high">
+      <scenario>SEC-ADS: на Windows file_path содержит NTFS alternate data stream (a.txt:secret, config::$DATA) или заканчивается точкой/пробелом (server.pem., id_rsa )</scenario>
+      <expected-outcome>_is_unsafe_windows_path возвращает True, _normalize_component срезает суффикс/хвост перед сопоставлением с денилистом — путь отклоняется до открытия файла и до, и после resolve</expected-outcome>
+    </VF-022>
+
+    <VF-023 NAME="OwnerCancelDoesNotDuplicateRequest" PRIORITY="high">
+      <scenario>DEDUP-CANCEL: создатель in-flight запроса (владелец задачи) отменяет свой await (например, по таймауту клиента), пока общая задача _guarded_request ещё выполняется</scenario>
+      <expected-outcome>Запись в _inflight не удаляется раньше времени (identity-проверка в _inflight_discard), retry того же клиента присоединяется к уже летящему запросу вместо второго платного вызова</expected-outcome>
+    </VF-023>
+
+    <VF-024 NAME="JoinerDoesNotHoldSemaphoreSlot" PRIORITY="high">
+      <scenario>DEDUP-SEM: несколько вызывающих присоединяются (join) к одному in-flight запросу через asyncio.shield, пока лимит semaphore уже исчерпан другими запросами</scenario>
+      <expected-outcome>Слот semaphore держит только общая задача _guarded_request; joiner'ы не блокируются на захвате своего слота и не увеличивают фактическую конкурентность</expected-outcome>
+    </VF-024>
+
+    <VF-025 NAME="JoinerNotRejectedByBudget" PRIORITY="high">
+      <scenario>BUDGET-SOFT: дневной бюджет исчерпан ПОСЛЕ того, как общая задача уже прошла _budget_exceeded_result и начала HTTP-запрос; новый вызов с тем же ключом присоединяется как joiner</scenario>
+      <expected-outcome>Joiner не проходит повторную проверку бюджета (она только внутри _guarded_request владельца) и получает результат общего запроса; POLZA_DAILY_BUDGET_USD документирован как soft limit с возможным перерасходом на max_concurrent_requests одновременных запросов</expected-outcome>
+    </VF-025>
+
+    <VF-026 NAME="StoreTmpExclusiveAndUnique" PRIORITY="medium">
+      <scenario>STORE-TMP-0600/STORE-TMP-UNIQUE: два процесса (MCP-сессия + CLI, либо параллельные followup) одновременно вызывают ReviewStore._atomic_write для одного review_id на POSIX</scenario>
+      <expected-outcome>Каждый вызов создаёт tmp с уникальным именем (.{имя}.{pid}.{uuid4}.tmp) через os.open(O_WRONLY|O_CREAT|O_EXCL, 0o600) — без коллизий и без окна с правами по umask; os.replace атомарно заменяет целевой файл; осиротевший tmp не подхватывается glob('rev_*.json')</expected-outcome>
+    </VF-026>
   </CriticalFlows>
 
   <ModuleVerification>
@@ -171,6 +241,27 @@
         <scenario-14 kind="success">reload_config_tool uses get_secret_value() for masked display</scenario-14>
       </scenarios>
     </V-M-SERVER>
+    <V-M-CLI MODULE="M-CLI" PRIORITY="high">
+      <test-files>
+        <file>tests/test_cli.py</file>
+      </test-files>
+      <module-checks>
+        <check-1>pytest tests/test_cli.py -v</check-1>
+      </module-checks>
+      <scenarios>
+        <scenario-1 kind="success">health без --ping возвращает статус конфига/store без обращения к сети</scenario-1>
+        <scenario-2 kind="success">health --ping вызывает health_check и печатает баланс/usage_today; degraded → exit 1</scenario-2>
+        <scenario-3 kind="success">review читает файл или stdin ('-'), клэмпит agent_count, предупреждает про sensitive-имена</scenario-3>
+        <scenario-4 kind="success">review --json/--json-output выводит машиночитаемый результат через _result_payload</scenario-4>
+        <scenario-5 kind="success">followup --review-id использует дисковый ReviewStore</scenario-5>
+        <scenario-6 kind="success">followup --from читает файл или stdin как previous_review</scenario-6>
+        <scenario-7 kind="success">logs печатает хвост config.log_file, подсказывает про stderr-режим при пустом log_file</scenario-7>
+        <scenario-8 kind="success">config выводит конфиг с маскированным api_key, env_file, store_path</scenario-8>
+        <scenario-9 kind="success">doctor проверяет Python, версию vs git HEAD, шим CLI, .env, ключ, TCP base_url+proxy, store writable, лог</scenario-9>
+        <scenario-10 kind="success">Без подкоманды CLI эквивалентен serve (совместимость с конфигами MCP-клиентов)</scenario-10>
+        <scenario-11 kind="success">Exit codes: 0 ok / 1 warning / 2 error согласованы по всем командам</scenario-11>
+      </scenarios>
+    </V-M-CLI>
   </ModuleVerification>
 
   <PhaseGates>
@@ -231,7 +322,7 @@
         <command-1>pytest tests/ -v</command-1>
       </commands>
       <required-evidence>
-        <evidence-1>157/157 tests pass on Windows</evidence-1>
+        <evidence-1>358 tests pass on Windows (356 passed + 2 skipped POSIX-only/symlink-without-privileges)</evidence-1>
         <evidence-2>GitHub repo up to date</evidence-2>
         <evidence-3>GRACE artifacts synced with code</evidence-3>
       </required-evidence>
@@ -243,10 +334,23 @@
         <command-1>pytest tests/ -v</command-1>
       </commands>
       <required-evidence>
-        <evidence-1>157/157 tests pass including SecretStr, config validation, decorator, file_path sandbox, transport-error retry tests</evidence-1>
+        <evidence-1>358 tests pass (356 passed + 2 skipped POSIX-only/symlink-without-privileges) including SecretStr, config validation, decorator, file_path sandbox, transport-error retry tests</evidence-1>
         <evidence-2>api_key never appears in logs or repr output</evidence-2>
       </required-evidence>
     </Gate-Phase-7>
+    <Gate-Phase-9 PHASE="Phase-9">
+      <goal>v1.10-1.11.2 hardening validated: MCP-схема file_path, SEC-CWD, SEC-DENY, self_update process control, dedup key, health degraded, per-file store, logging handler cleanup, M-CLI, SEC-ORACLE, SEC-ADS, DEDUP-CANCEL, DEDUP-SEM, BUDGET-SOFT, STORE-TMP-0600, STORE-TMP-UNIQUE</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+        <command-2>ruff check .</command-2>
+        <command-3>mypy src</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>358 tests pass (356 passed + 2 skipped — POSIX-only permissions and a symlink test without privileges on Windows)</evidence-1>
+        <evidence-2>ruff чистый (0 находок)</evidence-2>
+        <evidence-3>mypy — только 6 предсуществующих ошибок, новых нет</evidence-3>
+      </required-evidence>
+    </Gate-Phase-9>
   </PhaseGates>
 
   <FailurePackets>

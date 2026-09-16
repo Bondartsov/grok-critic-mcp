@@ -39,9 +39,9 @@ critic_followup(question, previous_review?, review_id?, agent_count?)
 
 1. **Всегда передавай `context`** — проект, язык, назначение. Без контекста критик работает вслепую.
 2. **Всегда задавай `focus_areas`** для `critic_review` — `"security,performance,SOLID"` вместо размытого «посмотри вообще».
-3. **Followup: `review_id` вместо `previous_review`.** В metadata каждого ревью есть `Review ID` — передай его, и сервер восстановит диалог сам (экономия ~25k input-токенов ≈ $0.065 за вызов). Полный текст — только fallback после рестарта сервера. Передавать оба параметра нельзя.
-4. **`agent_count`**: `4` — быстро (~30 с, мелкие сниппеты), `16` — глубоко (~2–3 мин, архитектура/security). По умолчанию 16 из конфига; для быстрых проверок явно ставь 4.
-5. **`file_path`** — путь вместо `content`; сервер сам прочитает файл (context авто = `File: <путь>`). По умолчанию **выключен** (SEC-03): статус — `reload_config_tool` (строка `allow_file_path`), разрешённые корни — `POLZA_ALLOWED_READ_DIRS` в `.env` (разделитель `;` на Windows). Секреты (`.env*`, `*credential*`, `id_rsa*`, `*.pem/*.key`, `.git/config`…) блокируются всегда — это правильно, не обходить.
+3. **Followup: `review_id` вместо `previous_review`.** В metadata каждого ревью есть `Review ID` — передай его, и сервер восстановит диалог сам из дискового store (экономия ~25k input-токенов ≈ $0.065 за вызов). Полный текст (`previous_review`) — fallback на случай, если `review_id` не найден (истёк TTL 24ч, store очищен или запись вытеснена лимитом 50); рестарт сервера сам по себе диалог не теряет — store переживает рестарты. Передавать оба параметра нельзя.
+4. **`agent_count`**: `4` — быстро (~30 с, мелкие сниппеты), `16` — глубоко (~2–4 мин, архитектура/security). По умолчанию 16 из конфига; для быстрых проверок явно ставь 4.
+5. **Для файлов на диске передавай `file_path`, а не копию/пересказ кода в `content`** — критик прочитает файл сам (context авто = `File: <путь>`). По умолчанию **выключен** (SEC-03): статус — `reload_config_tool` (строка `allow_file_path`). Разрешённые корни — директория проекта сессии (cwd MCP-сервера) + `POLZA_ALLOWED_READ_DIRS` в `.env` (разделитель `;` на Windows, `:` на POSIX); cwd не становится корнем, если внутри него лежит домашняя директория ($HOME, её предок, корень диска) — тогда добавь проект в `POLZA_ALLOWED_READ_DIRS`. `content` и `file_path` одновременно передавать нельзя — ошибка без вызова API. `critic_followup` `file_path` не принимает. Денилист секретов блокируется всегда (не обходить): `.env*`, `*credential*`, `id_rsa*`/`id_ed25519*`/`id_ecdsa*`/`id_dsa*`, `*.pem/*.key/*.p12/*.pfx/*.kdbx/*.jks/*.keystore`, `.git-credentials*`, `.netrc`/`_netrc`, `.htpasswd`, `.npmrc`, `.pypirc`, `.claude.json*`, `*.tfstate*`, `.vault-token`, `*.ovpn`, `kubeconfig*`, `config` внутри `.git`, а также любые файлы внутри каталогов `.ssh`, `.gnupg`, `.aws`, `.azure`, `.azure-devops`, `.kube`, `.docker`, `.config/gh`, `.config/gcloud`. Файлы > 1 МБ отклоняются. **SEC-ORACLE/SEC-ADS:** отказ по любой причине (нет файла, вне корней, denylist, небезопасная форма пути) выглядит одинаково — по тексту не определить, существует ли файл; на Windows формы пути с `:` (NTFS alternate data stream) или хвостовой точкой/пробелом отклоняются отдельно, до denylist.
 6. **`output_format="json"`** — когда находки нужно обработать программно: строгий JSON `{"summary", "findings":[{severity, title, location, description, recommendation}]}`. Для обычного ревью не нужен.
 
 ### Административные (бесплатные)
@@ -74,7 +74,7 @@ self_update()             # git pull + pip install + рестарт; выклю�
 
 У критика есть CLI: команда `grok-critic` (или `python -m grok_critic.cli`). Это **тот же критик, тот же баланс и тот же store review_id** — но не зависящий от состояния MCP-сессии. Полная инструкция: `docs/CLI.md`.
 
-Когда CLI вместо MCP: MCP отвалился или не подключён; one-shot вызов из скрипта/CI; диагностика сервера без инструментов MCP.
+**Для AI-агента основной путь — MCP-инструменты; CLI — ТОЛЬКО фолбек**, когда MCP стандартно не вызвать: tools нет в сессии, сервер не подключён, транспортная ошибка. Ошибки API (ключ, баланс, дневной бюджет, rate limit) — не повод переходить на CLI: у CLI те же ключ, баланс и бюджет. Диагностика сервера (`health`/`doctor`/`logs`) через CLI уместна всегда. One-shot вызов из скрипта/CI — сценарий для людей и не-агентских пайплайнов, не для агента с подключённым MCP.
 
 ### Шпаргалка
 
@@ -115,19 +115,19 @@ self_update()             # git pull + pip install + рестарт; выклю�
 
 - Замеренные значения (15.09.2026): 4 агента ≈ $0.07–0.10, 16 агентов ≈ $1.0–1.2 (input у 16 агентов включает внутреннюю multi-agent оркестрацию провайдера). Followup по `review_id` (~7k токенов) заметно дешевле followup с полным текстом (~25k).
 - `check_health` / `grok-critic health --ping` показывает суточный расход — перед серией вызовов взгляни; при низком балансе предупреди пользователя.
-- Защита от перерасхода на сервере: дневной бюджет (`POLZA_DAILY_BUDGET_USD`), semaphore одновременных запросов, in-flight dedup (параллельный дубль того же контента не платит дважды), retry-дедлайн (суммарное время ≤ таймауту MCP-клиента).
+- Защита от перерасхода на сервере: дневной бюджет (`POLZA_DAILY_BUDGET_USD` — **soft limit**: возможен перерасход не более чем на `max_concurrent_requests` одновременно выполняющихся запросов, т.к. стоимость multi-agent запроса заранее неизвестна), semaphore одновременных запросов, in-flight dedup (параллельный дубль того же контента не платит дважды), retry-дедлайн (суммарное время ≤ таймауту MCP-клиента).
 
 ## Ошибки (на русском)
 
-| Сообщение                              | Что делать                                                                                                |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `Ошибка авторизации: …`                | Ключ невалиден — проверить `POLZA_API_KEY`                                                                |
-| `Недостаточно средств: …`              | Пополнить баланс Polza.AI, предупредить пользователя                                                      |
-| `Превышен лимит запросов`              | Подождать и повторить; при повторе — `agent_count=4`                                                      |
-| `Превышен дневной бюджет`              | Сообщить пользователю; лимит правится в `.env` + `reload_config_tool`                                     |
-| `review_id не найден`                  | Сервер перезапускался (store in-memory) — передай `previous_review` явно                                  |
-| `file_path отключён` / `Access denied` | Файл вне `POLZA_ALLOWED_READ_DIRS` или в denylist секретов — передай `content` напрямую или расширь корни |
-| MCP недоступен                         | Замена гейта — см. «Если MCP недоступен»                                                                  |
+| Сообщение                              | Что делать                                                                                                                                                                     |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Ошибка авторизации: …`                | Ключ невалиден — проверить `POLZA_API_KEY`                                                                                                                                     |
+| `Недостаточно средств: …`              | Пополнить баланс Polza.AI, предупредить пользователя                                                                                                                           |
+| `Превышен лимит запросов`              | Подождать и повторить; при повторе — `agent_count=4`                                                                                                                           |
+| `Превышен дневной бюджет`              | Сообщить пользователю; лимит правится в `.env` + `reload_config_tool`                                                                                                          |
+| `review_id не найден`                  | Истёк TTL (24ч с последнего обращения), store очищен или запись вытеснена лимитом 50 — передай `previous_review` (fallback; рестарт сервера диалог НЕ теряет — store дисковый) |
+| `file_path отключён` / `Access denied` | Файл вне `POLZA_ALLOWED_READ_DIRS` или в denylist секретов — передай `content` напрямую или расширь корни                                                                      |
+| MCP недоступен                         | Замена гейта — см. «Если MCP недоступен»                                                                                                                                       |
 
 ## Жёсткие правила
 
@@ -152,7 +152,11 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.zcode\skills\grok-critic" -
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.kilocode\skills\grok-critic" -Target "<repo>\skill"
 # Agents
 New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\grok-critic" -Target "<repo>\skill"
+# Claude Code
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\grok-critic" -Target "<repo>\skill"
 ```
+
+Если `~/.claude` — git-репозиторий, добавьте `skills/grok-critic` в его `.gitignore` (junction не должен коммититься как отслеживаемый путь).
 
 **Копирование (если junction невозможен):** `cp skill/SKILL.md ~/.kilocode/skills/grok-critic/SKILL.md` — но копия устаревает при обновлении сервера.
 
@@ -162,3 +166,16 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\grok-critic" 
 ## Критик (grok-critic MCP)
 Обязателен при: планировании архитектуры, баг-фиксе со 2-й попытки, после > 50 строк кода, для security-кода.
 ```
+
+## Claude Code
+
+- Инструменты `grok-critic` в Claude Code — **deferred**: загружай схемы одним вызовом `ToolSearch` с `select:mcp__grok-critic__critic_review,mcp__grok-critic__architecture_review,mcp__grok-critic__security_audit,mcp__grok-critic__critic_followup` (и `check_health` при необходимости) — не по одной схеме за вызов.
+- Длинные вызовы (16 агентов, ~2–4 мин) должны укладываться в `MCP_TOOL_TIMEOUT` — ставь ≥ 300000, лучше 600000 мс.
+- Регистрация с `file_path`:
+
+  ```bash
+  claude mcp add grok-critic -s user -e POLZA_ALLOW_FILE_PATH=true -e "POLZA_ALLOWED_READ_DIRS=<корни через ;>" -- python -m grok_critic.server
+  ```
+
+- После обновления сервера (`self_update`, `git pull`) переподключи через `/mcp` — кэш схемы tools живёт сессию.
+- Фолбек CLI — из Git Bash: `python -m grok_critic.cli …` (шим `grok-critic` может отсутствовать на PATH). Для `--agents 16` таймаут самой Bash-команды ставь ≥ 600000 мс.

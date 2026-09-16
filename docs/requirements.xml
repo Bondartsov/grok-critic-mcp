@@ -1,4 +1,4 @@
-<RequirementsAnalysis VERSION="1.8.0">
+<RequirementsAnalysis VERSION="1.11.2">
   <Project>
     <name>grok-critic-mcp</name>
     <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 8 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update. SecretStr для api_key. Декоратор _review_tool для DRY. Используется как субагент "Критик" в Kilo Code.</annotation>
@@ -123,6 +123,7 @@
     <constraint-5>MCP сервер запускается через pip install -e . как local MCP server в kilo.json.</constraint-5>
     <constraint-6>Контент ограничен 100 000 символов (MAX_CONTENT_CHARS) — защита от cost DoS.</constraint-6>
     <constraint-7>Retry: 429 и 5xx повторяются до 2 раз с exponential backoff.</constraint-7>
+    <constraint-8>file_path — opt-in (POLZA_ALLOW_FILE_PATH=true). Корни sandbox: рабочая директория процесса сервера + POLZA_ALLOWED_READ_DIRS (разделитель os.pathsep). cwd НЕ становится корнем, если домашняя директория лежит внутри cwd (cwd=$HOME, предок $HOME, корень диска) — тогда чтение вне POLZA_ALLOWED_READ_DIRS отклоняется с подсказкой добавить проект в эту переменную. Denylist секретов (глобы + каталоги .ssh/.gnupg/.aws/.azure/.azure-devops/.kube/.docker + .config/gh, .config/gcloud) блокирует чтение независимо от корней. Размер файла ≤ 1 МБ проверяется до чтения; чтение — в worker-thread.</constraint-8>
   </Constraints>
 
   <Risks>

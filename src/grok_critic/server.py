@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing 8 tools for code review, architecture, security, admin
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
@@ -15,9 +15,10 @@ import fnmatch
 import json
 import logging
 import os
+import sys
 from collections.abc import Callable
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -109,33 +110,96 @@ _SENSITIVE_GLOBS: tuple[str, ...] = (
     "*credential*",
     "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx", "*.jks", "*.keystore",
     ".git-credentials*", ".netrc", ".htpasswd", ".npmrc", ".pypirc",
+    # SEC-DENY: секреты профиля пользователя
+    ".claude.json*",  # env MCP-серверов с ключами
+    "*.tfstate", "*.tfstate.*",
+    "_netrc", ".vault-token", "*.ovpn", "kubeconfig*",
 )
 # Файлы внутри любого каталога .git (config содержит токены из remote-URL).
 _SENSITIVE_GIT_DIR_FILES: tuple[str, ...] = ("config", "config.*")
+# SEC-DENY: каталоги-секреты — любой файл внутри них блокируется (сравнение без учёта регистра).
+_SENSITIVE_DIRS: frozenset[str] = frozenset({
+    ".ssh", ".gnupg", ".aws", ".azure", ".azure-devops", ".kube", ".docker",
+})
+# SEC-DENY: пары каталогов подряд (~/.config/gh, ~/.config/gcloud — OAuth-токены CLI).
+_SENSITIVE_DIR_PAIRS: tuple[tuple[str, str], ...] = ((".config", "gh"), (".config", "gcloud"))
 
 # Верхний предел размера файла для file_path (1 МБ).
 # Достаточно для любого исходника; большие файлы всё равно режутся MAX_CONTENT_CHARS.
 _MAX_FILE_BYTES = 1_000_000
 
+# SEC-ADS: проверка небезопасных форм пути включается только на Windows.
+# Флаг модульный (а не прямой os.name в функции): тесты переключают его без
+# подмены os.name, от которого зависит выбор класса в Path.__new__.
+_IS_WINDOWS: bool = os.name == "nt"
 
-def _is_sensitive_file(path: Path) -> bool:
-    name = path.name.lower()
+
+def _normalize_component(part: str) -> str:
+    """Имя компонента пути для сопоставления с денилистом (SEC-ADS).
+
+    Отрезает суффикс NTFS alternate data stream («config::$DATA» → «config»)
+    и хвостовые точки/пробелы, которые Windows игнорирует при открытии
+    («server.pem.» → «server.pem»). «.» / «..» в пустую строку не превращаются.
+    """
+    name = part.lower().split(":", 1)[0]
+    stripped = name.rstrip(". ")
+    return stripped if stripped else name
+
+
+def _is_sensitive_file(path: PurePath) -> bool:
+    name = _normalize_component(path.name)
     if any(fnmatch.fnmatch(name, pattern) for pattern in _SENSITIVE_GLOBS):
         return True
-    parts_lower = [part.lower() for part in path.parts]
-    return ".git" in parts_lower[:-1] and any(
+    dirs_lower = [_normalize_component(part) for part in path.parts[:-1]]
+    if any(part in _SENSITIVE_DIRS for part in dirs_lower):
+        return True
+    if any(pair in _SENSITIVE_DIR_PAIRS for pair in zip(dirs_lower, dirs_lower[1:], strict=False)):
+        return True
+    return ".git" in dirs_lower and any(
         fnmatch.fnmatch(name, pattern) for pattern in _SENSITIVE_GIT_DIR_FILES
     )
+
+
+# cwd, о пропуске которых уже предупредили: _allowed_roots() зовётся на каждый
+# file_path-вызов, без дедупликации сессия из $HOME засыпала бы лог одинаковыми warning.
+_CWD_SKIP_WARNED: set[Path] = set()
+
+
+def _cwd_root() -> Path | None:
+    """CWD сервера как корень sandbox — или None, если cwd небезопасен (SEC-CWD).
+
+    MCP-клиент, запущенный из $HOME (или из предка $HOME / корня диска), сделал бы
+    разрешённым весь профиль (.aws, .ssh, .claude.json…). Поэтому cwd пропускается,
+    когда домашняя директория лежит внутри cwd.
+    """
+    cwd = Path.cwd().resolve()
+    try:
+        home: Path | None = Path.home().resolve()
+    except RuntimeError:  # домашнюю директорию определить нельзя
+        home = None
+    if home is not None and home.is_relative_to(cwd):
+        if cwd not in _CWD_SKIP_WARNED:
+            _CWD_SKIP_WARNED.add(cwd)
+            logger.warning(
+                "[Server][_allowed_roots][CWD_SKIPPED] cwd %s contains home directory — not used as allowed root",
+                cwd,
+            )
+        return None
+    return cwd
 
 
 def _allowed_roots() -> list[Path]:
     """Allowed base directories for file_path reads.
 
-    Default: server CWD only. Extra roots come from POLZA_ALLOWED_READ_DIRS
-    (os.pathsep-separated). Resolved once per call — дёшево и всегда актуально
+    Default: server CWD (если домашняя директория не лежит внутри cwd — SEC-CWD).
+    Extra roots come from POLZA_ALLOWED_READ_DIRS (os.pathsep-separated) и
+    соблюдаются как есть. Resolved once per call — дёшево и всегда актуально
     после reload_config.
     """
-    roots = [Path.cwd().resolve()]
+    roots: list[Path] = []
+    cwd_root = _cwd_root()
+    if cwd_root is not None:
+        roots.append(cwd_root)
     extra = config.allowed_read_dirs or ""
     for part in extra.split(os.pathsep):
         part = part.strip()
@@ -144,28 +208,84 @@ def _allowed_roots() -> list[Path]:
     return roots
 
 
+def _is_unsafe_windows_path(path: str | PurePath) -> bool:
+    """SEC-ADS: небезопасная для Windows форма пути (чистая функция, тестируется на любой ОС).
+
+    Unsafe, если любой компонент КРОМЕ drive/anchor содержит ':' (NTFS alternate
+    data stream: «a.txt:secret», «config::$DATA») или заканчивается точкой/пробелом
+    («server.pem.», «name »), которые Windows молча отбрасывает при открытии.
+    «.» / «..» — навигация, не имя, их не считаем.
+    """
+    pure = PureWindowsPath(path)
+    parts = pure.parts
+    if pure.anchor and parts and parts[0] == pure.anchor:
+        parts = parts[1:]
+    for part in parts:
+        if part in (".", ".."):
+            continue
+        if ":" in part or part.endswith((".", " ")):
+            return True
+    return False
+
+
 def _read_file_content(file_path: str) -> tuple[str, str | None]:
     """Read file content for review. Returns (content, error_message).
 
     Sandbox: файл обязан лежать внутри allowed roots (cwd + POLZA_ALLOWED_READ_DIRS)
     и не быть типичным файлом секретов. Защита от path traversal и эксфильтрации
     секретов во внешний API (SEC-01).
+
+    SEC-ORACLE: проверки идут строго в порядке форма пути → денилист → корни →
+    существование. Отказы не зависят от существования файла и не содержат
+    resolved-путь (он раскрывал бы цель симлинка/junction) — только строку,
+    переданную клиентом. Resolved-путь пишется лишь в локальный серверный лог.
     """
+    # START_BLOCK_SANDBOX_CHECKS
     try:
-        path = Path(file_path).expanduser().resolve()
+        expanded = Path(file_path).expanduser()
+        path = expanded.resolve()
+    except Exception as exc:
+        logger.warning("[Server][_read_file_content][DENIED] Cannot resolve path: %s", exc)
+        return "", f"Access denied: unsupported path form ({file_path})"
+
+    # SEC-ADS: на Windows отказ для ADS и хвостовых точек/пробелов — и во входной
+    # форме (resolve срезает хвостовые точки), и в resolved (цель симлинка).
+    if _IS_WINDOWS and (_is_unsafe_windows_path(expanded) or _is_unsafe_windows_path(path)):
+        logger.warning("[Server][_read_file_content][DENIED] Unsafe Windows path form: %s", path)
+        return "", f"Access denied: unsupported path form ({file_path})"
+
+    if _is_sensitive_file(expanded) or _is_sensitive_file(path):
+        logger.warning("[Server][_read_file_content][DENIED] Sensitive file blocked: %s", path)
+        return "", f"Access denied: sensitive file type ({expanded.name or file_path})"
+
+    try:
+        roots = _allowed_roots()
+    except Exception as exc:  # cwd/home/allowed_read_dirs не резолвятся — fail closed
+        logger.warning("[Server][_read_file_content][DENIED] Cannot resolve allowed roots: %s", exc)
+        roots = []
+    if not any(path.is_relative_to(root) for root in roots):
+        logger.warning("[Server][_read_file_content][DENIED] Outside allowed dirs: %s", path)
+        hint = ""
+        with contextlib.suppress(Exception):
+            cwd = Path.cwd().resolve()
+            if cwd not in roots:
+                hint = (
+                    f" Note: server working directory {cwd} is skipped because it contains "
+                    "the home directory — add the project to POLZA_ALLOWED_READ_DIRS."
+                )
+        return "", (
+            f"Access denied: {file_path} is outside allowed directories. "
+            "Allowed: server working directory + POLZA_ALLOWED_READ_DIRS." + hint
+        )
+    # END_BLOCK_SANDBOX_CHECKS
+
+    # START_BLOCK_READ_INSIDE_ROOTS
+    # Путь уже внутри корней — resolved-путь в сообщениях показывать можно.
+    try:
         if not path.exists():
             return "", f"File not found: {path}"
         if not path.is_file():
             return "", f"Not a file: {path}"
-        if _is_sensitive_file(path):
-            logger.warning("[Server][_read_file_content][DENIED] Sensitive file blocked: %s", path.name)
-            return "", f"Access denied: sensitive file type ({path.name})"
-        if not any(path.is_relative_to(root) for root in _allowed_roots()):
-            logger.warning("[Server][_read_file_content][DENIED] Outside allowed dirs: %s", path)
-            return "", (
-                f"Access denied: {path} is outside allowed directories. "
-                "Allowed: server working directory + POLZA_ALLOWED_READ_DIRS."
-            )
         if path.stat().st_size > _MAX_FILE_BYTES:
             return "", f"File too large: {path} ({path.stat().st_size} bytes > {_MAX_FILE_BYTES})"
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -173,7 +293,9 @@ def _read_file_content(file_path: str) -> tuple[str, str | None]:
             return "", f"File is empty: {path}"
         return content, None
     except Exception as exc:
+        logger.warning("[Server][_read_file_content][READ_FAILED] %s: %s", path, type(exc).__name__)
         return "", f"Cannot read file: {exc}"
+    # END_BLOCK_READ_INSIDE_ROOTS
 
 
 def _validate_agent_count(agent_count: int | None) -> int | None:
@@ -227,6 +349,10 @@ def _review_tool(tool_name: str, *, allow_file_path: bool = True) -> Callable:
     - SEC-03: чтение файлов через file_path — явный opt-in POLZA_ALLOW_FILE_PATH=true.
     - FEAT-PROGRESS: при наличии ctx из FastMCP шлёт heartbeat-уведомления,
       в metadata добавляется ⏱ Elapsed.
+    - A1: content-инструменты объявляют file_path в сигнатуре (иначе FastMCP не
+      включает его в MCP-схему); декоратор изымает его из kwargs. content и
+      file_path одновременно — явная ошибка без вызова API.
+    - NEW-SERVER-2: отказы по file_path/opt-in/sandbox — до запуска heartbeat.
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -238,39 +364,44 @@ def _review_tool(tool_name: str, *, allow_file_path: bool = True) -> Callable:
             # FEAT-PROGRESS: ctx инжектится FastMCP по аннотации Context; прямые
             # вызовы в тестах идут без него — heartbeat просто не запускается.
             ctx = kwargs.pop("ctx", None)
+
+            # Resolve file_path → content. A1: file_path — явный параметр схемы;
+            # здесь он изымается и до тела инструмента не доходит.
+            # NEW-SERVER-2: все отказы — ДО создания heartbeat-задачи.
+            file_path = kwargs.pop("file_path", None)
+            if file_path and not allow_file_path:
+                return f"❌ {tool_name} does not support file_path (pass content directly)"
+            if file_path:
+                if (kwargs.get("content") or "").strip():
+                    logger.warning("[Server][%s][DENIED] both content and file_path passed", tool_name)
+                    return f"❌ {tool_name}: передайте либо content, либо file_path, не оба"
+                # SEC-03: чтение файлов выключено по умолчанию — cwd MCP-клиента
+                # непредсказуем (часто $HOME), поэтому включается явным флагом.
+                if not config.allow_file_path:
+                    logger.warning(
+                        "[Server][%s][DENIED] file_path disabled by POLZA_ALLOW_FILE_PATH",
+                        tool_name,
+                    )
+                    return (
+                        "❌ file_path отключён (SEC-03): установите "
+                        "POLZA_ALLOW_FILE_PATH=true в .env и вызовите reload_config_tool, "
+                        "либо передайте content напрямую."
+                    )
+                # to_thread: синхронное чтение файла не блокирует event loop (REL-02)
+                file_content, err = await asyncio.to_thread(_read_file_content, file_path)
+                if err:
+                    return f"❌ {err}"
+                kwargs["content"] = file_content
+                if kwargs.get("context") is None:
+                    kwargs["context"] = f"File: {file_path}"
+
             stop = asyncio.Event()
             hb_task = (
                 asyncio.create_task(_heartbeat(ctx, tool_name, stop, _HEARTBEAT_INTERVAL_SECONDS))
                 if ctx is not None
                 else None
             )
-
-            # Resolve file_path → content
-            file_path = kwargs.pop("file_path", None)
             try:
-                if file_path and not allow_file_path:
-                    return f"❌ {tool_name} does not support file_path (pass content directly)"
-                if file_path:
-                    # SEC-03: чтение файлов выключено по умолчанию — cwd MCP-клиента
-                    # непредсказуем (часто $HOME), поэтому включается явным флагом.
-                    if not config.allow_file_path:
-                        logger.warning(
-                            "[Server][%s][DENIED] file_path disabled by POLZA_ALLOW_FILE_PATH",
-                            tool_name,
-                        )
-                        return (
-                            "❌ file_path отключён (SEC-03): установите "
-                            "POLZA_ALLOW_FILE_PATH=true в .env и вызовите reload_config_tool, "
-                            "либо передайте content напрямую."
-                        )
-                    # to_thread: синхронное чтение файла не блокирует event loop (REL-02)
-                    file_content, err = await asyncio.to_thread(_read_file_content, file_path)
-                    if err:
-                        return f"❌ {err}"
-                    kwargs["content"] = file_content
-                    if kwargs.get("context") is None:
-                        kwargs["context"] = f"File: {file_path}"
-
                 content_len = len(kwargs.get("content", ""))
                 agent_count = kwargs.get("agent_count")
                 logger.info(
@@ -311,21 +442,25 @@ server = FastMCP("grok-critic")
 @server.tool()
 @_review_tool("critic_review")
 async def critic_review(
-    content: str,
+    content: str = "",
     context: str | None = None,
     agent_count: int | None = None,
     focus_areas: str | None = None,
     output_format: str | None = None,
+    file_path: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """Perform a critical code review using grok-4.20-multi-agent.
 
     Args:
-        content: The code to review.
+        content: Код/текст для ревью (если не указан file_path).
         context: Optional context about the code (project, language, purpose).
         agent_count: Number of reasoning agents (4=low, 16=high effort). Defaults to config value.
         focus_areas: Comma-separated focus areas (e.g. 'security,performance').
         output_format: 'json' for strict JSON output (summary + findings), omit for text.
+        file_path: Путь к файлу — сервер прочитает его сам (предпочтительнее content для файлов
+            на диске). Требует POLZA_ALLOW_FILE_PATH=true; разрешены: рабочая директория сервера
+            (проект сессии MCP-клиента) + POLZA_ALLOWED_READ_DIRS; файлы секретов блокируются.
     """
     areas: list[str] | None = None
     if focus_areas:
@@ -421,17 +556,22 @@ async def check_health() -> str:
 @server.tool()
 @_review_tool("architecture_review")
 async def architecture_review(
-    content: str,
+    content: str = "",
     context: str | None = None,
     agent_count: int | None = None,
+    file_path: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """Specialized architecture review: patterns, dependencies, scalability, risks.
 
     Args:
-        content: Architecture description, diagram, or code to review.
+        content: Код/текст для ревью (если не указан file_path) — architecture description,
+            diagram, or code.
         context: Optional project context (tech stack, constraints, team size).
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
+        file_path: Путь к файлу — сервер прочитает его сам (предпочтительнее content для файлов
+            на диске). Требует POLZA_ALLOW_FILE_PATH=true; разрешены: рабочая директория сервера
+            (проект сессии MCP-клиента) + POLZA_ALLOWED_READ_DIRS; файлы секретов блокируются.
     """
     return await do_architecture_review(
         content=content,
@@ -447,17 +587,22 @@ async def architecture_review(
 @server.tool()
 @_review_tool("security_audit")
 async def security_audit(
-    content: str,
+    content: str = "",
     context: str | None = None,
     agent_count: int | None = None,
+    file_path: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """Specialized security audit: injection, auth, secrets, infrastructure.
 
     Args:
-        content: Code or configuration to audit for security vulnerabilities.
+        content: Код/текст для ревью (если не указан file_path) — code or configuration
+            to audit for security vulnerabilities.
         context: Optional context (framework, deployment, threat model).
         agent_count: Override agent count (4=fast, 16=deep). Defaults to config.
+        file_path: Путь к файлу — сервер прочитает его сам (предпочтительнее content для файлов
+            на диске). Требует POLZA_ALLOW_FILE_PATH=true; разрешены: рабочая директория сервера
+            (проект сессии MCP-клиента) + POLZA_ALLOWED_READ_DIRS; файлы секретов блокируются.
     """
     return await do_security_audit(
         content=content,
@@ -509,6 +654,42 @@ async def reload_config_tool() -> str:
 
 
 # START_BLOCK_TOOL_SELF_UPDATE
+_GIT_REV_PARSE_TIMEOUT = 30.0
+_GIT_PULL_TIMEOUT = 60.0
+_PIP_INSTALL_TIMEOUT = 120.0
+
+
+async def _run_cmd(*cmd: str, cwd: str, timeout: float) -> tuple[int | None, str, str]:
+    """Запуск подпроцесса: (returncode, stdout, stderr). TimeoutError пробрасывается.
+
+    decode(errors="replace") — локализованный/не-UTF-8 вывод не роняет self_update.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        # Зависший git/pip не должен пережить таймаут self_update: убиваем и дожидаемся reap.
+        logger.warning(
+            "[Server][_run_cmd][TIMEOUT] %s exceeded %.0fs — killing pid %s",
+            cmd[0], timeout, proc.pid,
+        )
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        raise
+    return (
+        proc.returncode,
+        stdout.decode(errors="replace").strip(),
+        stderr.decode(errors="replace").strip(),
+    )
+
+
 @server.tool()
 async def self_update() -> str:
     """Update the server from GitHub (git pull + pip install) and restart.
@@ -535,48 +716,49 @@ async def self_update() -> str:
             f"{repo_dir} не похож на репозиторий. Обновите пакет вручную."
         )
 
-    # Step 1: git pull
+    # Step 1: git pull. NEW-SERVER-1: «уже актуально» определяется сравнением
+    # git rev-parse HEAD до/после pull, а не английской подстрокой вывода git
+    # (ломалась при локализованном git).
+    step, step_timeout = "git rev-parse", _GIT_REV_PARSE_TIMEOUT
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "pull",
-            cwd=repo_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        git_out = stdout.decode().strip()
-        git_err = stderr.decode().strip()
+        rc, head_before, err = await _run_cmd("git", "rev-parse", "HEAD", cwd=repo_dir, timeout=step_timeout)
+        if rc != 0:
+            return f"❌ git rev-parse failed (code {rc}):\n{err or head_before}"
 
-        if proc.returncode != 0:
-            return f"❌ git pull failed (code {proc.returncode}):\n{git_err or git_out}"
+        step, step_timeout = "git pull", _GIT_PULL_TIMEOUT
+        rc, git_out, git_err = await _run_cmd("git", "pull", cwd=repo_dir, timeout=step_timeout)
+        if rc != 0:
+            return f"❌ git pull failed (code {rc}):\n{git_err or git_out}"
 
-        if "Already up to date" in git_out:
+        step, step_timeout = "git rev-parse", _GIT_REV_PARSE_TIMEOUT
+        rc, head_after, err = await _run_cmd("git", "rev-parse", "HEAD", cwd=repo_dir, timeout=step_timeout)
+        if rc != 0:
+            return f"❌ git rev-parse failed (code {rc}):\n{err or head_after}"
+
+        if head_after == head_before:
+            logger.info("[Server][self_update][UP_TO_DATE] HEAD unchanged: %s", head_after)
             return f"✅ Already up to date. No changes to pull.\n{git_out}"
 
+        logger.info("[Server][self_update][GIT_PULL] HEAD %s -> %s", head_before, head_after)
         lines.append(f"📦 git pull:\n{git_out}")
     except TimeoutError:
-        return "❌ git pull timed out (60s)"
+        return f"❌ {step} timed out ({step_timeout:.0f}s)"
     except Exception as exc:
-        return f"❌ git pull error: {exc}"
+        return f"❌ {step} error: {exc}"
 
-    # Step 2: pip install -e .
+    # Step 2: pip install -e . — NEW-SERVER-3: pip текущего интерпретатора,
+    # а не первый "pip" из PATH (мог поставить пакет в чужой Python).
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "pip", "install", "-e", ".",
-            cwd=repo_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        rc, pip_out, pip_err = await _run_cmd(
+            sys.executable, "-m", "pip", "install", "-e", ".",
+            cwd=repo_dir, timeout=_PIP_INSTALL_TIMEOUT,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-        pip_out = stdout.decode().strip()
-        pip_err = stderr.decode().strip()
-
-        if proc.returncode != 0:
-            return f"❌ pip install failed (code {proc.returncode}):\n{pip_err or pip_out}"
+        if rc != 0:
+            return f"❌ pip install failed (code {rc}):\n{pip_err or pip_out}"
 
         lines.append("📥 pip install: OK")
     except TimeoutError:
-        return "❌ pip install timed out (120s)"
+        return f"❌ pip install timed out ({_PIP_INSTALL_TIMEOUT:.0f}s)"
     except Exception as exc:
         return f"❌ pip install error: {exc}"
 

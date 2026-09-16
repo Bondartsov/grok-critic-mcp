@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging
@@ -105,8 +105,11 @@ def _setup_logging(cfg: AppConfig) -> None:
     root = logging.getLogger("grok-critic")
     root.setLevel(cfg.log_level)
 
-    # Убираем дефолтные handler'ы
-    root.handlers.clear()
+    # Убираем прежние handler'ы с close(): иначе каждый reload_config с log_file
+    # оставлял бы незакрытый FileHandler (утечка дескрипторов, lock файла на Windows).
+    for old_handler in list(root.handlers):
+        root.removeHandler(old_handler)
+        old_handler.close()
 
     formatter = logging.Formatter(
         "[%(asctime)s] %(name)s %(levelname)s %(message)s",

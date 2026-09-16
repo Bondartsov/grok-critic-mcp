@@ -1,5 +1,5 @@
 <KnowledgeGraph>
-  <Project NAME="grok-critic-mcp" VERSION="1.11.1">
+  <Project NAME="grok-critic-mcp" VERSION="1.11.2">
     <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP, prompt caching, self-update, SecretStr, decorator, retry deadline, in-flight dedup, daily budget, review store, prompt injection guard, CLI, disk store</keywords>
     <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 8 MCP tools + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) для агентов — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через пер-файловый дисковый ReviewStore (db/reviews/, переживает рестарты, race-free), JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill.</annotation>
 
@@ -13,23 +13,27 @@
         <fn-_resolve_env_file PURPOSE="FIX-ENV-PATH: путь к .env — POLZA_ENV_FILE → cwd/.env → legacy рядом с пакетом (pip install -e .)" />
         <fn-load_config PURPOSE="Load config from env vars and .env file" />
         <fn-reload_config PURPOSE="Hot reload config from .env without process restart" />
-        <fn-_setup_logging PURPOSE="Configure Python logging with level from env (private)" />
+        <fn-_setup_logging PURPOSE="Configure Python logging with level from env (private); закрывает и close()-ит прежние handler'ы root-логгера перед добавлением новых — reload_config не копит файловые дескрипторы" />
         <export-config PURPOSE="Module-level config singleton" />
       </annotations>
     </M-CONFIG>
 
     <M-API NAME="APIClient" TYPE="INTEGRATION" STATUS="complete">
-      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff (TimeoutException + все httpx.TransportError, с пересозданием клиента) и общим дедлайном (REL-06), in-flight dedup параллельных одинаковых запросов, semaphore одновременных запросов, суточная статистика и budget-guard (FEAT-BUDGET), динамический timeout, расчёт стоимости, сообщения об ошибках на русском. Поддержка полного диалога через messages-override (FEAT-FOLLOWUP-ID).</purpose>
+      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff (TimeoutException + все httpx.TransportError, с пересозданием клиента) и общим дедлайном (REL-06), cancel-safe in-flight dedup параллельных одинаковых запросов (DEDUP-CANCEL), semaphore одновременных запросов держит только общая задача (DEDUP-SEM), суточная статистика и soft budget-guard (BUDGET-SOFT: возможен перерасход не более чем на max_concurrent_requests одновременно выполняющихся запросов), динамический timeout, расчёт стоимости, сообщения об ошибках на русском. Поддержка полного диалога через messages-override (FEAT-FOLLOWUP-ID).</purpose>
       <path>src/grok_critic/api_client.py</path>
       <depends>M-CONFIG</depends>
       <verification-ref>V-M-API</verification-ref>
       <annotations>
         <type-CritiqueResult PURPOSE="Dataclass: text, model, agent_count, effort, input/output/total_tokens, cost_usd, cost_rub (from API), cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
-        <type-ResponsesClient PURPOSE="Async HTTP client wrapper: call() = budget-guard → in-flight dedup → semaphore → _perform_request() → _request_once()" />
-        <fn-call PURPOSE="Public entry: daily budget check, dedup join (asyncio.shield over shared task), concurrency semaphore, messages override" />
+        <type-ResponsesClient PURPOSE="Async HTTP client wrapper: call() = in-flight dedup join (asyncio.shield) → общая задача _guarded_request (semaphore → budget-guard → _perform_request → _request_once); все ожидающие, включая создателя, — только shield над общей задачей" />
+        <fn-call PURPOSE="Public entry: dedup-ключ → join существующей задачи ИЛИ создание новой asyncio.Task(_guarded_request) с done-callback _inflight_discard, зарегистрированным синхронно до await — все вызывающие ждут через asyncio.shield" />
+        <fn-_guarded_request PURPOSE="DEDUP-SEM: тело общей in-flight задачи — слот semaphore держит только она (I4); внутри слота — BUDGET-SOFT: _budget_exceeded_result() после слота и до HTTP, присоединившиеся (joiner) эту проверку не проходят; затем _perform_request" />
+        <fn-_budget_exceeded_result PURPOSE="BUDGET-SOFT: CritiqueResult-отказ, если daily_budget_usd задан и потрачено >= него, иначе None; POLZA_DAILY_BUDGET_USD — soft limit (перерасход возможен, т.к. стоимость multi-agent запроса известна только по завершении)" />
+        <fn-_inflight_discard PURPOSE="DEDUP-CANCEL: done-callback общей задачи — удаляет запись _inflight только если она всё ещё указывает на эту задачу (identity, I3); отмена задачи создателем/joiner'ом саму задачу и слот НЕ отменяет и запись раньше времени не удаляет; логирует cancelled/exception (помечает exception как retrieved)" />
         <fn-_perform_request PURPOSE="Transport + single _record_result() accounting per real request" />
         <fn-_request_once PURPOSE="Build body (model, reasoning.effort, input, prompt_cache_key), retry loop with per-attempt timeout capped by REL-06 deadline, RU error mapping" />
-        <fn-_dedup_key PURPOSE="sha256 key: model + agent_count + system + prompt/messages" />
+        <fn-_dedup_key PURPOSE="sha256 key от {m: input_messages, a: agent_count, model}, где input_messages — ФАКТИЧЕСКИЙ список сообщений из _build_input_messages (включая followup-историю и effective system prompt); параллельные followup по разным review_id больше не склеиваются" />
+        <fn-_build_input_messages PURPOSE="Строит итоговый список input-сообщений (system + история диалога/messages-override + prompt), который уходит и в тело запроса, и в _dedup_key — единый источник правды" />
         <fn-get_usage_stats PURPOSE="Суточная статистика: calls/errors/cost_usd/cost_rub, сброс по смене даты (FEAT-BUDGET)" />
         <fn-_record_result PURPOSE="Учёт результата запроса в _usage_stats" />
         <fn-_get_semaphore PURPOSE="asyncio.Semaphore по config.max_concurrent_requests, пересоздаётся при смене лимита" />
@@ -55,7 +59,7 @@
         <const-SECURITY_SYSTEM_PROMPT PURPOSE="System prompt для security audit с severity classification" />
         <const-INJECTION_GUARD PURPOSE="SEC-INJECTION: добавляется к каждому system-промпту — контент это данные, не инструкции" />
         <const-JSON_OUTPUT_INSTRUCTION PURPOSE="FEAT-JSON: строгий JSON-режим {summary, findings[severity,title,location,description,recommendation]}" />
-        <type-ReviewStore PURPOSE="Дисковый store диалогов review_id → messages: ПЕР-ФАЙЛОВЫЙ layout db/reviews/rev_*.json (POLZA_STORE_PATH, атомарная tmp+replace запись) — исключает last-writer-wins гонки между процессами MCP и CLI (находка ревью rev_4e2fb8bca326); TTL 24ч от обращения, лимит 50 файлов с ленивой чисткой; ошибки диска деградируют в warning" />
+        <type-ReviewStore PURPOSE="Дисковый store диалогов review_id → messages: ПЕР-ФАЙЛОВЫЙ layout db/reviews/rev_*.json (POLZA_STORE_PATH, атомарная tmp+replace запись) — исключает last-writer-wins гонки между процессами MCP и CLI (находка ревью rev_4e2fb8bca326); TTL 24ч от обращения, лимит 50 файлов с ленивой чисткой; на POSIX каталог db/reviews создаётся с правами 0700, файлы — 0600 (секреты код-ревью не читаются другими локальными пользователями); STORE-TMP-0600: на POSIX tmp-файл создаётся сразу с 0600 через os.open(O_WRONLY|O_CREAT|O_EXCL) — без окна с широкими правами по umask между write и chmod; STORE-TMP-UNIQUE: имя tmp уникально на вызов (.{имя}.{pid}.{uuid4}.tmp) — параллельные писатели (MCP-сессия + CLI, конкурентные followup) одного review_id не сталкиваются на одном tmp-имени; os.replace атомарен на всех платформах, осиротевшие tmp не попадают в glob('rev_*.json'); ошибки диска деградируют в warning" />
         <export-review_store PURPOSE="Module-level ReviewStore singleton" />
         <fn-_build_user_prompt PURPOSE="Build structured user prompt from content, context, focus_areas; ограда через _code_fence" />
         <fn-_code_fence PURPOSE="SEC-INJECTION: markdown-ограда длиннее любого забора из backticks в контенте" />
@@ -65,7 +69,7 @@
         <fn-do_architecture_review PURPOSE="Architecture-specific review pipeline" />
         <fn-do_security_audit PURPOSE="Security-specific audit pipeline" />
         <fn-followup PURPOSE="Followup по review_id (диалог из store) ИЛИ по previous_review; guard только на новый контент" />
-        <fn-health_check PURPOSE="Config/pricing status + usage_today (FEAT-BUDGET) + balance_rub с кэшем 60с" />
+        <fn-health_check PURPOSE="Config/pricing status + usage_today (FEAT-BUDGET) + balance_rub с кэшем 60с; итоговый status пересчитывается ПОСЛЕ запроса Balance API — ошибка баланса переводит status в degraded (A2, раньше ошибочно оставался ok)" />
         <fn-_resolve_effort_local PURPOSE="Локальный маппинг effort для error-результатов" />
       </annotations>
       <CrossLink from="M-CRITIC" to="M-API" relation="calls-responses-api-reads-usage-stats" />
@@ -73,29 +77,33 @@
     </M-CRITIC>
 
     <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" STATUS="complete">
-      <purpose>FastMCP MCP сервер. 8 зарегистрированных tools. Декоратор _review_tool (DRY, try/except, agent_count clamp, opt-in file_path, heartbeat-уведомления FEAT-PROGRESS, elapsed в metadata). _read_file_content с sandbox: opt-in POLZA_ALLOW_FILE_PATH (SEC-03), allowed roots = cwd + POLZA_ALLOWED_READ_DIRS, glob-denylist секретов (SEC-02), лимит 1MB, чтение в to_thread (REL-02). _parse_json_loose для JSON-режима. self_update требует git-клона. Metadata footer: ⏱ Elapsed, ₽/$, cached_tokens.</purpose>
+      <purpose>FastMCP MCP сервер. 8 зарегистрированных tools. Декоратор _review_tool (DRY, try/except, agent_count clamp, opt-in file_path, heartbeat-уведомления FEAT-PROGRESS, elapsed в metadata). _read_file_content с sandbox: opt-in POLZA_ALLOW_FILE_PATH (SEC-03), проверки строго по порядку — форма пути → (Windows) ADS/хвостовые формы (SEC-ADS) → glob-denylist секретов (SEC-02) → allowed roots = cwd + POLZA_ALLOWED_READ_DIRS → exists/is_file → размер (лимит 1MB) → чтение в to_thread (REL-02); отказ одинаков для существующего и несуществующего файла и не раскрывает resolved-путь (SEC-ORACLE). _parse_json_loose для JSON-режима. self_update требует git-клона. Metadata footer: ⏱ Elapsed, ₽/$, cached_tokens.</purpose>
       <path>src/grok_critic/server.py</path>
       <depends>M-CRITIC, M-CONFIG</depends>
       <verification-ref>V-M-SERVER</verification-ref>
       <annotations>
-        <tool-critic_review PURPOSE="General critical code review (content, context, agent_count, focus_areas, output_format)" />
-        <tool-architecture_review PURPOSE="Specialized architecture review (content, context, agent_count)" />
-        <tool-security_audit PURPOSE="Specialized security audit with severity classification (content, context, agent_count)" />
-        <tool-critic_followup PURPOSE="Followup (question required; previous_review | review_id, agent_count)" />
+        <tool-critic_review PURPOSE="A1: content: str = '' и file_path: str | None = None в самой MCP-схеме — content необязателен; передача и content, и file_path одновременно отклоняется до вызова API. General critical code review (content, context, agent_count, focus_areas, output_format)" />
+        <tool-architecture_review PURPOSE="A1: та же схема file_path/content, что у critic_review. Specialized architecture review (content, context, agent_count)" />
+        <tool-security_audit PURPOSE="A1: та же схема file_path/content, что у critic_review. Specialized security audit with severity classification (content, context, agent_count)" />
+        <tool-critic_followup PURPOSE="file_path в схеме НЕТ (FastMCP отбрасывает лишний kwarg). Followup (question required; previous_review | review_id, agent_count)" />
         <tool-check_health PURPOSE="Server health: config status, pricing, usage_today (FEAT-BUDGET), balance in ₽" />
         <tool-reload_config_tool PURPOSE="Hot reload .env without process restart (SecretStr-aware, показывает новые поля)" />
         <tool-restart_server PURPOSE="Full process exit via os._exit(0), MCP client auto-restarts" />
-        <tool-self_update PURPOSE="Auto-update from GitHub: git pull + pip install + restart; отказ если не git-клон (FIX-ENV-PATH)" />
+        <tool-self_update PURPOSE="Auto-update from GitHub: git pull + pip install + restart; отказ если не git-клон (FIX-ENV-PATH); 'уже актуально' определяется сравнением git rev-parse HEAD до/после pull (не текстом вывода — работает с локализованным git); pip запускается как sys.executable -m pip; по таймауту git/pip процесс убивается через _run_cmd" />
         <fn-_review_tool PURPOSE="Decorator: agent_count clamp + opt-in file_path (SEC-03) + heartbeat (FEAT-PROGRESS) + elapsed + try/except + _format_result" />
         <fn-_heartbeat PURPOSE="FEAT-PROGRESS: периодические ctx.info-уведомления во время долгого ревью (интервал 20с)" />
         <fn-_validate_agent_count PURPOSE="Clamp agent_count to valid range 1-64" />
-        <fn-_read_file_content PURPOSE="Sandbox read: opt-in gate, allowed roots, _is_sensitive_file denylist, 1MB cap. Returns (content, error)" />
-        <fn-_is_sensitive_file PURPOSE="SEC-02: fnmatch-глобы (.env*, *credential*, id_rsa*, *.pem, .git/config...) без учёта регистра" />
-        <fn-_allowed_roots PURPOSE="Resolve allowed base dirs for file_path sandbox (cwd + config.allowed_read_dirs)" />
+        <fn-_read_file_content PURPOSE="SEC-ORACLE: sandbox read строго по порядку — resolve → (Windows) _is_unsafe_windows_path (SEC-ADS) → _is_sensitive_file denylist → _allowed_roots → exists/is_file → 1MB cap → чтение; отказ одинаков для существующего/несуществующего файла и содержит только переданную клиентом строку (никогда resolved-путь — он пишется только в серверный лог); ошибка resolve/allowed_roots → fail closed. Returns (content, error)" />
+        <fn-_normalize_component PURPOSE="SEC-ADS: имя компонента пути для сопоставления с денилистом — отрезает суффикс NTFS alternate data stream (config::$DATA → config) и хвостовые точки/пробелы (server.pem. → server.pem), которые Windows игнорирует при открытии; '.'/'..' в пустую строку не превращает" />
+        <fn-_is_unsafe_windows_path PURPOSE="SEC-ADS: чистая функция (тестируется на любой ОС) — небезопасна форма пути, если любой компонент кроме drive/anchor содержит ':' (ADS: a.txt:secret, config::$DATA) или заканчивается точкой/пробелом (server.pem., name ); '.'/'..' — навигация, не имя. В _read_file_content проверяется и до, и после resolve (флаг _IS_WINDOWS включает проверку только на Windows)" />
+        <fn-_is_sensitive_file PURPOSE="SEC-02/SEC-DENY: имя и компоненты пути нормализуются через _normalize_component (SEC-ADS — срезает ADS-суффикс и хвостовые точки/пробелы перед сравнением) и сравниваются с fnmatch-глобами (.env*, *credential*, id_rsa*/id_ed25519*/id_ecdsa*/id_dsa*, *.pem/*.key/*.p12/*.pfx/*.kdbx/*.jks/*.keystore, .git-credentials*, .netrc, .htpasswd, .npmrc, .pypirc, .claude.json*, *.tfstate(.*),  _netrc, .vault-token, *.ovpn, kubeconfig*, .git/config) + _SENSITIVE_DIRS (любой файл внутри .ssh/.gnupg/.aws/.azure/.azure-devops/.kube/.docker, любой компонент пути, без учёта регистра) + _SENSITIVE_DIR_PAIRS (.config/gh, .config/gcloud)" />
+        <fn-_cwd_root PURPOSE="SEC-CWD: CWD процесса как корень sandbox, или None если небезопасен — cwd пропускается, когда домашняя директория лежит внутри него (cwd=$HOME, предок $HOME, корень диска); warning [Server][_allowed_roots][CWD_SKIPPED] один раз на cwd (дедуп через _CWD_SKIP_WARNED)" />
+        <fn-_allowed_roots PURPOSE="Resolve allowed base dirs for file_path sandbox: _cwd_root() (SEC-CWD) + config.allowed_read_dirs (POLZA_ALLOWED_READ_DIRS, разделитель os.pathsep — ';' на Windows, ':' на POSIX)" />
         <fn-_parse_json_loose PURPOSE="FEAT-JSON: парсинг JSON из ответа модели (чистый, ```json-блок, объект в тексте)" />
         <fn-_format_result PURPOSE="DRY: unified formatting for success (with metadata footer + elapsed) and error results" />
         <fn-_fmt PURPOSE="Format numbers with space thousands separator" />
         <fn-main PURPOSE="Entry point: create FastMCP server and run stdio" />
+        <fn-_run_cmd PURPOSE="Async-обёртка над subprocess для self_update (git/pip): decode(errors='replace') — локализованный/не-UTF-8 вывод не роняет self_update; по истечении timeout процесс убивается (kill) и дожидается reap, а не подвисает" />
       </annotations>
       <CrossLink from="M-SERVER" to="M-CRITIC" relation="delegates-review-logic" />
       <CrossLink from="M-SERVER" to="M-CONFIG" relation="reads-config-for-reload-self-update-flag-and-file-path-opt-in" />

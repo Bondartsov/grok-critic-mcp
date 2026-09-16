@@ -1,4 +1,4 @@
-<DevelopmentPlan VERSION="1.8.0">
+<DevelopmentPlan VERSION="1.11.2">
   <ArchitectureNotes>
     <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 8 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart, self-update.</objective>
     <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>
@@ -23,10 +23,10 @@
         </errors>
       </contract>
       <interface>
-        <export-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_" />
+        <export-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_. Поля: api_key (SecretStr, min_length=1), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, log_file, price_input_per_1m, price_output_per_1m, allow_self_update, allowed_read_dirs (SEC-CWD/SEC-03, os.pathsep-разделитель), max_retries (ge=0,le=10), retry_backoff_base (ge=0.0), max_content_chars (ge=1), timeout_low, timeout_mid, allow_file_path, retry_deadline_seconds (0=авто, REL-06), daily_budget_usd (0=off, FEAT-BUDGET), max_concurrent_requests (ge=1,le=16), store_path (FEAT-CLI: путь дискового ReviewStore, пусто = db/reviews)" />
         <export-load_config PURPOSE="Load and validate config singleton" />
         <export-reload_config PURPOSE="Hot reload from .env without restart" />
-        <export-setup_logging PURPOSE="Configure Python logging" />
+        <export-_setup_logging PURPOSE="Configure Python logging (private); закрывает и close()-ит прежние handler'ы root-логгера перед reload_config" />
         <export-config PURPOSE="Module-level config instance" />
       </interface>
       <depends>none</depends>
@@ -60,7 +60,7 @@
         </errors>
       </contract>
       <interface>
-        <export-CritiqueResult PURPOSE="Dataclass for structured API response" />
+        <export-CritiqueResult PURPOSE="Dataclass for structured API response: text, model, agent_count, effort, input_tokens, output_tokens, total_tokens, cost_usd, cost_rub, cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
         <export-ResponsesClient PURPOSE="Async HTTP client wrapper" />
         <export-ResponsesClient.call PURPOSE="Send request with retry (max 2 on 429/5xx) and dynamic timeout" />
         <export-get_client PURPOSE="Singleton factory for persistent AsyncClient" />
@@ -149,6 +149,42 @@
       </observability>
       <verification-ref>V-M-SERVER</verification-ref>
     </M-SERVER>
+
+    <M-CLI NAME="CommandLine" TYPE="ENTRY_POINT" LAYER="3" ORDER="2" STATUS="complete">
+      <contract>
+        <purpose>Терминальный вход для агентов (Bash/PowerShell) — one-shot ревью/followup/диагностика, не зависящие от состояния MCP-сессии; фолбек, когда MCP стандартно недоступен</purpose>
+        <inputs>
+          <param name="argv" type="list[str]" note="serve/health/doctor/review/followup/logs/config" />
+        </inputs>
+        <outputs>
+          <param name="exit_code" type="int" note="0 ok / 1 warning / 2 error" />
+        </outputs>
+        <errors>
+          <error code="STORE_NOT_WRITABLE" />
+          <error code="ENV_MISSING" />
+        </errors>
+      </contract>
+      <interface>
+        <export-main PURPOSE="Console-script entry point grok-critic = grok_critic.cli:main; без подкоманды = serve (совместимость с конфигами MCP-клиентов)" />
+        <export-cmd-serve PURPOSE="Запуск MCP stdio-сервера" />
+        <export-cmd-health PURPOSE="Статус конфига/store без сети; --ping — реальный health_check (баланс, usage_today)" />
+        <export-cmd-doctor PURPOSE="Диагностика: Python, версия vs git HEAD, шим CLI, .env, ключ, TCP base_url+proxy, store writable, лог" />
+        <export-cmd-review PURPOSE="One-shot ревью файла/stdin в обход MCP; --json / --json-output" />
+        <export-cmd-followup PURPOSE="Followup из терминала: --review-id ИЛИ --from файл|stdin" />
+        <export-cmd-logs PURPOSE="Хвост лога сервера (config.log_file)" />
+        <export-cmd-config PURPOSE="Конфиг с маскированным ключом + env_file + store_path" />
+      </interface>
+      <depends>M-CRITIC, M-CONFIG, M-SERVER</depends>
+      <target>
+        <source>src/grok_critic/cli.py</source>
+        <tests>tests/test_cli.py</tests>
+      </target>
+      <observability>
+        <log-prefix>[CLI]</log-prefix>
+        <note>Без критических BLOCK-маркеров: CLI переиспользует логику и логи M-CRITIC/M-API/M-SERVER, добавляя только [CLI][review][REVIEW|DONE]</note>
+      </observability>
+      <verification-ref>V-M-CLI</verification-ref>
+    </M-CLI>
   </Modules>
 
   <DataFlow>
@@ -232,6 +268,27 @@
       <step-6 status="complete">30 новых тестов (127 → 157): sandbox, retry recovery, cache-key, size-guard, file_path integration, package exports, resolve_timeout</step-6>
       <step-7 status="complete">DOC-01..12: AGENTS.md 1.9.0/8 tools/157 тестов, knowledge-graph (CritiqueResult, _resolve_effort, _setup_logging, M-CONFIG поля), requirements/verification-plan timeout=180, README config-таблица + sandbox + retry, SKILL.md file_path + feature flag, URL репозитория унифицирован</step-7>
     </Phase-8>
+
+    <Phase-9 name="v1.10-1.11.2 hardening" status="complete">
+      <goal>Третья волна hardening: MCP-схема file_path, sandbox по cwd, расширенный денилист секретов, устойчивый self_update, дисковый per-file store, надёжный dedup-ключ, health degraded, закрытие log handler'ов</goal>
+      <step-1 module="M-SERVER" status="complete">A1: content: str = "" и file_path: str | None = None прямо в сигнатуре critic_review/architecture_review/security_audit — content стал необязателен на уровне MCP-схемы; одновременная передача content и file_path отклоняется до вызова API; critic_followup file_path не принимает</step-1>
+      <step-2 module="M-SERVER" status="complete">SEC-CWD: fn-_cwd_root — CWD процесса как корень sandbox, пропускается когда домашняя директория лежит внутри него (cwd=$HOME/предок/корень диска), warning CWD_SKIPPED один раз на cwd; allowed roots = _cwd_root() + POLZA_ALLOWED_READ_DIRS (os.pathsep)</step-2>
+      <step-3 module="M-SERVER" status="complete">SEC-DENY: расширен _is_sensitive_file — новые глобы (.claude.json*, *.tfstate(.*), _netrc, .vault-token, *.ovpn, kubeconfig*) + _SENSITIVE_DIRS (.ssh/.gnupg/.aws/.azure/.azure-devops/.kube/.docker, любой компонент пути) + _SENSITIVE_DIR_PAIRS (.config/gh, .config/gcloud)</step-3>
+      <step-4 module="M-SERVER" status="complete">self_update: NEW-SERVER-1 git rev-parse HEAD до/после pull вместо парсинга текста вывода git (работает с локализованным git); NEW-SERVER-3 pip запускается как sys.executable -m pip; RUN-CMD-KILL fn-_run_cmd убивает зависший процесс по таймауту и дожидается reap</step-4>
+      <step-5 module="M-CRITIC" status="complete">A2: health_check пересчитывает итоговый status ПОСЛЕ запроса Balance API — ошибка баланса переводит status в degraded (раньше ошибочно оставался ok); CLI health --ping тогда возвращает exit 1</step-5>
+      <step-6 module="M-CRITIC" status="complete">A4: ReviewStore переведён на дисковый per-file layout (db/reviews/rev_*.json, POLZA_STORE_PATH), TTL 24ч с последнего обращения, лимит 50, переживает рестарты, общий для MCP и CLI; на POSIX каталог создаётся 0700, файлы 0600</step-6>
+      <step-7 module="M-API" status="complete">A3: fn-_build_input_messages — единый источник фактического списка input-сообщений; fn-_dedup_key считает sha256 от этого списка + agent_count + model, а не от system+prompt по отдельности — параллельные followup по разным review_id больше не склеиваются</step-7>
+      <step-8 module="M-CONFIG" status="complete">_setup_logging закрывает (close()) прежние handler'ы root-логгера перед добавлением новых — reload_config с log_file больше не копит открытые файловые дескрипторы</step-8>
+      <step-9 module="M-CLI" status="complete">Модуль M-CLI (cli.py) описан в графе и планах как самостоятельный ENTRY_POINT: serve/health/doctor/review/followup/logs/config, console-script grok-critic</step-9>
+      <step-10 status="complete">Тесты: 358 (356 passed + 2 skipped — POSIX-only права и symlink-тест без прав на Windows) — test_server 149, test_api_client 71, test_critic 60, test_config 49, test_cli 26, test_package 3. ruff чистый; mypy — 6 предсуществующих ошибок, новых нет</step-10>
+      <step-11 module="M-SERVER" status="complete">SEC-ORACLE: fn-_read_file_content — порядок проверок строго resolve → (Windows) небезопасные формы пути → denylist _is_sensitive_file → корни _allowed_roots → exists/is_file → размер → чтение; отказ одинаков для существующего и несуществующего файла, не содержит resolved-путь (только клиентскую строку); ошибка resolve/allowed_roots трактуется как отказ (fail closed)</step-11>
+      <step-12 module="M-SERVER" status="complete">SEC-ADS: fn-_normalize_component отрезает суффикс NTFS alternate data stream и хвостовые точки/пробелы перед сопоставлением с denylist; fn-_is_unsafe_windows_path отклоняет на Windows компоненты пути (кроме drive-anchor) с ':' или хвостовой точкой/пробелом — проверка выполняется и до, и после resolve</step-12>
+      <step-13 module="M-API" status="complete">DEDUP-CANCEL: очистка _inflight переведена на task.add_done_callback (fn-_inflight_discard) с проверкой identity вместо finally — отмена владельца больше не удаляет запись живого запроса</step-13>
+      <step-14 module="M-API" status="complete">DEDUP-SEM/BUDGET-SOFT: fn-_guarded_request — слот semaphore держит только общая задача; fn-_budget_exceeded_result проверяется внутри неё после слота и до HTTP, присоединившиеся (joiner) эту проверку не проходят; POLZA_DAILY_BUDGET_USD документирован как soft limit (перерасход не более чем на max_concurrent_requests одновременных запросов)</step-14>
+      <step-15 module="M-CRITIC" status="complete">STORE-TMP-0600/STORE-TMP-UNIQUE: ReviewStore._atomic_write — на POSIX tmp создаётся через os.open(O_WRONLY|O_CREAT|O_EXCL, 0o600) без окна с правами по umask; имя tmp уникально на вызов (pid + uuid4) — параллельные писатели одного review_id не сталкиваются</step-15>
+      <step-16 status="complete">Тесты второй волны критика: 36 новых тестов (322 → 358) — test_server 124→149, test_api_client 64→71, test_critic 56→60; ruff чистый, mypy без новых ошибок</step-16>
+      <step-17 status="complete">Контрольное ревью критика: rev_f27c1ca3d751 (корректность патча конкурентности), rev_34169f2fcd5e (security-аудит sandbox), rev_4dbf16f4295f (согласование понижений); ручной smoke-test check_health против реального Polza.AI выполнен 2026-09-16 (Status ok, баланс получен)</step-17>
+    </Phase-9>
   </ImplementationOrder>
 
   <ExecutionPolicy>

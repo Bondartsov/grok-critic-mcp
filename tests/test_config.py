@@ -1,5 +1,5 @@
 # FILE: tests/test_config.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CONFIG configuration loading and validation
 #   SCOPE: Test env var reading, defaults, log_level validation, price fields
@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from unittest.mock import patch
 
@@ -16,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_settings import SettingsConfigDict
 
-from grok_critic.config import AppConfig
+from grok_critic.config import AppConfig, _setup_logging
 
 
 def _make_no_env(**kwargs) -> AppConfig:
@@ -292,3 +293,91 @@ class TestReloadConfig:
 
 
 # END_BLOCK_RELOAD_CONFIG
+
+
+# START_BLOCK_SETUP_LOGGING
+class TestSetupLogging:
+    """A10 / TEST-09: покрытие _setup_logging."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_logger_state(self):
+        logger = logging.getLogger("grok-critic")
+        saved_handlers = list(logger.handlers)
+        saved_level = logger.level
+        logger.handlers.clear()
+        yield
+        for h in logger.handlers:
+            if isinstance(h, logging.FileHandler):
+                h.close()
+        logger.handlers.clear()
+        logger.handlers.extend(saved_handlers)
+        logger.setLevel(saved_level)
+
+    def test_file_handler_writes_to_log_file(self, tmp_path) -> None:
+        log_file = tmp_path / "x.log"
+        cfg = _make_no_env(api_key="test-key", log_level="INFO", log_file=str(log_file))
+        _setup_logging(cfg)
+
+        logger = logging.getLogger("grok-critic")
+        assert len(logger.handlers) == 1
+        handler = logger.handlers[0]
+        assert isinstance(handler, logging.FileHandler)
+        assert logger.level == logging.INFO
+
+        logger.info("hello from test")
+        handler.flush()
+        handler.close()
+
+        content = log_file.read_text(encoding="utf-8")
+        assert "hello from test" in content
+
+    def test_empty_log_file_uses_stream_handler_to_stderr(self) -> None:
+        import sys
+
+        cfg = _make_no_env(api_key="test-key", log_file="")
+        _setup_logging(cfg)
+
+        logger = logging.getLogger("grok-critic")
+        assert len(logger.handlers) == 1
+        handler = logger.handlers[0]
+        assert isinstance(handler, logging.StreamHandler)
+        assert not isinstance(handler, logging.FileHandler)
+        assert handler.stream is sys.stderr
+
+    def test_repeated_call_does_not_duplicate_handlers(self, tmp_path) -> None:
+        log_file = tmp_path / "y.log"
+        cfg = _make_no_env(api_key="test-key", log_file=str(log_file))
+
+        _setup_logging(cfg)
+        _setup_logging(cfg)
+
+        logger = logging.getLogger("grok-critic")
+        assert len(logger.handlers) == 1
+        logger.handlers[0].close()
+
+    def test_repeated_call_closes_previous_file_handler(self, tmp_path) -> None:
+        """reload_config с log_file не должен оставлять незакрытый FileHandler."""
+        cfg = _make_no_env(api_key="test-key", log_file=str(tmp_path / "w.log"))
+        _setup_logging(cfg)
+        logger = logging.getLogger("grok-critic")
+        first = logger.handlers[0]
+        assert isinstance(first, logging.FileHandler)
+
+        _setup_logging(cfg)
+
+        assert first.stream is None  # FileHandler.close() сбрасывает stream
+        assert logger.handlers[0] is not first
+        logger.handlers[0].close()
+
+    def test_log_level_normalized_by_validator(self, tmp_path) -> None:
+        log_file = tmp_path / "z.log"
+        cfg = _make_no_env(api_key="test-key", log_level="info", log_file=str(log_file))
+        assert cfg.log_level == "INFO"
+
+        _setup_logging(cfg)
+        logger = logging.getLogger("grok-critic")
+        assert logger.level == logging.INFO
+        logger.handlers[0].close()
+
+
+# END_BLOCK_SETUP_LOGGING

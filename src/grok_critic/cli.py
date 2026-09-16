@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/cli.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Terminal CLI over critic/api_client — agents can use/fix the critic via Bash when MCP is down
 #   SCOPE: serve (stdio MCP), health, doctor, review, followup, logs, config; exit codes; --json

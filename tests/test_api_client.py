@@ -1,5 +1,5 @@
 # FILE: tests/test_api_client.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-API ResponsesClient with mocked HTTP
 #   SCOPE: call(), error handling, parsing, usage/cost, retry deadline, dedup, budget guard
@@ -853,8 +853,433 @@ class TestInFlightDedup:
             await client.call("same")
         assert mock_httpx.post.call_count == 2
 
+    async def test_same_prompt_different_messages_not_deduped(
+        self, client: ResponsesClient
+    ) -> None:
+        """A3: followup по разным review_id с одинаковым prompt, но разной историей
+        диалога (messages) НЕ должен присоединяться к чужому in-flight запросу."""
+        response_a = httpx.Response(200, json={"output_text": "answer-A"})
+        response_b = httpx.Response(200, json={"output_text": "answer-B"})
+        post_calls: list[dict[str, object]] = []
+        release = asyncio.Event()
+
+        async def slow_post(url: str, **kwargs: object) -> httpx.Response:
+            body = kwargs.get("json")
+            post_calls.append(body)  # type: ignore[arg-type]
+            await release.wait()
+            # Разные тела запроса → разные ответы, чтобы поймать возможную склейку.
+            assert isinstance(body, dict)
+            first_msg = body["input"][0]["content"]
+            return response_a if "review-A" in first_msg else response_b
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = slow_post
+            mock_gc.return_value = mock_httpx
+            t1 = asyncio.create_task(
+                client.call(
+                    "Ты уверен?",
+                    messages=[{"role": "user", "content": "review-A context"}],
+                )
+            )
+            await asyncio.sleep(0.02)
+            t2 = asyncio.create_task(
+                client.call(
+                    "Ты уверен?",
+                    messages=[{"role": "user", "content": "review-B context"}],
+                )
+            )
+            await asyncio.sleep(0.02)
+            release.set()
+            r1, r2 = await asyncio.gather(t1, t2)
+
+        assert len(post_calls) == 2
+        assert r1.text == "answer-A"
+        assert r2.text == "answer-B"
+
+    async def test_different_model_not_deduped(self) -> None:
+        """A3: разные модели у клиентов → разные dedup-ключи, отдельные запросы."""
+        mock_response = httpx.Response(200, json={"output_text": "ok"})
+        release = asyncio.Event()
+        post_calls = 0
+
+        async def slow_post(url: str, **kwargs: object) -> httpx.Response:
+            nonlocal post_calls
+            post_calls += 1
+            await release.wait()
+            return mock_response
+
+        def make_client(model: str) -> ResponsesClient:
+            with patch("grok_critic.api_client.config") as mock_cfg:
+                mock_cfg.base_url = "https://polza.ai/api/v1"
+                mock_cfg.api_key = SecretStr("test-key")
+                mock_cfg.model = model
+                mock_cfg.timeout_seconds = 30
+                mock_cfg.price_input_per_1m = 0.0
+                mock_cfg.price_output_per_1m = 0.0
+                mock_cfg.timeout_low = 90
+                mock_cfg.timeout_mid = 150
+                mock_cfg.max_retries = 2
+                mock_cfg.retry_backoff_base = 2.0
+                mock_cfg.retry_deadline_seconds = 0.0
+                mock_cfg.daily_budget_usd = 0.0
+                mock_cfg.max_concurrent_requests = 4
+                return ResponsesClient()
+
+        client_a = make_client("model-a")
+        client_b = make_client("model-b")
+
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = slow_post
+            mock_gc.return_value = mock_httpx
+            t1 = asyncio.create_task(client_a.call("same", system_prompt="s"))
+            await asyncio.sleep(0.02)
+            t2 = asyncio.create_task(client_b.call("same", system_prompt="s"))
+            await asyncio.sleep(0.02)
+            release.set()
+            r1, r2 = await asyncio.gather(t1, t2)
+
+        assert post_calls == 2
+        assert r1.success and r2.success
+
 
 # END_BLOCK_INFLIGHT_DEDUP
+
+
+# START_BLOCK_INFLIGHT_CONCURRENCY
+def _patch_runtime_config(**overrides: object):
+    """patch config на ВСЁ время теста (call() читает config в рантайме, не только в __init__)."""
+    patcher = patch("grok_critic.api_client.config")
+    mock_cfg = patcher.start()
+    values: dict[str, object] = {
+        "base_url": "https://polza.ai/api/v1",
+        "api_key": SecretStr("test-key"),
+        "model": "x-ai/grok-4.20-multi-agent",
+        "timeout_seconds": 30,
+        "price_input_per_1m": 0.0,
+        "price_output_per_1m": 0.0,
+        "timeout_low": 90,
+        "timeout_mid": 150,
+        "max_retries": 2,
+        "retry_backoff_base": 2.0,
+        "retry_deadline_seconds": 0.0,
+        "daily_budget_usd": 0.0,
+        "max_concurrent_requests": 2,
+    }
+    values.update(overrides)
+    for name, value in values.items():
+        setattr(mock_cfg, name, value)
+    return patcher
+
+
+def _body_prompt(kwargs: dict[str, object]) -> str:
+    body = kwargs.get("json")
+    assert isinstance(body, dict)
+    return str(body["input"][-1]["content"])
+
+
+class TestInFlightConcurrency:
+    """DEDUP-CANCEL / DEDUP-SEM / BUDGET-SOFT: инварианты общей in-flight задачи."""
+
+    async def test_creator_cancel_does_not_duplicate_request(self) -> None:
+        """I2: отмена создателя не удаляет запись — повторный вызов присоединяется."""
+        patcher = _patch_runtime_config()
+        try:
+            client = ResponsesClient()
+            started = asyncio.Event()
+            release = asyncio.Event()
+            post_calls = 0
+
+            async def slow_post(url: str, **kwargs: object) -> httpx.Response:
+                nonlocal post_calls
+                post_calls += 1
+                started.set()
+                await release.wait()
+                return httpx.Response(200, json={"output_text": "ok"})
+
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = slow_post
+                mock_gc.return_value = mock_httpx
+
+                creator = asyncio.create_task(client.call("same"))
+                await asyncio.wait_for(started.wait(), 1)
+                creator.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await creator
+
+                key = client._dedup_key("same", 4, None, None)
+                assert key in api_mod._inflight
+
+                second = asyncio.create_task(client.call("same"))
+                await asyncio.sleep(0.01)
+                release.set()
+                result = await asyncio.wait_for(second, 1)
+                await asyncio.sleep(0)
+
+            assert post_calls == 1
+            assert result.text == "ok"
+            assert key not in api_mod._inflight
+        finally:
+            patcher.stop()
+
+    async def test_all_waiters_cancelled_request_completes(self) -> None:
+        """I2/I3/I4/I6: все ожидающие отменены → запрос завершается, запись удалена,
+        статистика учтена один раз, слот semaphore освобождён."""
+        patcher = _patch_runtime_config(max_concurrent_requests=1)
+        try:
+            client = ResponsesClient()
+            started = asyncio.Event()
+            release = asyncio.Event()
+            prompts: list[str] = []
+
+            async def post(url: str, **kwargs: object) -> httpx.Response:
+                prompt = _body_prompt(kwargs)
+                prompts.append(prompt)
+                if prompt == "same":
+                    started.set()
+                    await release.wait()
+                return httpx.Response(200, json={"output_text": f"ok-{prompt}"})
+
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = post
+                mock_gc.return_value = mock_httpx
+
+                waiters = [asyncio.create_task(client.call("same")) for _ in range(3)]
+                await asyncio.wait_for(started.wait(), 1)
+                key = client._dedup_key("same", 4, None, None)
+                shared = api_mod._inflight[key]
+                for w in waiters:
+                    w.cancel()
+                results = await asyncio.gather(*waiters, return_exceptions=True)
+                assert all(isinstance(r, asyncio.CancelledError) for r in results)
+                assert not shared.done()
+                assert api_mod._inflight.get(key) is shared
+
+                # I4: слот всё ещё занят летящим запросом — другой ключ не стартует.
+                other = asyncio.create_task(client.call("other"))
+                await asyncio.sleep(0.02)
+                assert prompts == ["same"]
+
+                release.set()
+                shared_result = await asyncio.wait_for(shared, 1)
+                other_result = await asyncio.wait_for(other, 1)
+                await asyncio.sleep(0)
+
+            assert shared_result.text == "ok-same"
+            assert other_result.text == "ok-other"
+            assert prompts == ["same", "other"]
+            assert key not in api_mod._inflight
+            assert get_usage_stats()["calls"] == 2  # по одному на каждый реальный запрос
+        finally:
+            patcher.stop()
+
+    async def test_joiners_do_not_hold_semaphore_slot(self) -> None:
+        """I4: владелец + 3 joiner при limit=2 → запрос другого ключа стартует до
+        завершения владельца."""
+        patcher = _patch_runtime_config(max_concurrent_requests=2)
+        try:
+            client = ResponsesClient()
+            started = asyncio.Event()
+            release = asyncio.Event()
+            prompts: list[str] = []
+
+            async def post(url: str, **kwargs: object) -> httpx.Response:
+                prompt = _body_prompt(kwargs)
+                prompts.append(prompt)
+                if prompt == "slow":
+                    started.set()
+                    await release.wait()
+                return httpx.Response(200, json={"output_text": f"ok-{prompt}"})
+
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = post
+                mock_gc.return_value = mock_httpx
+
+                owner = asyncio.create_task(client.call("slow"))
+                await asyncio.wait_for(started.wait(), 1)
+                joiners = [asyncio.create_task(client.call("slow")) for _ in range(3)]
+                await asyncio.sleep(0.01)
+
+                other_result = await asyncio.wait_for(client.call("other"), 1)
+                assert not owner.done()
+                assert prompts == ["slow", "other"]
+
+                release.set()
+                results = await asyncio.wait_for(asyncio.gather(owner, *joiners), 1)
+
+            assert other_result.text == "ok-other"
+            assert all(r.text == "ok-slow" for r in results)
+            assert prompts.count("slow") == 1
+        finally:
+            patcher.stop()
+
+    async def test_joiner_queued_for_slot_does_not_hold_it(self) -> None:
+        """I4 (DEDUP-SEM): владелец и joiner одного ключа пришли, когда все слоты заняты.
+        После освобождения слотов joiner не должен занять второй слот своим ожиданием —
+        запрос другого ключа стартует, пока общий запрос ещё летит."""
+        patcher = _patch_runtime_config(max_concurrent_requests=2)
+        try:
+            client = ResponsesClient()
+            gates = {name: asyncio.Event() for name in ("a", "b", "slow")}
+            started = {name: asyncio.Event() for name in ("a", "b", "slow", "other")}
+            prompts: list[str] = []
+
+            async def post(url: str, **kwargs: object) -> httpx.Response:
+                prompt = _body_prompt(kwargs)
+                prompts.append(prompt)
+                started[prompt].set()
+                if prompt in gates:
+                    await gates[prompt].wait()
+                return httpx.Response(200, json={"output_text": f"ok-{prompt}"})
+
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = post
+                mock_gc.return_value = mock_httpx
+
+                blocker_a = asyncio.create_task(client.call("a"))
+                blocker_b = asyncio.create_task(client.call("b"))
+                await asyncio.wait_for(started["a"].wait(), 1)
+                await asyncio.wait_for(started["b"].wait(), 1)
+
+                owner = asyncio.create_task(client.call("slow"))
+                joiner = asyncio.create_task(client.call("slow"))
+                await asyncio.sleep(0.01)
+
+                gates["a"].set()
+                await asyncio.wait_for(blocker_a, 1)
+                await asyncio.wait_for(started["slow"].wait(), 1)
+                gates["b"].set()
+                await asyncio.wait_for(blocker_b, 1)
+
+                other_result = await asyncio.wait_for(client.call("other"), 1)
+                assert not owner.done() and not joiner.done()
+
+                gates["slow"].set()
+                owner_result, joiner_result = await asyncio.wait_for(
+                    asyncio.gather(owner, joiner), 1
+                )
+
+            assert other_result.text == "ok-other"
+            assert owner_result.text == joiner_result.text == "ok-slow"
+            assert prompts.count("slow") == 1
+        finally:
+            patcher.stop()
+
+    async def test_joiner_not_rejected_by_budget_new_request_rejected(self) -> None:
+        """I5: бюджет исчерпан во время полёта → joiner получает результат,
+        новый запрос (другой ключ) отклоняется без post."""
+        patcher = _patch_runtime_config(daily_budget_usd=0.01)
+        try:
+            client = ResponsesClient()
+            started = asyncio.Event()
+            release = asyncio.Event()
+            prompts: list[str] = []
+
+            async def post(url: str, **kwargs: object) -> httpx.Response:
+                prompts.append(_body_prompt(kwargs))
+                started.set()
+                await release.wait()
+                return httpx.Response(200, json={"output_text": "ok"})
+
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = post
+                mock_gc.return_value = mock_httpx
+
+                owner = asyncio.create_task(client.call("same"))
+                await asyncio.wait_for(started.wait(), 1)
+                # Имитация: бюджет исчерпан, пока первый запрос летит.
+                api_mod._usage_stats["cost_usd"] = 0.5
+
+                joiner = asyncio.create_task(client.call("same"))
+                rejected = await asyncio.wait_for(client.call("fresh"), 1)
+                assert not rejected.success
+                assert "Превышен дневной бюджет" in rejected.error
+                assert prompts == ["same"]
+
+                release.set()
+                owner_result, joiner_result = await asyncio.wait_for(
+                    asyncio.gather(owner, joiner), 1
+                )
+
+            assert owner_result.text == "ok"
+            assert joiner_result.text == "ok"
+            assert joiner_result.success
+            assert prompts == ["same"]
+        finally:
+            patcher.stop()
+
+    async def test_exception_reaches_all_waiters_and_entry_removed(self) -> None:
+        """I6: исключение общей задачи получают все ожидающие; запись удалена."""
+        patcher = _patch_runtime_config()
+        try:
+            client = ResponsesClient()
+            started = asyncio.Event()
+            release = asyncio.Event()
+            post_calls = 0
+
+            async def failing_post(url: str, **kwargs: object) -> httpx.Response:
+                nonlocal post_calls
+                post_calls += 1
+                started.set()
+                await release.wait()
+                raise RuntimeError("boom")
+
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = failing_post
+                mock_gc.return_value = mock_httpx
+
+                owner = asyncio.create_task(client.call("same"))
+                await asyncio.wait_for(started.wait(), 1)
+                joiners = [asyncio.create_task(client.call("same")) for _ in range(2)]
+                await asyncio.sleep(0.01)
+                release.set()
+                results = await asyncio.wait_for(
+                    asyncio.gather(owner, *joiners, return_exceptions=True), 1
+                )
+                await asyncio.sleep(0)
+
+            assert post_calls == 1
+            assert len(results) == 3
+            assert all(isinstance(r, RuntimeError) for r in results)
+            assert api_mod._inflight == {}
+            stats = get_usage_stats()
+            assert stats["calls"] == 0
+            assert stats["errors"] == 0
+        finally:
+            patcher.stop()
+
+    async def test_done_callback_does_not_remove_newer_task(self) -> None:
+        """I3: done-callback устаревшей задачи не удаляет более новую запись с тем же ключом."""
+
+        async def value() -> CritiqueResult:
+            return CritiqueResult(text="x", model="m", agent_count=4, effort="low")
+
+        release = asyncio.Event()
+
+        async def pending() -> CritiqueResult:
+            await release.wait()
+            return CritiqueResult(text="y", model="m", agent_count=4, effort="low")
+
+        old = asyncio.create_task(value())
+        await old
+        new = asyncio.create_task(pending())
+        api_mod._inflight["k"] = new
+        api_mod._inflight_discard("k", old)
+        assert api_mod._inflight.get("k") is new
+        release.set()
+        await new
+        api_mod._inflight_discard("k", new)
+        assert "k" not in api_mod._inflight
+
+
+# END_BLOCK_INFLIGHT_CONCURRENCY
 
 
 # START_BLOCK_BUDGET_GUARD

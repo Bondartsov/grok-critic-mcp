@@ -1,5 +1,5 @@
 # FILE: tests/test_package.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for package public API consistency (__init__.py)
 #   SCOPE: Verify __all__ matches actual exports, star-import works

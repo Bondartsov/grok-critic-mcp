@@ -1,5 +1,5 @@
 # FILE: tests/test_cli.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CLI terminal interface (serve/health/doctor/review/followup/logs/config)
 #   SCOPE: argparse wiring, exit codes, mocked API calls, store interaction, output formats

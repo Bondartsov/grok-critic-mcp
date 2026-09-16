@@ -1,5 +1,5 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.11.1
+# VERSION: 1.11.2
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 
@@ -91,9 +92,33 @@ class ReviewStore:
     # -- persistence --------------------------------------------------------
 
     def _atomic_write(self, path: Path, payload: str) -> None:
+        # NEW-SEC-store-perms: диалоги ревью (включая ревьюируемый код) пишутся
+        # в plaintext — на POSIX ограничиваем доступ каталогу до владельца
+        # (0700); на Windows ACL профиля покрывает это без нас.
+        # STORE-TMP-0600: на POSIX tmp-файл создаётся СРАЗУ с mode 0600 через
+        # os.open(O_CREAT|O_EXCL) — без окна с широкими правами по umask между
+        # write_text() и последующим chmod().
+        # STORE-TMP-UNIQUE: store общий для нескольких процессов (MCP-сессии +
+        # CLI, параллельные followup) — имя tmp уникально на писателя/вызов
+        # (pid + uuid4), иначе два писателя одного review_id сталкиваются на
+        # одном tmp-имени (с O_EXCL второй просто упадёт).
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(payload, encoding="utf-8")
+        if os.name == "posix":
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError as exc:
+                logger.warning("[Critic][ReviewStore][PERMS] chmod dir failed: %s", exc)
+        tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        if os.name == "posix":
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+        else:
+            tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, path)
 
     def _read_entry(self, path: Path) -> dict | None:
@@ -337,7 +362,7 @@ async def followup(
 
     FEAT-FOLLOWUP-ID: вместо передачи полного текста предыдущего ревью
     (дорого по токенам) можно передать review_id из metadata — сервер
-    восстановит диалог из in-memory store.
+    восстановит диалог из дискового store (db/reviews/).
     """
     logger.info(
         "[Critic][followup][FOLLOWUP] prev_len=%s question_len=%d review_id=%s",
@@ -384,7 +409,7 @@ async def followup(
                 agent_count=count, effort=_resolve_effort_local(count),
                 error=(
                     f"review_id не найден: {review_id} "
-                    "(store теряется при рестарте процесса и хранит последние 50 ревью). "
+                    "(истёк TTL 24ч, store очищен или запись вытеснена лимитом 50). "
                     "Передайте previous_review явно."
                 ),
             )
@@ -504,6 +529,10 @@ async def health_check() -> dict:
             except Exception as exc:
                 logger.warning("[Critic][health_check][BALANCE] Failed to fetch balance: %s", exc)
                 issues.append(f"Balance API error: {exc}")
+
+    # A2: Balance API может добавить issues уже ПОСЛЕ первого расчёта status —
+    # пересчитываем, иначе status="ok" врёт при непустых issues.
+    result["status"] = "ok" if not issues else "degraded"
 
     logger.info("[Critic][health_check][HEALTH_CHECK] status=%s", result["status"])
     return result

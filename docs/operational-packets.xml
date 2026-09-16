@@ -1,4 +1,4 @@
-<OperationalPackets VERSION="1.8.0">
+<OperationalPackets VERSION="1.11.2">
   <ExecutionPacketTemplate>
     <ExecutionPacket>
       <module-id>M-EXAMPLE</module-id>
