@@ -68,6 +68,23 @@ class TestHealthCommand:
         assert rc == cli.EXIT_ERR
         assert "Store" in capsys.readouterr().err
 
+    def test_no_ping_json_ok(self, capsys) -> None:
+        """--json без --ping даёт машинный вывод (раньше флаг игнорировался и печатался текст)."""
+        rc = cli.cmd_health(_args(ping=False, json=True))
+        assert rc == cli.EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"status": "ok", "mode": "offline", "issues": []}
+
+    def test_no_ping_json_store_broken(self, tmp_path, monkeypatch, capsys) -> None:
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(review_store, "_dir", blocker / "db" / "reviews")
+        rc = cli.cmd_health(_args(ping=False, json=True))
+        assert rc == cli.EXIT_ERR
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "error"
+        assert any("Store" in issue for issue in payload["issues"])
+
     def test_ping_json(self, capsys) -> None:
         fake = {
             "status": "ok",

@@ -46,6 +46,7 @@ grok-critic followup "Ответь одним предложением: код �
 Проверка живости без обращения к API (конфиг + доступность store на запись).
 
 - `--ping` — реальный запрос к Polza.AI: статус, баланс ₽, суточные счётчики (`Today: N calls | $X | ₽`).
+- `--json` — машинный вывод в обоих режимах: без `--ping` — `{status: ok|error, mode: offline, issues[]}`, с `--ping` — `{status, model, base_url, issues[], balance_rub, usage_today}`.
 - Выход: `0` ok / `1` degraded (например, Balance API недоступен) / `2` сломано (ключ, store).
 
 ### `grok-critic doctor`

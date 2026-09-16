@@ -125,6 +125,12 @@ def cmd_health(args: argparse.Namespace) -> int:
     if not _store_writable(store_path):
         problems.append(f"Store недоступен для записи: {store_path}")
 
+    if args.json:
+        # --json без --ping: тот же машинный контракт, что у ветки --ping (status + issues);
+        # раньше флаг молча игнорировался и печатался текст — скрипты падали на разборе.
+        payload = {"status": "ok" if not problems else "error", "mode": "offline", "issues": problems}
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return EXIT_OK if not problems else EXIT_ERR
     for p in problems:
         print(f"❌ {p}", file=sys.stderr)
     if not problems:
