@@ -1,6 +1,14 @@
 # grok-critic CLI — инструкция по использованию
 
-> Версия документа: 1.11.2 (2026-09-16). CLI появился в v1.11.0, per-file store — в v1.11.1.
+> Версия документа: 1.12.0 (16.09.2026). CLI появился в v1.11.0, per-file store — в v1.11.1, цены в ₽ и `POLZA_DAILY_BUDGET_RUB` — в v1.12.0.
+
+## Миграция с 1.11.x
+
+- Удалены переменные `POLZA_PRICE_INPUT_PER_1M`, `POLZA_PRICE_OUTPUT_PER_1M`, `POLZA_DAILY_BUDGET_USD`. Если они остались в `.env`/окружении — запуск не ломается, в лог пишется один DEPRECATED-warning с именами ключей (без значений); их стоит удалить.
+- Новая `POLZA_DAILY_BUDGET_RUB` (float, по умолчанию `0` = без лимита) — дневной лимит по **фактической** `cost_rub` (из ответа API либо оценке по тарифу модели), soft limit, проверяется ДО платного запроса.
+- `--json` у `review`/`followup`: поле `cost_usd` удалено; есть `cost_rub` и новый `cost_is_estimate` (`true` — стоимость посчитана по тарифу модели, а не пришла из API).
+- `health [--ping] --json`: новый блок `pricing` (тариф модели в ₽ + лимиты контекста/ответа) и `usage_today.date` в формате `DD.MM.YYYY`. `--json` теперь работает и **без** `--ping` (раньше флаг молча игнорировался и печатался текст).
+- Актуальный тариф модели всегда показывает `grok-critic health --ping` (или `check_health` в MCP).
 
 ## Зачем
 
@@ -28,12 +36,30 @@ cp .env.example .env        # и заполнить POLZA_API_KEY
 
 ## Быстрый старт
 
+### Bash
+
 ```bash
 grok-critic health                                  # мгновенная проверка конфига (без сети)
 echo "def add(a, b): return a - b" | grok-critic review - --agents 4   # ревью stdin
 grok-critic review src/api.py --agents 16 --focus "security,performance"
 grok-critic followup "Ответь одним предложением: код корректен?" --review-id rev_be618bd19c9f
 ```
+
+### PowerShell
+
+Консоль Windows по умолчанию не в UTF-8 — без этого ломаются `₽`/эмодзи в выводе (CLI сам форсирует `utf-8` для своих потоков, но лучше выставить и в консоли):
+
+```powershell
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+function critic { python -m grok_critic.cli @args }
+
+critic health --ping
+critic review .\src\app.py --agents 4 --focus security --context "что это за код"
+critic followup "почему это блокер?" --review-id rev_xxxxxxxxxxxx
+```
+
+`python -m grok_critic.cli` надёжнее шима `grok-critic.exe` (обычно не на PATH — см. «Требования и установка» выше и `grok-critic doctor`). На Windows зовите `python`, **не** `python3` — `python3` в PATH обычно заглушка Microsoft Store, которая падает без установленного интерпретатора.
 
 ## Справочник команд
 
@@ -45,9 +71,10 @@ grok-critic followup "Ответь одним предложением: код �
 
 Проверка живости без обращения к API (конфиг + доступность store на запись).
 
-- `--ping` — реальный запрос к Polza.AI: статус, баланс ₽, суточные счётчики (`Today: N calls | $X | ₽`).
-- `--json` — машинный вывод в обоих режимах: без `--ping` — `{status: ok|error, mode: offline, issues[]}`, с `--ping` — `{status, model, base_url, issues[], balance_rub, usage_today}`.
-- Выход: `0` ok / `1` degraded (например, Balance API недоступен) / `2` сломано (ключ, store).
+- `--ping` — реальный запрос к Polza.AI: статус, тариф модели в ₽ (`pricing`: вход/выход/кэш за 1M токенов + лимиты контекста и ответа, из `GET /models/{model}`), баланс ₽, суточные счётчики (`Today (16.09.2026): N calls | X ₽ (N errors)`).
+- `--json` — машинный вывод в обоих режимах: без `--ping` — `{status: ok|error, mode: offline, issues[]}`; с `--ping` — `{status, model, base_url, issues[], pricing, balance_rub, usage_today: {date, calls, errors, cost_rub}}` (`date` — `DD.MM.YYYY`). Работает независимо от `--ping` (раньше без `--ping` флаг молча игнорировался).
+- Если тариф модели недоступен (`GET /models/{model}` не ответил) — issue `Тариф модели недоступен (GET /models/<model>)`, `status=degraded`.
+- Выход: `0` ok / `1` degraded (например, Balance API или тариф модели недоступны) / `2` сломано (ключ, store).
 
 ### `grok-critic doctor`
 
@@ -65,13 +92,13 @@ grok-critic followup "Ответь одним предложением: код �
 
 One-shot ревью в stdout. `-` читает stdin (удобно для pipe: `git diff | grok-critic review -`).
 
-| Опция           | Значение                                                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `--context`     | Контекст: проект, язык, назначение (всегда указывайте)                                                                   |
-| `--agents`      | 4 = быстро (~30 с, ~$0.08), 16 = глубоко (~2–4 мин, ~$1.1). Дефолт из конфига (16). Клэмпится в 1–64                     |
-| `--focus`       | Фокус-области через запятую: `"security,performance,SOLID"`                                                              |
-| `--json`        | Машинный вывод: `{success, text, review_id, tokens, cost_usd, cost_rub, …}`                                              |
-| `--json-output` | Попросить у модели строгие JSON-findings `{summary, findings[{severity, title, location, description, recommendation}]}` |
+| Опция           | Значение                                                                                                                                                     |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--context`     | Контекст: проект, язык, назначение (всегда указывайте)                                                                                                       |
+| `--agents`      | 4 = быстро (~30 с, ≈ 9–15 ₽ за файл), 16 = глубоко (~2–4 мин, ≈ 50–60 ₽ за файл ~700–850 строк). Дефолт из конфига (16). Клэмпится в 1–64                    |
+| `--focus`       | Фокус-области через запятую: `"security,performance,SOLID"`                                                                                                  |
+| `--json`        | Машинный вывод: `{success, text, review_id, tokens, cost_rub, cost_is_estimate, …}` (`cost_is_estimate=true` — цена посчитана по тарифу, а не пришла из API) |
+| `--json-output` | Попросить у модели строгие JSON-findings `{summary, findings[{severity, title, location, description, recommendation}]}`                                     |
 
 Примечания:
 
@@ -164,7 +191,7 @@ EOF
 | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `grok-critic: command not found`             | Шим не на PATH этой оболочки — используйте `python -m grok_critic.cli …` или `pip install -e .` заново; `doctor` покажет путь     |
 | `POLZA_API_KEY` / ValidationError при старте | `.env` не найден — задайте `POLZA_ENV_FILE` или запуститесь из директории с `.env`                                                |
-| `Превышен дневной бюджет`                    | Лимит `POLZA_DAILY_BUDGET_USD` исчерпан — увеличить в `.env` (для MCP затем `reload_config_tool`)                                 |
+| `Превышен дневной бюджет`                    | Лимит `POLZA_DAILY_BUDGET_RUB` исчерпан — увеличить в `.env` (для MCP затем `reload_config_tool`)                                 |
 | `review_id не найден`                        | Истёк TTL (24ч с последнего обращения), store очищен вручную или запись вытеснена лимитом 50 файлов — используйте `--from <файл>` |
 | `Контент слишком большой`                    | Уменьшите вход или поднимите `POLZA_MAX_CONTENT_CHARS`                                                                            |
 | Долгое молчание при 16 агентах               | Норма (2–4 мин); heartbeat в CLI не шлётся                                                                                        |

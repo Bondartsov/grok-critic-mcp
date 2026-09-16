@@ -1,8 +1,9 @@
 # FILE: tests/test_api_client.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-API ResponsesClient with mocked HTTP
-#   SCOPE: call(), error handling, parsing, usage/cost, retry deadline, dedup, budget guard
+#   SCOPE: call(), error handling, parsing, usage/cost (₽, tariff estimate), model pricing,
+#          retry deadline, dedup, budget guard
 #   DEPENDS: M-API, M-CONFIG
 #   LINKS: M-API
 # END_MODULE_CONTRACT
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -21,14 +23,16 @@ import grok_critic.api_client as api_mod
 from grok_critic.api_client import (
     MAX_RETRIES,
     CritiqueResult,
+    ModelPricing,
     ResponsesClient,
-    _calculate_cost,
     _extract_text,
     _extract_usage,
     _resolve_effort,
     _resolve_timeout,
     close_client,
+    estimate_cost_rub,
     get_client,
+    get_model_pricing,
     get_usage_stats,
 )
 from grok_critic.config import config
@@ -36,21 +40,55 @@ from grok_critic.config import config
 
 # START_BLOCK_RUNTIME_STATE_RESET
 @pytest.fixture(autouse=True)
-def _reset_api_runtime_state():
-    """Чистит module-level состояние (stats/inflight/semaphore) между тестами."""
+def _reset_api_runtime_state(monkeypatch):
+    """Чистит module-level состояние (stats/inflight/semaphore/кэш тарифа) между тестами.
+
+    PRICING-RUB: разбор ответа без cost_rub зовёт get_model_pricing() — по умолчанию
+    тариф «недоступен» (без сети). Тесты самой get_model_pricing используют
+    импортированную по имени оригинальную функцию, а не атрибут модуля.
+    """
     api_mod._usage_stats.update(
         {
             "date": datetime.date.today().isoformat(),
             "calls": 0,
             "errors": 0,
-            "cost_usd": 0.0,
             "cost_rub": 0.0,
         }
     )
     api_mod._inflight.clear()
     api_mod._semaphore = None
     api_mod._semaphore_limit = None
+    api_mod._pricing_cache = None
+    api_mod._pricing_failure = None
+    monkeypatch.setattr(api_mod, "get_model_pricing", AsyncMock(return_value=None))
     yield
+    api_mod._pricing_cache = None
+    api_mod._pricing_failure = None
+
+
+# Тариф x-ai/grok-4.20-multi-agent из GET /models/{model} (проверено 16.09.2026).
+MODEL_PAYLOAD: dict[str, object] = {
+    "id": "x-ai/grok-4.20-multi-agent",
+    "top_provider": {
+        "pricing": {
+            "prompt_per_million": "147.35000000",
+            "completion_per_million": "294.70000000",
+            "web_search_per_thousand": "589.40000000",
+            "input_cache_read_per_million": "23.57600000",
+            "currency": "RUB",
+        },
+        "context_length": 2000000,
+        "max_completion_tokens": 1800000,
+    },
+}
+
+GROK_PRICING = ModelPricing(
+    input_per_1m_rub=147.35,
+    output_per_1m_rub=294.70,
+    cache_read_per_1m_rub=23.576,
+    context_length=2_000_000,
+    max_output_tokens=1_800_000,
+)
 
 
 # END_BLOCK_RUNTIME_STATE_RESET
@@ -120,6 +158,13 @@ class TestExtractUsage:
         inp, out, total, cost_rub, cached, reasoning = _extract_usage(payload)
         assert cost_rub == 2.50
 
+    @pytest.mark.parametrize("key", ["cost_rub", "cost"])
+    def test_explicit_zero_cost_is_not_missing(self, key) -> None:
+        """Честный 0 из API — это стоимость, а не её отсутствие (не уходит в оценку по тарифу)."""
+        payload = {"usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150, key: 0}}
+        _, _, _, cost_rub, _, _ = _extract_usage(payload)
+        assert cost_rub == 0.0
+
     def test_missing_usage(self) -> None:
         inp, out, total, cost_rub, cached, reasoning = _extract_usage({})
         assert inp == 0
@@ -173,31 +218,210 @@ class TestExtractUsage:
 # END_BLOCK_EXTRACT_USAGE
 
 
-# START_BLOCK_CALCULATE_COST
-class TestCalculateCost:
-    def test_zero_prices(self) -> None:
-        with patch("grok_critic.api_client.config") as mock_cfg:
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
-            assert _calculate_cost(1000, 1000) == 0.0
+# START_BLOCK_COST_ESTIMATE
+class TestEstimateCostRub:
+    """PRICING-RUB: оценка стоимости в ₽ по тарифу — сверка с фактической cost_rub API."""
 
-    def test_with_prices_per_million(self) -> None:
-        with patch("grok_critic.api_client.config") as mock_cfg:
-            # $2.5 за 1М input, $6.6 за 1М output
-            mock_cfg.price_input_per_1m = 2.5
-            mock_cfg.price_output_per_1m = 6.6
-            # 30K input + 10K output = 30/1000*2.5 + 10/1000*6.6 = 0.075 + 0.066 = 0.141
-            cost = _calculate_cost(30_000, 10_000)
-            assert cost == pytest.approx(0.075 + 0.066)
+    def test_matches_real_api_cost(self) -> None:
+        # Реальный запрос: input=619370, cached=477162, output=72853 → API cost_rub=53.67 ₽
+        cost = estimate_cost_rub(619_370, 72_853, 477_162, GROK_PRICING)
+        assert round(cost, 2) == 53.67
+
+    def test_cached_greater_than_input_clamped_to_input(self) -> None:
+        """Аномальный cached > input: кэш — часть входа, тарифицируется не больше input."""
+        cost = estimate_cost_rub(100, 0, 1_000, GROK_PRICING)
+        assert cost >= 0.0
+        assert cost == pytest.approx(100 * 23.576 / 1e6)
+
+    def test_negative_cached_treated_as_zero(self) -> None:
+        cost = estimate_cost_rub(1_000, 0, -5, GROK_PRICING)
+        assert cost == pytest.approx(1_000 * 147.35 / 1e6)
 
     def test_zero_tokens(self) -> None:
+        assert estimate_cost_rub(0, 0, 0, GROK_PRICING) == 0.0
+
+
+# END_BLOCK_COST_ESTIMATE
+
+
+# START_BLOCK_MODEL_PRICING
+def _pricing_http(response: object) -> AsyncMock:
+    """Мок общего httpx-клиента: .get возвращает response (или бросает исключение)."""
+    mock_httpx = AsyncMock()
+    if isinstance(response, BaseException):
+        mock_httpx.get = AsyncMock(side_effect=response)
+    else:
+        mock_httpx.get = AsyncMock(return_value=response)
+    return mock_httpx
+
+
+class TestGetModelPricing:
+    """PRICING-RUB: get_model_pricing — разбор тарифа, отказоустойчивость, TTL-кэш."""
+
+    @pytest.fixture(autouse=True)
+    def _cfg(self):
         with patch("grok_critic.api_client.config") as mock_cfg:
-            mock_cfg.price_input_per_1m = 2.5
-            mock_cfg.price_output_per_1m = 6.6
-            assert _calculate_cost(0, 0) == 0.0
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.api_key = SecretStr("secret-key-xyz")
+            yield mock_cfg
+
+    async def test_parses_rub_from_top_provider(self) -> None:
+        mock_httpx = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            pricing = await get_model_pricing()
+        assert pricing == GROK_PRICING
+        url = mock_httpx.get.call_args.args[0]
+        assert url == "https://polza.ai/api/v1/models/x-ai/grok-4.20-multi-agent"
+        headers = mock_httpx.get.call_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer secret-key-xyz"
+
+    async def test_fallback_to_first_provider(self) -> None:
+        payload = {
+            "id": "m",
+            "top_provider": {"name": "x"},
+            "providers": [
+                {
+                    "pricing": {
+                        "prompt_per_million": "100.5",
+                        "completion_per_million": "200",
+                        "input_cache_read_per_million": "10",
+                        "currency": "RUB",
+                    },
+                    "context_length": 1000,
+                    "max_completion_tokens": 500,
+                }
+            ],
+        }
+        mock_httpx = _pricing_http(httpx.Response(200, json=payload))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            pricing = await get_model_pricing()
+        assert pricing == ModelPricing(100.5, 200.0, 10.0, 1000, 500)
+
+    async def test_non_rub_currency_returns_none(self, caplog) -> None:
+        payload = {
+            "top_provider": {
+                "pricing": {"prompt_per_million": "2.6", "completion_per_million": "6.6", "currency": "USD"}
+            }
+        }
+        mock_httpx = _pricing_http(httpx.Response(200, json=payload))
+        with caplog.at_level(logging.WARNING, logger="grok-critic"), patch(
+            "grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx
+        ):
+            assert await get_model_pricing() is None
+        assert "currency" in caplog.text
+
+    async def test_http_500_returns_none(self, caplog) -> None:
+        mock_httpx = _pricing_http(httpx.Response(500, text="boom"))
+        with caplog.at_level(logging.WARNING, logger="grok-critic"), patch(
+            "grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx
+        ):
+            assert await get_model_pricing() is None
+        assert "secret-key-xyz" not in caplog.text
+
+    async def test_network_error_returns_none(self, caplog) -> None:
+        mock_httpx = _pricing_http(httpx.ConnectError("refused"))
+        with caplog.at_level(logging.WARNING, logger="grok-critic"), patch(
+            "grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx
+        ):
+            assert await get_model_pricing() is None
+        assert "ConnectError" in caplog.text
+        assert "secret-key-xyz" not in caplog.text
+
+    async def test_broken_json_returns_none(self) -> None:
+        mock_httpx = _pricing_http(httpx.Response(200, text="<html>not json"))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            assert await get_model_pricing() is None
+
+    async def test_malformed_price_returns_none(self) -> None:
+        payload = {"top_provider": {"pricing": {"prompt_per_million": "abc", "completion_per_million": "1", "currency": "RUB"}}}
+        mock_httpx = _pricing_http(httpx.Response(200, json=payload))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            assert await get_model_pricing() is None
+
+    async def test_cache_hit_skips_request(self) -> None:
+        mock_httpx = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            first = await get_model_pricing()
+            second = await get_model_pricing()
+        assert first == second == GROK_PRICING
+        assert mock_httpx.get.await_count == 1
+
+    async def test_force_bypasses_cache(self) -> None:
+        mock_httpx = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            await get_model_pricing()
+            await get_model_pricing(force=True)
+        assert mock_httpx.get.await_count == 2
+
+    async def test_expired_ttl_refetches(self) -> None:
+        mock_httpx = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            await get_model_pricing()
+            assert api_mod._pricing_cache is not None
+            ts, key, cached = api_mod._pricing_cache
+            # Кэш «почти истёк» — ещё валиден, запроса нет.
+            api_mod._pricing_cache = (ts - api_mod.PRICING_CACHE_TTL_SECONDS + 60, key, cached)
+            await get_model_pricing()
+            assert mock_httpx.get.await_count == 1
+            # Кэш старше TTL — повторный запрос.
+            api_mod._pricing_cache = (ts - api_mod.PRICING_CACHE_TTL_SECONDS - 1, key, cached)
+            await get_model_pricing()
+        assert mock_httpx.get.await_count == 2
+
+    async def test_failure_cached_briefly(self) -> None:
+        """Сбой кэшируется на PRICING_FAILURE_TTL_SECONDS: повтор без сети; force обходит; успех сбрасывает отметку."""
+        failing = _pricing_http(httpx.Response(503, text="down"))
+        ok = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=failing):
+            assert await get_model_pricing() is None
+            assert await get_model_pricing() is None
+        assert failing.get.await_count == 1
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=ok):
+            assert await get_model_pricing() is None  # окно неудачи ещё действует
+            assert ok.get.await_count == 0
+            assert await get_model_pricing(force=True) == GROK_PRICING
+        assert api_mod._pricing_failure is None
+
+    async def test_failure_window_expires(self) -> None:
+        failing = _pricing_http(httpx.Response(503, text="down"))
+        ok = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=failing):
+            assert await get_model_pricing() is None
+        assert api_mod._pricing_failure is not None
+        ts, key = api_mod._pricing_failure
+        api_mod._pricing_failure = (ts - api_mod.PRICING_FAILURE_TTL_SECONDS - 1, key)
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=ok):
+            assert await get_model_pricing() == GROK_PRICING
+        assert ok.get.await_count == 1
+
+    async def test_network_exception_cached_briefly(self) -> None:
+        failing = _pricing_http(httpx.ConnectError("boom"))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=failing):
+            assert await get_model_pricing() is None
+            assert await get_model_pricing() is None
+        assert failing.get.await_count == 1
+
+    async def test_failure_for_other_model_does_not_block(self, _cfg) -> None:
+        failing = _pricing_http(httpx.Response(503, text="down"))
+        ok = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=failing):
+            assert await get_model_pricing() is None
+        _cfg.model = "x-ai/other-model"
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=ok):
+            assert await get_model_pricing() == GROK_PRICING
+        assert ok.get.await_count == 1
+
+    async def test_model_change_invalidates_cache(self, _cfg) -> None:
+        mock_httpx = _pricing_http(httpx.Response(200, json=MODEL_PAYLOAD))
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock, return_value=mock_httpx):
+            await get_model_pricing()
+            _cfg.model = "other/model"
+            await get_model_pricing()
+        assert mock_httpx.get.await_count == 2
 
 
-# END_BLOCK_CALCULATE_COST
+# END_BLOCK_MODEL_PRICING
 
 
 # START_BLOCK_CRITIQUE_RESULT
@@ -215,7 +439,9 @@ class TestCritiqueResult:
         assert r.input_tokens == 0
         assert r.output_tokens == 0
         assert r.total_tokens == 0
-        assert r.cost_usd == 0.0
+        assert r.cost_rub is None
+        assert r.cost_is_estimate is False
+        assert not hasattr(r, "cost_usd")
         assert r.review_id == ""
         assert r.error == ""
 
@@ -257,14 +483,12 @@ class TestResponsesClientCall:
             mock_cfg.api_key = SecretStr("test-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             mock_cfg.timeout_low = 90
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
-            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.daily_budget_rub = 0.0
             mock_cfg.max_concurrent_requests = 2
             return ResponsesClient()
 
@@ -501,35 +725,49 @@ class TestResponsesClientCall:
             assert result.review_id.startswith("rev_")
             assert len(result.review_id) == 16
 
-    async def test_cost_calculated(self, client: ResponsesClient) -> None:
-        with patch.object(client, "_api_key", "test-key"), \
-             patch("grok_critic.api_client.config") as mock_cfg:
-            mock_cfg.price_input_per_1m = 10.0   # $10 per 1M → 1000 tokens = $0.01
-            mock_cfg.price_output_per_1m = 30.0  # $30 per 1M → 500 tokens = $0.015
-            mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
-            mock_cfg.timeout_seconds = 30
-            mock_cfg.timeout_low = 90
-            mock_cfg.timeout_mid = 150
-            mock_cfg.max_retries = 2
-            mock_cfg.retry_backoff_base = 2.0
-            mock_cfg.retry_deadline_seconds = 0.0
-            mock_cfg.daily_budget_usd = 0.0
-            mock_cfg.max_concurrent_requests = 2
+    async def _call_with_usage(self, client: ResponsesClient, usage: dict[str, object]):
+        mock_response = httpx.Response(200, json={"output_text": "ok", "usage": usage})
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            return await client.call("test")
 
-            mock_response = httpx.Response(
-                200,
-                json={
-                    "output_text": "ok",
-                    "usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
-                },
-            )
-            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
-                mock_httpx = AsyncMock()
-                mock_httpx.post = AsyncMock(return_value=mock_response)
-                mock_gc.return_value = mock_httpx
-                result = await client.call("test")
-                assert result.cost_usd == pytest.approx(0.01 + 0.015)
+    async def test_cost_rub_from_api_is_not_estimate(self, client: ResponsesClient, monkeypatch) -> None:
+        """PRICING-RUB: фактическая cost_rub из API приоритетна, тариф даже не запрашивается."""
+        pricing_mock = AsyncMock(return_value=GROK_PRICING)
+        monkeypatch.setattr(api_mod, "get_model_pricing", pricing_mock)
+        result = await self._call_with_usage(
+            client,
+            {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500, "cost_rub": 53.67},
+        )
+        assert result.cost_rub == 53.67
+        assert result.cost_is_estimate is False
+        pricing_mock.assert_not_awaited()
+
+    async def test_cost_estimated_by_tariff_when_api_has_no_cost(self, client: ResponsesClient, monkeypatch) -> None:
+        monkeypatch.setattr(api_mod, "get_model_pricing", AsyncMock(return_value=GROK_PRICING))
+        result = await self._call_with_usage(
+            client,
+            {
+                "input_tokens": 619_370,
+                "output_tokens": 72_853,
+                "total_tokens": 692_223,
+                "input_tokens_details": {"cached_tokens": 477_162},
+            },
+        )
+        assert result.cost_is_estimate is True
+        assert result.cost_rub is not None
+        assert round(result.cost_rub, 2) == 53.67
+
+    async def test_cost_none_without_api_cost_and_tariff(self, client: ResponsesClient) -> None:
+        # autouse-фикстура: get_model_pricing → None (тариф недоступен)
+        result = await self._call_with_usage(
+            client, {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500}
+        )
+        assert result.success
+        assert result.cost_rub is None
+        assert result.cost_is_estimate is False
 
 
 # END_BLOCK_CLIENT_CALL
@@ -584,14 +822,12 @@ class TestPromptCacheKey:
             mock_cfg.api_key = SecretStr("test-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             mock_cfg.timeout_low = 90
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
-            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.daily_budget_rub = 0.0
             mock_cfg.max_concurrent_requests = 2
             return ResponsesClient()
 
@@ -676,14 +912,12 @@ class TestClientFeatures:
             mock_cfg.api_key = SecretStr("test-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             mock_cfg.timeout_low = 90
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
-            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.daily_budget_rub = 0.0
             mock_cfg.max_concurrent_requests = 2
             return ResponsesClient()
 
@@ -792,14 +1026,12 @@ class TestInFlightDedup:
             mock_cfg.api_key = SecretStr("test-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.timeout_seconds = 30
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             mock_cfg.timeout_low = 90
             mock_cfg.timeout_mid = 150
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
-            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.daily_budget_rub = 0.0
             mock_cfg.max_concurrent_requests = 4
             return ResponsesClient()
 
@@ -915,14 +1147,12 @@ class TestInFlightDedup:
                 mock_cfg.api_key = SecretStr("test-key")
                 mock_cfg.model = model
                 mock_cfg.timeout_seconds = 30
-                mock_cfg.price_input_per_1m = 0.0
-                mock_cfg.price_output_per_1m = 0.0
                 mock_cfg.timeout_low = 90
                 mock_cfg.timeout_mid = 150
                 mock_cfg.max_retries = 2
                 mock_cfg.retry_backoff_base = 2.0
                 mock_cfg.retry_deadline_seconds = 0.0
-                mock_cfg.daily_budget_usd = 0.0
+                mock_cfg.daily_budget_rub = 0.0
                 mock_cfg.max_concurrent_requests = 4
                 return ResponsesClient()
 
@@ -957,14 +1187,12 @@ def _patch_runtime_config(**overrides: object):
         "api_key": SecretStr("test-key"),
         "model": "x-ai/grok-4.20-multi-agent",
         "timeout_seconds": 30,
-        "price_input_per_1m": 0.0,
-        "price_output_per_1m": 0.0,
         "timeout_low": 90,
         "timeout_mid": 150,
         "max_retries": 2,
         "retry_backoff_base": 2.0,
         "retry_deadline_seconds": 0.0,
-        "daily_budget_usd": 0.0,
+        "daily_budget_rub": 0.0,
         "max_concurrent_requests": 2,
     }
     values.update(overrides)
@@ -1173,7 +1401,7 @@ class TestInFlightConcurrency:
     async def test_joiner_not_rejected_by_budget_new_request_rejected(self) -> None:
         """I5: бюджет исчерпан во время полёта → joiner получает результат,
         новый запрос (другой ключ) отклоняется без post."""
-        patcher = _patch_runtime_config(daily_budget_usd=0.01)
+        patcher = _patch_runtime_config(daily_budget_rub=10.0)
         try:
             client = ResponsesClient()
             started = asyncio.Event()
@@ -1194,12 +1422,13 @@ class TestInFlightConcurrency:
                 owner = asyncio.create_task(client.call("same"))
                 await asyncio.wait_for(started.wait(), 1)
                 # Имитация: бюджет исчерпан, пока первый запрос летит.
-                api_mod._usage_stats["cost_usd"] = 0.5
+                api_mod._usage_stats["cost_rub"] = 50.0
 
                 joiner = asyncio.create_task(client.call("same"))
                 rejected = await asyncio.wait_for(client.call("fresh"), 1)
                 assert not rejected.success
-                assert "Превышен дневной бюджет" in rejected.error
+                assert "Превышен дневной бюджет: 50,00 ₽ из 10,00 ₽" in rejected.error
+                assert "POLZA_DAILY_BUDGET_RUB" in rejected.error
                 assert prompts == ["same"]
 
                 release.set()
@@ -1298,10 +1527,10 @@ class TestBudgetGuard:
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
             mock_cfg.max_concurrent_requests = 2
-            mock_cfg.daily_budget_usd = 0.01
+            mock_cfg.daily_budget_rub = 500.0
 
             api_mod._usage_stats["date"] = datetime.date.today().isoformat()
-            api_mod._usage_stats["cost_usd"] = 0.5  # уже потрачено больше лимита
+            api_mod._usage_stats["cost_rub"] = 1234.567  # уже потрачено больше лимита
 
             client = ResponsesClient()
             with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
@@ -1309,8 +1538,39 @@ class TestBudgetGuard:
                 mock_gc.return_value = mock_httpx
                 result = await client.call("test")
                 assert not result.success
-                assert "бюджет" in result.error.lower()
+                assert result.error == (
+                    "Превышен дневной бюджет: 1 234,57 ₽ из 500,00 ₽. "
+                    "Увеличьте POLZA_DAILY_BUDGET_RUB или дождитесь следующего дня."
+                )
+                assert "$" not in result.error
                 mock_httpx.post.assert_not_called()
+
+    async def test_budget_below_limit_allows_call(self) -> None:
+        with patch("grok_critic.api_client.config") as mock_cfg:
+            mock_cfg.base_url = "https://polza.ai/api/v1"
+            mock_cfg.api_key = SecretStr("test-key")
+            mock_cfg.model = "x-ai/grok-4.20-multi-agent"
+            mock_cfg.timeout_seconds = 30
+            mock_cfg.timeout_low = 90
+            mock_cfg.timeout_mid = 150
+            mock_cfg.max_retries = 2
+            mock_cfg.retry_backoff_base = 2.0
+            mock_cfg.retry_deadline_seconds = 0.0
+            mock_cfg.max_concurrent_requests = 2
+            mock_cfg.daily_budget_rub = 500.0
+
+            api_mod._usage_stats["date"] = datetime.date.today().isoformat()
+            api_mod._usage_stats["cost_rub"] = 499.99
+
+            client = ResponsesClient()
+            mock_response = httpx.Response(200, json={"output_text": "ok"})
+            with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+                mock_httpx = AsyncMock()
+                mock_httpx.post = AsyncMock(return_value=mock_response)
+                mock_gc.return_value = mock_httpx
+                result = await client.call("test")
+                assert result.success
+                mock_httpx.post.assert_awaited_once()
 
     async def test_budget_disabled_by_default(self) -> None:
         with patch("grok_critic.api_client.config") as mock_cfg:
@@ -1324,10 +1584,10 @@ class TestBudgetGuard:
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
             mock_cfg.max_concurrent_requests = 2
-            mock_cfg.daily_budget_usd = 0.0  # выключен
+            mock_cfg.daily_budget_rub = 0.0  # выключен
 
             api_mod._usage_stats["date"] = datetime.date.today().isoformat()
-            api_mod._usage_stats["cost_usd"] = 100.0  # много потрачено, но лимита нет
+            api_mod._usage_stats["cost_rub"] = 100_000.0  # много потрачено, но лимита нет
 
             client = ResponsesClient()
             mock_response = httpx.Response(200, json={"output_text": "ok"})
@@ -1358,10 +1618,8 @@ class TestUsageStats:
             mock_cfg.max_retries = 2
             mock_cfg.retry_backoff_base = 2.0
             mock_cfg.retry_deadline_seconds = 0.0
-            mock_cfg.daily_budget_usd = 0.0
+            mock_cfg.daily_budget_rub = 0.0
             mock_cfg.max_concurrent_requests = 2
-            mock_cfg.price_input_per_1m = 2.6
-            mock_cfg.price_output_per_1m = 6.6
             return ResponsesClient()
 
     async def test_success_recorded(self, client: ResponsesClient) -> None:
@@ -1369,7 +1627,9 @@ class TestUsageStats:
             200,
             json={
                 "output_text": "ok",
-                "usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500},
+                "usage": {
+                    "input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500, "cost_rub": 1.25,
+                },
             },
         )
         with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
@@ -1381,7 +1641,8 @@ class TestUsageStats:
         stats = get_usage_stats()
         assert stats["calls"] == 1
         assert stats["errors"] == 0
-        assert stats["cost_usd"] == pytest.approx((1000 / 1e6 * 2.6) + (500 / 1e6 * 6.6))
+        assert stats["cost_rub"] == pytest.approx(1.25)
+        assert "cost_usd" not in stats
 
     async def test_error_recorded(self, client: ResponsesClient) -> None:
         mock_response = httpx.Response(500, text="boom")
@@ -1398,5 +1659,59 @@ class TestUsageStats:
         assert stats["calls"] == 0
         assert stats["errors"] == 1
 
+    async def test_estimated_cost_recorded(self, client: ResponsesClient, monkeypatch) -> None:
+        """PRICING-RUB: оценка по тарифу тоже учитывается в суточной cost_rub."""
+        monkeypatch.setattr(api_mod, "get_model_pricing", AsyncMock(return_value=GROK_PRICING))
+        mock_response = httpx.Response(
+            200,
+            json={"output_text": "ok", "usage": {"input_tokens": 1_000_000, "output_tokens": 0, "total_tokens": 1_000_000}},
+        )
+        with patch("grok_critic.api_client.get_client", new_callable=AsyncMock) as mock_gc:
+            mock_httpx = AsyncMock()
+            mock_httpx.post = AsyncMock(return_value=mock_response)
+            mock_gc.return_value = mock_httpx
+            await client.call("test")
+        assert get_usage_stats()["cost_rub"] == pytest.approx(147.35)
+
+    def test_date_in_dd_mm_yyyy(self) -> None:
+        stats = get_usage_stats()
+        assert stats["date"] == datetime.date.today().strftime("%d.%m.%Y")
+        assert set(stats) == {"date", "calls", "errors", "cost_rub"}
+
+    def test_rollover_on_date_change(self) -> None:
+        api_mod._usage_stats.update({"date": "2000-01-01", "calls": 7, "errors": 3, "cost_rub": 99.0})
+        stats = get_usage_stats()
+        assert stats["calls"] == 0
+        assert stats["errors"] == 0
+        assert stats["cost_rub"] == 0.0
+        assert stats["date"] == datetime.date.today().strftime("%d.%m.%Y")
+        # внутренний ключ сброса — ISO, наружу не утекает
+        assert api_mod._usage_stats["date"] == datetime.date.today().isoformat()
+
+    def test_same_day_keeps_counters(self) -> None:
+        api_mod._usage_stats.update({"calls": 2, "cost_rub": 10.5})
+        stats = get_usage_stats()
+        assert stats["calls"] == 2
+        assert stats["cost_rub"] == 10.5
+
 
 # END_BLOCK_USAGE_STATS
+
+
+# START_BLOCK_FORMAT_RUB
+class TestFormatRub:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0,00 ₽"),
+            (53.67, "53,67 ₽"),
+            (23.576, "23,58 ₽"),
+            (128760.16, "128 760,16 ₽"),
+            (1234567.891, "1 234 567,89 ₽"),
+        ],
+    )
+    def test_format(self, value: float, expected: str) -> None:
+        assert api_mod.format_rub(value) == expected
+
+
+# END_BLOCK_FORMAT_RUB

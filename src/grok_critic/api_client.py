@@ -1,11 +1,24 @@
 # FILE: src/grok_critic/api_client.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Async HTTP client for the Polza.AI Responses API
 #   SCOPE: Build and send requests, parse responses, handle errors, track usage/cost
 #   DEPENDS: M-CONFIG, httpx
 #   LINKS: M-API
 # END_MODULE_CONTRACT
+# START_CHANGE_SUMMARY
+#   PRICING-RUB: удалены _calculate_cost и CritiqueResult.cost_usd (оценка в $ по
+#     устаревшим ценам из .env). Стоимость — только в ₽: cost_rub из ответа API,
+#     иначе оценка estimate_cost_rub() по тарифу get_model_pricing() (GET /models/{model},
+#     кэш 3600 с) с флагом cost_is_estimate. Суточная статистика и бюджет — в ₽
+#     (daily_budget_rub); get_usage_stats()["date"] — DD.MM.YYYY. format_rub() —
+#     единый денежный формат «128 760,16 ₽» (server/cli переиспользуют).
+#   PRICING-CACHE: get_model_pricing() дополнительно кэширует НЕУДАЧУ запроса на
+#     PRICING_FAILURE_TTL_SECONDS=60 с (_pricing_failure, ключ base_url|model) —
+#     без этого при недоступном /models каждый ответ без cost_rub ждал бы новый GET
+#     до PRICING_REQUEST_TIMEOUT_SECONDS=10 с; force=True обходит и кэш успеха, и кэш
+#     неудачи; успешный запрос сбрасывает отметку неудачи (_pricing_failure = None).
+# END_CHANGE_SUMMARY
 
 from __future__ import annotations
 
@@ -15,6 +28,7 @@ import functools
 import hashlib
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -33,27 +47,47 @@ MAX_RETRIES = 2
 RETRY_BACKOFF_BASE = 2.0  # seconds
 
 
+# START_BLOCK_MONEY_FORMAT
+def format_rub(value: float) -> str:
+    """Денежный формат ₽ для человекочитаемого вывода: 128760.16 → «128 760,16 ₽».
+
+    Пробел — разделитель тысяч, запятая — десятичный, всегда 2 знака.
+    Единая точка правды для api_client/server/cli (в JSON суммы остаются числами).
+    """
+    return f"{value:,.2f}".replace(",", " ").replace(".", ",") + " ₽"
+
+
+# END_BLOCK_MONEY_FORMAT
+
+
 # START_BLOCK_RUNTIME_GUARDS
 # FEAT-BUDGET: суточная статистика использования (сбрасывается при смене даты).
+# Внутренний ключ "date" — ISO (YYYY-MM-DD), только для сравнения при rollover;
+# наружу get_usage_stats() отдаёт дату в формате DD.MM.YYYY.
 _usage_stats: dict[str, Any] = {
     "date": "",
     "calls": 0,
     "errors": 0,
-    "cost_usd": 0.0,
     "cost_rub": 0.0,
 }
 
+USER_DATE_FORMAT = "%d.%m.%Y"
+
 
 def get_usage_stats() -> dict[str, Any]:
-    """Копия статистики за сегодня: вызовы, ошибки, стоимость. Сброс по смене даты."""
-    today = datetime.date.today().isoformat()
-    if _usage_stats["date"] != today:
-        _usage_stats["date"] = today
+    """Копия статистики за сегодня: вызовы, ошибки, стоимость в ₽. Сброс по смене даты.
+
+    "date" в возвращаемой копии — DD.MM.YYYY.
+    """
+    today = datetime.date.today()
+    if _usage_stats["date"] != today.isoformat():
+        _usage_stats["date"] = today.isoformat()
         _usage_stats["calls"] = 0
         _usage_stats["errors"] = 0
-        _usage_stats["cost_usd"] = 0.0
         _usage_stats["cost_rub"] = 0.0
-    return dict(_usage_stats)
+    snapshot = dict(_usage_stats)
+    snapshot["date"] = today.strftime(USER_DATE_FORMAT)
+    return snapshot
 
 
 def _record_result(result: CritiqueResult) -> None:
@@ -61,7 +95,6 @@ def _record_result(result: CritiqueResult) -> None:
     get_usage_stats()  # триггерим rollover по дате
     if result.success:
         _usage_stats["calls"] += 1
-        _usage_stats["cost_usd"] += result.cost_usd
         _usage_stats["cost_rub"] += result.cost_rub or 0.0
     else:
         _usage_stats["errors"] += 1
@@ -131,8 +164,9 @@ class CritiqueResult:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    cost_usd: float = 0.0
-    cost_rub: float | None = None  # Actual cost from Polza.AI API (usage.cost_rub)
+    # Стоимость в ₽: из ответа API (usage.cost_rub) или оценка по тарифу модели.
+    cost_rub: float | None = None
+    cost_is_estimate: bool = False  # True — cost_rub рассчитан по тарифу, а не пришёл из API
     cached_tokens: int = 0  # Tokens served from cache (prompt_tokens_details.cached_tokens)
     reasoning_tokens: int = 0  # Reasoning tokens (completion_tokens_details.reasoning_tokens) — most expensive part
     review_id: str = ""
@@ -215,7 +249,10 @@ def _build_input_messages(
 # START_BLOCK_USAGE_EXTRACTION
 def _extract_usage(payload: dict[str, Any]) -> tuple[int, int, int, float | None, int, int]:
     usage = payload.get("usage", {})
-    cost_rub = usage.get("cost_rub") or usage.get("cost")
+    # Явная проверка на None, не `or`: честные cost_rub=0 не должны уходить в оценку по тарифу.
+    cost_rub = usage.get("cost_rub")
+    if cost_rub is None:
+        cost_rub = usage.get("cost")
     # cached_tokens can be in prompt_tokens_details or input_tokens_details
     in_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     cached_tokens = in_details.get("cached_tokens", 0) or 0
@@ -235,14 +272,40 @@ def _extract_usage(payload: dict[str, Any]) -> tuple[int, int, int, float | None
 # END_BLOCK_USAGE_EXTRACTION
 
 
-# START_BLOCK_COST_CALCULATION
-def _calculate_cost(input_tokens: int, output_tokens: int) -> float:
-    return (input_tokens / 1_000_000 * config.price_input_per_1m) + (
-        output_tokens / 1_000_000 * config.price_output_per_1m
-    )
+# START_BLOCK_COST_ESTIMATE
+@dataclass(frozen=True)
+class ModelPricing:
+    """Тариф модели Polza.AI в ₽ за 1M токенов + лимиты модели."""
+
+    input_per_1m_rub: float
+    output_per_1m_rub: float
+    cache_read_per_1m_rub: float
+    context_length: int | None
+    max_output_tokens: int | None
 
 
-# END_BLOCK_COST_CALCULATION
+def estimate_cost_rub(
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int,
+    pricing: ModelPricing,
+) -> float:
+    """Оценка стоимости запроса в ₽ по тарифу (сверено с фактической cost_rub API).
+
+    Некэшированный вход × input + кэшированный вход × cache_read + выход × output
+    (reasoning-токены входят в output_tokens). Кэш — часть входа: аномальный
+    cached > input обрезается до input, чтобы не тарифицировать несуществующие токены.
+    """
+    cached = min(max(cached_tokens, 0), max(input_tokens, 0))
+    uncached = max(input_tokens - cached, 0)
+    return (
+        uncached * pricing.input_per_1m_rub
+        + cached * pricing.cache_read_per_1m_rub
+        + output_tokens * pricing.output_per_1m_rub
+    ) / 1_000_000
+
+
+# END_BLOCK_COST_ESTIMATE
 
 
 # START_BLOCK_PERSISTENT_CLIENT
@@ -274,6 +337,147 @@ async def close_client() -> None:
 
 
 # END_BLOCK_PERSISTENT_CLIENT
+
+
+# START_BLOCK_MODEL_PRICING
+PRICING_CACHE_TTL_SECONDS = 3600.0
+PRICING_REQUEST_TIMEOUT_SECONDS = 10.0
+PRICING_FAILURE_TTL_SECONDS = 60.0
+# Кэш тарифа на процесс: (monotonic_ts, ключ base_url|model, тариф).
+# Ключ в кэше — чтобы reload_config со сменой модели не отдавал чужой тариф.
+_pricing_cache: tuple[float, str, ModelPricing] | None = None
+# Кэш НЕУДАЧИ: (monotonic_ts, ключ). Успех живёт PRICING_CACHE_TTL_SECONDS, сбой —
+# PRICING_FAILURE_TTL_SECONDS: без него при недоступном /models каждый ответ без
+# cost_rub ждал бы новый GET до 10 с, а долгий кэш сбоя прятал бы тариф на час.
+_pricing_failure: tuple[float, str] | None = None
+
+
+def _parse_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_model_pricing(data: Any) -> ModelPricing | None:
+    """Разбор ответа GET /models/{model}: top_provider.pricing → fallback providers[0].pricing."""
+    if not isinstance(data, dict):
+        logger.warning(
+            "[APIClient][get_model_pricing][PRICING] unexpected payload type: %s", type(data).__name__
+        )
+        return None
+    top_raw = data.get("top_provider")
+    top: dict[str, Any] = top_raw if isinstance(top_raw, dict) else {}
+    providers = data.get("providers")
+    first: dict[str, Any] = (
+        providers[0]
+        if isinstance(providers, list) and providers and isinstance(providers[0], dict)
+        else {}
+    )
+    source = top if isinstance(top.get("pricing"), dict) else first
+    pricing = source.get("pricing")
+    if not isinstance(pricing, dict):
+        logger.warning("[APIClient][get_model_pricing][PRICING] no pricing in model payload")
+        return None
+    currency = str(pricing.get("currency", "")).upper()
+    if currency != "RUB":
+        logger.warning(
+            "[APIClient][get_model_pricing][PRICING] unsupported currency=%r (expected RUB)", currency
+        )
+        return None
+    try:
+        input_price = float(pricing["prompt_per_million"])
+        output_price = float(pricing["completion_per_million"])
+        # Нет отдельной цены чтения кэша — считаем кэш по цене обычного входа (консервативно).
+        cache_raw = pricing.get("input_cache_read_per_million")
+        cache_price = float(cache_raw) if cache_raw is not None else input_price
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning(
+            "[APIClient][get_model_pricing][PRICING] malformed pricing fields: %s", type(exc).__name__
+        )
+        return None
+    return ModelPricing(
+        input_per_1m_rub=input_price,
+        output_per_1m_rub=output_price,
+        cache_read_per_1m_rub=cache_price,
+        context_length=_parse_int(source.get("context_length", top.get("context_length"))),
+        max_output_tokens=_parse_int(
+            source.get("max_completion_tokens", top.get("max_completion_tokens"))
+        ),
+    )
+
+
+async def get_model_pricing(force: bool = False) -> ModelPricing | None:
+    """Тариф текущей модели в ₽ из Polza.AI (GET {base_url}/models/{model}).
+
+    Кэш на процесс с TTL PRICING_CACHE_TTL_SECONDS; force=True — запрос в обход кэша.
+    НИКОГДА не бросает исключение: любая ошибка (сеть, статус != 200, формат,
+    валюта != RUB) → None + warning. API-ключ в лог не попадает.
+    """
+    global _pricing_cache, _pricing_failure
+    # START_BLOCK_PRICING_CACHE
+    cache_key = f"{config.base_url}|{config.model}"
+    cached = _pricing_cache
+    if (
+        not force
+        and cached is not None
+        and cached[1] == cache_key
+        and time.monotonic() - cached[0] < PRICING_CACHE_TTL_SECONDS
+    ):
+        logger.debug("[APIClient][get_model_pricing][CACHE] hit model=%s", config.model)
+        return cached[2]
+    failure = _pricing_failure
+    if (
+        not force
+        and failure is not None
+        and failure[1] == cache_key
+        and time.monotonic() - failure[0] < PRICING_FAILURE_TTL_SECONDS
+    ):
+        logger.debug(
+            "[APIClient][get_model_pricing][CACHE] recent failure, fetch skipped model=%s", config.model
+        )
+        return None
+    # END_BLOCK_PRICING_CACHE
+
+    # START_BLOCK_PRICING_FETCH
+    url = f"{config.base_url}/models/{config.model}"
+    try:
+        api_key = config.api_key.get_secret_value()
+        client = await get_client()
+        resp = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(PRICING_REQUEST_TIMEOUT_SECONDS),
+        )
+        if resp.status_code != 200:
+            logger.warning(
+                "[APIClient][get_model_pricing][FETCH] model=%s HTTP %s",
+                config.model, resp.status_code,
+            )
+            _pricing_failure = (time.monotonic(), cache_key)
+            return None
+        pricing = _parse_model_pricing(resp.json())
+    except Exception as exc:
+        logger.warning(
+            "[APIClient][get_model_pricing][FETCH] model=%s failed: %s",
+            config.model, type(exc).__name__,
+        )
+        _pricing_failure = (time.monotonic(), cache_key)
+        return None
+    if pricing is None:
+        _pricing_failure = (time.monotonic(), cache_key)
+        return None
+    _pricing_cache = (time.monotonic(), cache_key, pricing)
+    _pricing_failure = None
+    logger.info(
+        "[APIClient][get_model_pricing][FETCH] model=%s input=%.2f output=%.2f cache_read=%.2f RUB/1M",
+        config.model, pricing.input_per_1m_rub, pricing.output_per_1m_rub, pricing.cache_read_per_1m_rub,
+    )
+    return pricing
+    # END_BLOCK_PRICING_FETCH
+
+
+# END_BLOCK_MODEL_PRICING
 
 
 # START_BLOCK_RESPONSES_CLIENT
@@ -342,20 +546,20 @@ class ResponsesClient:
         # END_BLOCK_INFLIGHT_DEDUP
 
     def _budget_exceeded_result(self, agent_count: int) -> CritiqueResult | None:
-        """FEAT-BUDGET: результат-отказ при исчерпанном дневном бюджете, иначе None."""
-        budget = config.daily_budget_usd
-        if isinstance(budget, (int, float)) and budget > 0:
-            spent = get_usage_stats()["cost_usd"]
+        """FEAT-BUDGET: результат-отказ при исчерпанном дневном бюджете в ₽, иначе None."""
+        budget = config.daily_budget_rub
+        if isinstance(budget, (int, float)) and not isinstance(budget, bool) and budget > 0:
+            spent = get_usage_stats()["cost_rub"]
             if spent >= budget:
                 logger.warning(
-                    "[APIClient][call][BUDGET] Exceeded: spent=$%.4f limit=$%.2f", spent, budget
+                    "[APIClient][call][BUDGET] Exceeded: spent=%.2f RUB limit=%.2f RUB", spent, budget
                 )
                 return CritiqueResult(
                     text="", model=self._model, agent_count=agent_count,
                     effort=_resolve_effort(agent_count),
                     error=(
-                        f"Превышен дневной бюджет: ${spent:.4f} из ${budget:.2f}. "
-                        "Увеличьте POLZA_DAILY_BUDGET_USD или дождитесь следующего дня."
+                        f"Превышен дневной бюджет: {format_rub(spent)} из {format_rub(budget)}. "
+                        "Увеличьте POLZA_DAILY_BUDGET_RUB или дождитесь следующего дня."
                     ),
                 )
         return None
@@ -378,9 +582,9 @@ class ResponsesClient:
             # I5: бюджет проверяется непосредственно перед тратой — после получения
             # слота и до HTTP. Присоединившиеся к уже летящему запросу этой проверки
             # не проходят и бюджетом не отклоняются.
-            # POLZA_DAILY_BUDGET_USD — SOFT limit: стоимость multi-agent запроса заранее
-            # неизвестна и учитывается только по завершении, поэтому возможен перерасход
-            # не более чем на max_concurrent_requests одновременно выполняющихся запросов.
+            # POLZA_DAILY_BUDGET_RUB — SOFT limit (₽): стоимость multi-agent запроса заранее
+            # неизвестна и учитывается (cost_rub) только по завершении, поэтому возможен
+            # перерасход не более чем на max_concurrent_requests одновременно выполняющихся запросов.
             rejected = self._budget_exceeded_result(agent_count)
             if rejected is not None:
                 return rejected
@@ -607,7 +811,22 @@ class ResponsesClient:
             )
 
         input_tokens, output_tokens, total_tokens, cost_rub, cached_tokens, reasoning_tokens = _extract_usage(payload)
-        cost_usd = _calculate_cost(input_tokens, output_tokens)
+
+        # START_BLOCK_RESOLVE_COST
+        # PRICING-RUB: фактическая cost_rub из API приоритетна; без неё — оценка по тарифу.
+        cost_is_estimate = False
+        if cost_rub is None:
+            pricing = await get_model_pricing()
+            if pricing is not None:
+                cost_rub = estimate_cost_rub(input_tokens, output_tokens, cached_tokens, pricing)
+                cost_is_estimate = True
+                logger.info(
+                    "[APIClient][call][COST_ESTIMATE] cost_rub absent in usage — estimated %.4f RUB by tariff",
+                    cost_rub,
+                )
+            else:
+                logger.warning("[APIClient][call][COST_ESTIMATE] cost_rub absent and tariff unavailable")
+        # END_BLOCK_RESOLVE_COST
 
         # Debug: log full usage payload to understand what Polza.AI actually returns
         usage_raw = payload.get("usage", {})
@@ -617,11 +836,11 @@ class ResponsesClient:
         )
 
         logger.info(
-            "[APIClient][call][CALL] Response received, text_len=%d tokens=%d cost_usd=%.6f cost_rub=%s cached=%d reasoning=%d",
+            "[APIClient][call][CALL] Response received, text_len=%d tokens=%d cost_rub=%s estimate=%s cached=%d reasoning=%d",
             len(text),
             total_tokens,
-            cost_usd,
             f"{cost_rub:.4f}" if cost_rub is not None else "N/A",
+            cost_is_estimate,
             cached_tokens,
             reasoning_tokens,
         )
@@ -634,8 +853,8 @@ class ResponsesClient:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
             cost_rub=cost_rub,
+            cost_is_estimate=cost_is_estimate,
             cached_tokens=cached_tokens,
             reasoning_tokens=reasoning_tokens,
             review_id=review_id,

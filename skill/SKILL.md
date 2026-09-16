@@ -39,18 +39,45 @@ critic_followup(question, previous_review?, review_id?, agent_count?)
 
 1. **Всегда передавай `context`** — проект, язык, назначение. Без контекста критик работает вслепую.
 2. **Всегда задавай `focus_areas`** для `critic_review` — `"security,performance,SOLID"` вместо размытого «посмотри вообще».
-3. **Followup: `review_id` вместо `previous_review`.** В metadata каждого ревью есть `Review ID` — передай его, и сервер восстановит диалог сам из дискового store (экономия ~25k input-токенов ≈ $0.065 за вызов). Полный текст (`previous_review`) — fallback на случай, если `review_id` не найден (истёк TTL 24ч, store очищен или запись вытеснена лимитом 50); рестарт сервера сам по себе диалог не теряет — store переживает рестарты. Передавать оба параметра нельзя.
-4. **`agent_count`**: `4` — быстро (~30 с, мелкие сниппеты), `16` — глубоко (~2–4 мин, архитектура/security). По умолчанию 16 из конфига; для быстрых проверок явно ставь 4.
+3. **Followup: `review_id` вместо `previous_review`.** В metadata каждого ревью есть `Review ID` — передай его, и сервер восстановит диалог сам из дискового store (экономия ~25k input-токенов — до ~3,7 ₽ за вызов; сам followup по `review_id` стоит ≈ 8–11 ₽). Полный текст (`previous_review`) — fallback на случай, если `review_id` не найден (истёк TTL 24ч, store очищен или запись вытеснена лимитом 50); рестарт сервера сам по себе диалог не теряет — store переживает рестарты. Передавать оба параметра нельзя.
+4. **`agent_count`**: `4` — быстро (~30–90 с, 9–15 ₽ за файл), `16` — глубоко (~1,5–4 мин, 50–60 ₽ за файл ~700–850 строк; архитектура/security). По умолчанию 16 из конфига; для быстрых проверок явно ставь 4.
 5. **Для файлов на диске передавай `file_path`, а не копию/пересказ кода в `content`** — критик прочитает файл сам (context авто = `File: <путь>`). По умолчанию **выключен** (SEC-03): статус — `reload_config_tool` (строка `allow_file_path`). Разрешённые корни — директория проекта сессии (cwd MCP-сервера) + `POLZA_ALLOWED_READ_DIRS` в `.env` (разделитель `;` на Windows, `:` на POSIX); cwd не становится корнем, если внутри него лежит домашняя директория ($HOME, её предок, корень диска) — тогда добавь проект в `POLZA_ALLOWED_READ_DIRS`. `content` и `file_path` одновременно передавать нельзя — ошибка без вызова API. `critic_followup` `file_path` не принимает. Денилист секретов блокируется всегда (не обходить): `.env*`, `*credential*`, `id_rsa*`/`id_ed25519*`/`id_ecdsa*`/`id_dsa*`, `*.pem/*.key/*.p12/*.pfx/*.kdbx/*.jks/*.keystore`, `.git-credentials*`, `.netrc`/`_netrc`, `.htpasswd`, `.npmrc`, `.pypirc`, `.claude.json*`, `*.tfstate*`, `.vault-token`, `*.ovpn`, `kubeconfig*`, `config` внутри `.git`, а также любые файлы внутри каталогов `.ssh`, `.gnupg`, `.aws`, `.azure`, `.azure-devops`, `.kube`, `.docker`, `.config/gh`, `.config/gcloud`. Файлы > 1 МБ отклоняются. **SEC-ORACLE/SEC-ADS:** отказ по любой причине (нет файла, вне корней, denylist, небезопасная форма пути) выглядит одинаково — по тексту не определить, существует ли файл; на Windows формы пути с `:` (NTFS alternate data stream) или хвостовой точкой/пробелом отклоняются отдельно, до denylist.
 6. **`output_format="json"`** — когда находки нужно обработать программно: строгий JSON `{"summary", "findings":[{severity, title, location, description, recommendation}]}`. Для обычного ревью не нужен.
 
 ### Административные (бесплатные)
 
 ```
-check_health()            # статус, баланс ₽, суточный расход («Today: N calls | $X | ₽»)
+check_health()            # статус, тариф модели в ₽ (вход/выход/кэш за 1M), баланс ₽, суточный расход («Today (16.09.2026): N calls | X ₽»)
 reload_config_tool()      # горячая перезагрузка .env после изменения POLZA_* (без рестарта)
 restart_server(reason?)   # жёсткий выход; клиент поднимет процесс сам
-self_update()             # git pull + pip install + рестарт; выключен по умолчанию, требует git-клона
+self_update()             # git pull + pip install -e . + рестарт; выключен по умолчанию (POLZA_ALLOW_SELF_UPDATE=true), требует git-клона
+```
+
+### Управление критиком — шпаргалка
+
+`critic` ниже — `python -m grok_critic.cli` (шим `grok-critic` часто не на PATH).
+
+| Задача                                    | MCP (основной путь)                                   | Терминал                                                                    |
+| ----------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| Статус, баланс, тариф в ₽, расход за день | `check_health()`                                      | `critic health --ping`                                                      |
+| Быстрая проверка конфига без сети         | —                                                     | `critic health`                                                             |
+| Диагностика «почему отвалился»            | —                                                     | `critic doctor`                                                             |
+| Посмотреть конфиг (ключ замаскирован)     | `reload_config_tool()`                                | `critic config --json`                                                      |
+| Перечитать `.env` после правки `POLZA_*`  | `reload_config_tool()`                                | —                                                                           |
+| Перезапустить процесс сервера             | `restart_server(reason="…")`                          | новая сессия / форк сессии                                                  |
+| Обновить код сервера                      | `self_update()` (если `POLZA_ALLOW_SELF_UPDATE=true`) | `cd <repo> && git pull && python -m pip install -e .` → новая сессия / форк |
+| Логи сервера                              | —                                                     | `critic logs --tail 50`                                                     |
+| Подключить к Claude Code                  | —                                                     | `claude mcp add …` (раздел «Claude Code» ниже)                              |
+
+PowerShell (UTF-8, иначе ломаются `₽` и эмодзи):
+
+```powershell
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+function critic { python -m grok_critic.cli @args }
+critic health --ping
+critic review .\src\app.py --agents 4 --focus security --context "проект, язык, назначение"
+critic followup "почему это блокер?" --review-id rev_xxxxxxxxxxxx
 ```
 
 ## Формат ответа
@@ -64,9 +91,11 @@ self_update()             # git pull + pip install + рестарт; выклю�
 📈 Tokens: input=… output=… total=…
 🧠 Reasoning: … (~4x cost)
 💾 Cached: … (дешевле)
-💰 Cost: 7.59 ₽ | $0.2240
+💰 Cost: 53,67 ₽
 🏷️ Review ID: rev_0715e81bba24   ← сохрани для followup
 ```
+
+Если фактическая `cost_rub` не пришла от API, сервер оценивает её сам по тарифу модели — тогда строка выглядит как `💰 Cost: ≈ 53,67 ₽ (оценка по тарифу)`.
 
 Пока ревью выполняется (1–3 мин), сервер шлёт heartbeat-уведомления — «тишина» ≠ зависание.
 
@@ -92,10 +121,10 @@ self_update()             # git pull + pip install + рестарт; выклю�
 
 ### Правила CLI
 
-- Exit codes: `0` ok / `1` warning / `2` error / `130` прервано — ветвись в скрипте; `--json` даёт `{success, text, review_id, tokens, cost…}`.
+- Exit codes: `0` ok / `1` warning / `2` error / `130` прервано — ветвись в скрипте; `--json` даёт `{success, text, review_id, tokens, cost_rub, cost_is_estimate, …}`.
 - `review_id` един для MCP и CLI (TTL 24ч): получили ревью через MCP — продолжайте через CLI и наоборот.
 - Sandbox `file_path` в CLI не применяется — файл выбираешь сам; на секретные имена CLI предупредит в stderr.
-- Стоимость: `--agents 4` ≈ $0.08 быстро, `--agents 16` ≈ $1.1 глубоко — выбирай осознанно.
+- Стоимость: `--agents 4` ≈ 9–15 ₽ за файл быстро, `--agents 16` ≈ 50–60 ₽ за файл ~700–850 строк глубоко — выбирай осознанно.
 
 ## Workflow
 
@@ -113,9 +142,22 @@ self_update()             # git pull + pip install + рестарт; выклю�
 
 ## Стоимость и лимиты
 
-- Замеренные значения (15.09.2026): 4 агента ≈ $0.07–0.10, 16 агентов ≈ $1.0–1.2 (input у 16 агентов включает внутреннюю multi-agent оркестрацию провайдера). Followup по `review_id` (~7k токенов) заметно дешевле followup с полным текстом (~25k).
-- `check_health` / `grok-critic health --ping` показывает суточный расход — перед серией вызовов взгляни; при низком балансе предупреди пользователя.
-- Защита от перерасхода на сервере: дневной бюджет (`POLZA_DAILY_BUDGET_USD` — **soft limit**: возможен перерасход не более чем на `max_concurrent_requests` одновременно выполняющихся запросов, т.к. стоимость multi-agent запроса заранее неизвестна), semaphore одновременных запросов, in-flight dedup (параллельный дубль того же контента не платит дважды), retry-дедлайн (суммарное время ≤ таймауту MCP-клиента).
+Тариф `x-ai/grok-4.20-multi-agent` на 16.09.2026 (актуальный всегда — `check_health` / `grok-critic health --ping`): вход 147,35 ₽, выход 294,70 ₽, чтение кэша 23,58 ₽ — за 1M токенов; контекст 2 000 000 токенов, максимум ответа 1 800 000. Тариф кэшируется на процессе 1 ч (неудачный запрос — 60 с), таймаут запроса тарифа — 10 с.
+
+Замеренные значения (16.09.2026, MCP, `file_path`):
+
+| Вызов                                      | Агентов |    Стоимость | Время |
+| ------------------------------------------ | :-----: | -----------: | ----: |
+| `critic_review` api_client.py (~850 строк) |   16    |      53,67 ₽ |  84 с |
+| `security_audit` server.py                 |    4    |      15,23 ₽ |     — |
+| `critic_review` (контрольное ревью)        |    4    |      10,32 ₽ |     — |
+| `critic_review` critic.py                  |    4    |       8,88 ₽ |     — |
+| `critic_followup`                          |    —    | 8,19–10,74 ₽ |     — |
+
+Ориентиры: 4 агента ≈ 9–15 ₽ за файл, 16 агентов ≈ 50–60 ₽ за файл ~700–850 строк (только архитектура/security-критичное); followup по `review_id` (~7k токенов) заметно дешевле followup с полным текстом (~25k).
+
+- `check_health` / `grok-critic health --ping` показывает тариф и суточный расход — перед серией вызовов взгляни; при низком балансе предупреди пользователя.
+- Защита от перерасхода на сервере: дневной бюджет в ₽ (`POLZA_DAILY_BUDGET_RUB` — **soft limit** по фактической `cost_rub`, проверяется ДО платного запроса: возможен перерасход не более чем на `max_concurrent_requests` одновременно выполняющихся запросов, т.к. стоимость multi-agent запроса заранее неизвестна), semaphore одновременных запросов, in-flight dedup (параллельный дубль того же контента не платит дважды), retry-дедлайн (суммарное время ≤ таймауту MCP-клиента).
 
 ## Ошибки (на русском)
 
@@ -124,7 +166,7 @@ self_update()             # git pull + pip install + рестарт; выклю�
 | `Ошибка авторизации: …`                | Ключ невалиден — проверить `POLZA_API_KEY`                                                                                                                                     |
 | `Недостаточно средств: …`              | Пополнить баланс Polza.AI, предупредить пользователя                                                                                                                           |
 | `Превышен лимит запросов`              | Подождать и повторить; при повторе — `agent_count=4`                                                                                                                           |
-| `Превышен дневной бюджет`              | Сообщить пользователю; лимит правится в `.env` + `reload_config_tool`                                                                                                          |
+| `Превышен дневной бюджет`              | Сообщить пользователю; лимит `POLZA_DAILY_BUDGET_RUB` правится в `.env` + `reload_config_tool`                                                                                 |
 | `review_id не найден`                  | Истёк TTL (24ч с последнего обращения), store очищен или запись вытеснена лимитом 50 — передай `previous_review` (fallback; рестарт сервера диалог НЕ теряет — store дисковый) |
 | `file_path отключён` / `Access denied` | Файл вне `POLZA_ALLOWED_READ_DIRS` или в denylist секретов — передай `content` напрямую или расширь корни                                                                      |
 | MCP недоступен                         | Замена гейта — см. «Если MCP недоступен»                                                                                                                                       |
@@ -136,6 +178,12 @@ self_update()             # git pull + pip install + рестарт; выклю�
 3. Читай ответ **полностью** — критик находит и то, что не просили.
 4. Один вызов на осмысленную единицу работы (модуль/фича), а не на каждый чих.
 5. Спор — аргументами через `critic_followup`, не переписыванием ревью «как хочется».
+
+## Миграция с 1.11.x на 1.12.0
+
+- Деньги — только в ₽. Убраны `POLZA_PRICE_INPUT_PER_1M` / `POLZA_PRICE_OUTPUT_PER_1M` / `POLZA_DAILY_BUDGET_USD` — если остались в `.env`/окружении, сервер стартует как обычно, но пишет один DEPRECATED-warning с именами ключей (без значений); их стоит удалить. Вместо `POLZA_DAILY_BUDGET_USD` — `POLZA_DAILY_BUDGET_RUB` (soft limit по фактической `cost_rub`).
+- CLI `--json` (`review`/`followup`): поле `cost_usd` удалено, есть `cost_rub` и новый `cost_is_estimate` (`true` — цена оценена по тарифу, а не пришла из API).
+- `check_health` / `grok-critic health --ping`: новый блок тарифа модели в ₽ (вход/выход/кэш + лимиты контекста/ответа) и `usage_today.date` в формате `DD.MM.YYYY`.
 
 ---
 
@@ -169,13 +217,16 @@ New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\grok-critic" 
 
 ## Claude Code
 
-- Инструменты `grok-critic` в Claude Code — **deferred**: загружай схемы одним вызовом `ToolSearch` с `select:mcp__grok-critic__critic_review,mcp__grok-critic__architecture_review,mcp__grok-critic__security_audit,mcp__grok-critic__critic_followup` (и `check_health` при необходимости) — не по одной схеме за вызов.
-- Длинные вызовы (16 агентов, ~2–4 мин) должны укладываться в `MCP_TOOL_TIMEOUT` — ставь ≥ 300000, лучше 600000 мс.
-- Регистрация с `file_path`:
+- Инструменты `grok-critic` в Claude Code — **deferred**: загружай схемы одним вызовом `ToolSearch` с `select:mcp__grok-critic__critic_review,mcp__grok-critic__architecture_review,mcp__grok-critic__security_audit,mcp__grok-critic__critic_followup` (и `mcp__grok-critic__check_health,...` при необходимости) — не по одной схеме за вызов.
+- Длинные вызовы (16 агентов, ~2–4 мин) должны укладываться в `MCP_TOOL_TIMEOUT` клиента — ставь ≥ 300000, лучше 600000 мс; на сервере — `POLZA_TIMEOUT_SECONDS=540`.
+- Регистрация (user scope), с `file_path` и увеличенным таймаутом сервера:
 
   ```bash
-  claude mcp add grok-critic -s user -e POLZA_ALLOW_FILE_PATH=true -e "POLZA_ALLOWED_READ_DIRS=<корни через ;>" -- python -m grok_critic.server
+  export MSYS_NO_PATHCONV=1
+  export MSYS2_ARG_CONV_EXCL="*"
+  claude mcp add grok-critic -s user -e POLZA_ALLOW_FILE_PATH=true -e "POLZA_ALLOWED_READ_DIRS=C:\path\one;D:\Projects" -e POLZA_TIMEOUT_SECONDS=540 -- python -m grok_critic.server
   ```
 
-- После обновления сервера (`self_update`, `git pull`) переподключи через `/mcp` — кэш схемы tools живёт сессию.
-- Фолбек CLI — из Git Bash: `python -m grok_critic.cli …` (шим `grok-critic` может отсутствовать на PATH). Для `--agents 16` таймаут самой Bash-команды ставь ≥ 600000 мс.
+  `POLZA_API_KEY` — только в переменной окружения пользователя или в `.env` репо, НЕ в аргументах `-e`. В Git Bash `export MSYS_NO_PATHCONV=1`/`MSYS2_ARG_CONV_EXCL="*"` обязательны в том же вызове (шелл не хранит их между вызовами) — иначе MSYS молча портит аргументы команды. Итог сверяй по `claude mcp list` / `~/.claude.json`, не по коду возврата.
+- После обновления сервера (`self_update`, либо `cd <repo> && git pull && python -m pip install -e .`) нужна новая сессия Claude Code или форк сессии (в Claude Desktop `/mcp reconnect` недоступен; в терминальном `claude` — `/mcp`) — кэш схемы tools живёт одну сессию.
+- Фолбек CLI — из Git Bash: `python -m grok_critic.cli …` (шим `grok-critic` может отсутствовать на PATH; на Windows зовите `python`, не `python3` — тот обычно заглушка Microsoft Store). Для `--agents 16` таймаут самой Bash-команды ставь ≥ 600000 мс.

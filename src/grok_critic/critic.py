@@ -1,11 +1,17 @@
 # FILE: src/grok_critic/critic.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Critical code review orchestration via grok-4.20-multi-agent
 #   SCOPE: Build review prompts, call API, followup questions, perform health checks
 #   DEPENDS: M-API, M-CONFIG
 #   LINKS: M-CRITIC
 # END_MODULE_CONTRACT
+# START_CHANGE_SUMMARY
+#   PRICING-RUB: health_check отдаёт тариф модели в ₽ из get_model_pricing()
+#     (pricing: input/output/cache_read_per_1m_rub + context_length/max_output_tokens);
+#     недоступный тариф — issue и status degraded. usage_today — date DD.MM.YYYY,
+#     calls, errors, cost_rub (cost_usd удалён).
+# END_CHANGE_SUMMARY
 
 from __future__ import annotations
 
@@ -18,7 +24,12 @@ from uuid import uuid4
 
 import httpx
 
-from grok_critic.api_client import CritiqueResult, ResponsesClient, get_usage_stats
+from grok_critic.api_client import (
+    CritiqueResult,
+    ResponsesClient,
+    get_model_pricing,
+    get_usage_stats,
+)
 from grok_critic.config import config
 
 logger = logging.getLogger("grok-critic.critic")
@@ -491,19 +502,27 @@ async def health_check() -> dict:
         "issues": issues,
     }
 
-    if config.price_input_per_1m > 0 or config.price_output_per_1m > 0:
+    # PRICING-RUB: реальный тариф модели в ₽ из Polza.AI (кэш 1 ч в api_client).
+    pricing = await get_model_pricing()
+    if pricing is not None:
         result["pricing"] = {
-            "input_per_1m": config.price_input_per_1m,
-            "output_per_1m": config.price_output_per_1m,
+            "input_per_1m_rub": pricing.input_per_1m_rub,
+            "output_per_1m_rub": pricing.output_per_1m_rub,
+            "cache_read_per_1m_rub": pricing.cache_read_per_1m_rub,
+            "context_length": pricing.context_length,
+            "max_output_tokens": pricing.max_output_tokens,
         }
+    else:
+        logger.warning("[Critic][health_check][PRICING] tariff unavailable for model=%s", config.model)
+        issues.append(f"Тариф модели недоступен (GET /models/{config.model})")
 
     # FEAT-BUDGET: суточная статистика использования — агент видит расход без
     # обращения к внешнему API.
     stats = get_usage_stats()
     result["usage_today"] = {
+        "date": stats["date"],
         "calls": stats["calls"],
         "errors": stats["errors"],
-        "cost_usd": round(stats["cost_usd"], 6),
         "cost_rub": round(stats["cost_rub"], 2),
     }
 
@@ -530,7 +549,7 @@ async def health_check() -> dict:
                 logger.warning("[Critic][health_check][BALANCE] Failed to fetch balance: %s", exc)
                 issues.append(f"Balance API error: {exc}")
 
-    # A2: Balance API может добавить issues уже ПОСЛЕ первого расчёта status —
+    # A2: тариф и Balance API могут добавить issues уже ПОСЛЕ первого расчёта status —
     # пересчитываем, иначе status="ok" врёт при непустых issues.
     result["status"] = "ok" if not issues else "degraded"
 

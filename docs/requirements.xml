@@ -1,7 +1,7 @@
-<RequirementsAnalysis VERSION="1.11.2">
+<RequirementsAnalysis VERSION="1.12.0">
   <Project>
     <name>grok-critic-mcp</name>
-    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 8 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update. SecretStr для api_key. Декоратор _review_tool для DRY. Используется как субагент "Критик" в Kilo Code.</annotation>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI (Responses API). Предоставляет 8 tools: critic_review, architecture_review, security_audit, critic_followup, check_health, reload_config, restart_server, self_update. SecretStr для api_key. Декоратор _review_tool для DRY. PRICING-RUB: стоимость и дневной бюджет — только в ₽, по реальному тарифу модели из Polza.AI (GET /models/{model}), без ручных цен в конфиге. Используется как субагент "Критик" в Kilo Code.</annotation>
     <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP</keywords>
   </Project>
 
@@ -46,7 +46,7 @@
       <Action>Вызывает MCP tool check_health для проверки connectivity и конфигурации</Action>
       <Goal>Убедиться что сервер работает, конфиг валиден, API ключ задан</Goal>
       <Preconditions>MCP сервер запущен</Preconditions>
-      <AcceptanceCriteria>Tool check_health возвращает статус, конфигурацию и расчёт стоимости за 1M токенов</AcceptanceCriteria>
+      <AcceptanceCriteria>Tool check_health возвращает статус, конфигурацию и реальный тариф модели в ₽ за 1M токенов (вход/выход/кэш, из Polza.AI GET /models/{model}); тариф недоступен → issue и status=degraded</AcceptanceCriteria>
       <Priority>medium</Priority>
     </UC-003>
 
@@ -92,7 +92,7 @@
     <UC-007>
       <Actor>KiloAgent</Actor>
       <Action>Вызывает MCP tool reload_config для hot-reload конфигурации без рестарта</Action>
-      <Goal>Обновить env vars (API key, цены, timeout) без перезапуска сервера</Goal>
+      <Goal>Обновить env vars (API key, дневной бюджет в ₽, timeout) без перезапуска сервера</Goal>
       <Preconditions>MCP сервер запущен, .env файл обновлён</Preconditions>
       <AcceptanceCriteria>Новые значения подхватываются без перезапуска процесса</AcceptanceCriteria>
       <Priority>low</Priority>
@@ -119,7 +119,7 @@
     <constraint-1>grok-4.20-multi-agent НЕ поддерживает Chat Completions API — только Responses API (/v1/responses).</constraint-1>
     <constraint-2>API ключ Polza.AI хранится в env variable POLZA_API_KEY или в .env файле. Используется SecretStr для защиты от случайного логирования.</constraint-2>
     <constraint-3>Ответ может занимать до 5 минут (16 агентов) — нужен адекватный timeout.</constraint-3>
-    <constraint-4>Стоимость: $2.6/$6.6 за 1M токенов (input/output). 16 агентов потребляют значительно больше токенов.</constraint-4>
+    <constraint-4>Стоимость (PRICING-RUB): только ₽, по реальному тарифу модели из Polza.AI (GET /models/{model}, кэш успеха 1ч / неудачи 60с). Тариф x-ai/grok-4.20-multi-agent на 16.09.2026: вход 147,35 ₽/1M, выход 294,70 ₽/1M, кэш 23,576 ₽/1M токенов (контекст 2 000 000, макс. ответ 1 800 000) — меняется по решению провайдера, конфиг цену не хранит. 16 агентов потребляют значительно больше токенов.</constraint-4>
     <constraint-5>MCP сервер запускается через pip install -e . как local MCP server в kilo.json.</constraint-5>
     <constraint-6>Контент ограничен 100 000 символов (MAX_CONTENT_CHARS) — защита от cost DoS.</constraint-6>
     <constraint-7>Retry: 429 и 5xx повторяются до 2 раз с exponential backoff.</constraint-7>

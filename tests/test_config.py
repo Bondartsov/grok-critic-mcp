@@ -1,8 +1,9 @@
 # FILE: tests/test_config.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CONFIG configuration loading and validation
-#   SCOPE: Test env var reading, defaults, log_level validation, price fields
+#   SCOPE: Test env var reading, defaults, log_level validation, daily_budget_rub,
+#          deprecated price/budget keys warning, log datefmt
 #   DEPENDS: M-CONFIG
 #   LINKS: M-CONFIG
 # END_MODULE_CONTRACT
@@ -17,6 +18,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_settings import SettingsConfigDict
 
+import grok_critic.config as config_mod
 from grok_critic.config import AppConfig, _setup_logging
 
 
@@ -56,22 +58,25 @@ class TestAppConfigDefaults:
         cfg = _make_no_env(api_key="test-key")
         assert cfg.log_file == ""
 
-    def test_default_price_input_per_1m(self) -> None:
+    def test_removed_usd_price_fields(self) -> None:
+        """PRICING-RUB: цены в $ и бюджет в $ удалены из модели конфига."""
         cfg = _make_no_env(api_key="test-key")
-        assert cfg.price_input_per_1m == 0.0
-
-    def test_default_price_output_per_1m(self) -> None:
-        cfg = _make_no_env(api_key="test-key")
-        assert cfg.price_output_per_1m == 0.0
+        for removed in ("price_input_per_1m", "price_output_per_1m", "daily_budget_usd"):
+            assert removed not in AppConfig.model_fields
+            assert not hasattr(cfg, removed)
 
     def test_default_allow_file_path_false(self) -> None:
         """SEC-03: чтение файлов через file_path выключено по умолчанию."""
         cfg = _make_no_env(api_key="test-key")
         assert cfg.allow_file_path is False
 
-    def test_default_daily_budget_usd(self) -> None:
+    def test_default_daily_budget_rub(self) -> None:
         cfg = _make_no_env(api_key="test-key")
-        assert cfg.daily_budget_usd == 0.0
+        assert cfg.daily_budget_rub == 0.0
+
+    def test_negative_daily_budget_rub_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_no_env(api_key="test-key", daily_budget_rub=-1)
 
     def test_default_max_concurrent_requests(self) -> None:
         cfg = _make_no_env(api_key="test-key")
@@ -141,15 +146,19 @@ class TestEnvOverride:
             cfg = AppConfig(api_key="test-key")
             assert cfg.log_file == "/tmp/grok-critic.log"
 
-    def test_price_input_override(self) -> None:
-        with patch.dict(os.environ, {"POLZA_PRICE_INPUT_PER_1M": "2.5"}):
+    def test_deprecated_usd_keys_do_not_break_startup(self) -> None:
+        """PRICING-RUB: устаревшие ключи игнорируются (extra="ignore"), запуск не падает."""
+        with patch.dict(
+            os.environ,
+            {
+                "POLZA_PRICE_INPUT_PER_1M": "2.5",
+                "POLZA_PRICE_OUTPUT_PER_1M": "6.6",
+                "POLZA_DAILY_BUDGET_USD": "5.5",
+            },
+        ):
             cfg = AppConfig(api_key="test-key")
-            assert cfg.price_input_per_1m == 2.5
-
-    def test_price_output_override(self) -> None:
-        with patch.dict(os.environ, {"POLZA_PRICE_OUTPUT_PER_1M": "6.6"}):
-            cfg = AppConfig(api_key="test-key")
-            assert cfg.price_output_per_1m == 6.6
+        assert not hasattr(cfg, "price_input_per_1m")
+        assert not hasattr(cfg, "daily_budget_usd")
 
     def test_allow_file_path_override(self) -> None:
         """SEC-03: file_path включается явным флагом."""
@@ -157,10 +166,10 @@ class TestEnvOverride:
             cfg = AppConfig(api_key="test-key")
             assert cfg.allow_file_path is True
 
-    def test_daily_budget_override(self) -> None:
-        with patch.dict(os.environ, {"POLZA_DAILY_BUDGET_USD": "5.5"}):
+    def test_daily_budget_rub_override(self) -> None:
+        with patch.dict(os.environ, {"POLZA_DAILY_BUDGET_RUB": "1500.5"}):
             cfg = AppConfig(api_key="test-key")
-            assert cfg.daily_budget_usd == 5.5
+            assert cfg.daily_budget_rub == 1500.5
 
     def test_max_concurrent_requests_override(self) -> None:
         with patch.dict(os.environ, {"POLZA_MAX_CONCURRENT_REQUESTS": "4"}):
@@ -277,7 +286,8 @@ class TestReloadConfig:
         result = reload_config()
         assert hasattr(result, "model")
         assert hasattr(result, "api_key")
-        assert hasattr(result, "price_input_per_1m")
+        assert hasattr(result, "daily_budget_rub")
+        assert not hasattr(result, "price_input_per_1m")
         # Module-level reference updated
         from grok_critic import config as cfg_mod
         assert cfg_mod.config is result
@@ -380,4 +390,86 @@ class TestSetupLogging:
         logger.handlers[0].close()
 
 
+    def test_log_datefmt_is_dd_mm_yyyy(self) -> None:
+        """Даты в логах — DD.MM.YYYY."""
+        cfg = _make_no_env(api_key="test-key", log_file="")
+        _setup_logging(cfg)
+        handler = logging.getLogger("grok-critic").handlers[0]
+        assert handler.formatter is not None
+        assert handler.formatter.datefmt == "%d.%m.%Y %H:%M:%S"
+
+
 # END_BLOCK_SETUP_LOGGING
+
+
+# START_BLOCK_DEPRECATED_KEYS
+_DEPRECATED_VALUES = {
+    "POLZA_PRICE_INPUT_PER_1M": "2.6123",
+    "POLZA_PRICE_OUTPUT_PER_1M": "6.6456",
+    "POLZA_DAILY_BUDGET_USD": "9.8765",
+}
+
+
+class TestDeprecatedKeysWarning:
+    """PRICING-RUB: один warning с ИМЕНАМИ устаревших ключей, значения не логируются."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, tmp_path, monkeypatch):
+        for key in _DEPRECATED_VALUES:
+            monkeypatch.delenv(key, raising=False)
+        # .env пользователя не читаем: указываем несуществующий файл
+        monkeypatch.setenv("POLZA_ENV_FILE", str(tmp_path / "absent.env"))
+        yield
+
+    def test_no_warning_without_deprecated_keys(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="grok-critic"):
+            assert config_mod._warn_deprecated_keys() == []
+        assert "DEPRECATED" not in caplog.text
+
+    def test_warning_lists_names_from_environ(self, monkeypatch, caplog) -> None:
+        for key, value in _DEPRECATED_VALUES.items():
+            monkeypatch.setenv(key, value)
+        with caplog.at_level(logging.WARNING, logger="grok-critic"):
+            keys = config_mod._warn_deprecated_keys()
+        assert keys == list(_DEPRECATED_VALUES)
+        records = [r for r in caplog.records if "[Config][load_config][DEPRECATED]" in r.getMessage()]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        for key, value in _DEPRECATED_VALUES.items():
+            assert key in message
+            assert value not in message
+        assert "POLZA_DAILY_BUDGET_RUB" in message
+
+    def test_warning_from_dotenv_file(self, tmp_path, monkeypatch, caplog) -> None:
+        env_file = tmp_path / "test.env"
+        env_file.write_text("POLZA_PRICE_OUTPUT_PER_1M=6.6456\nPOLZA_MODEL=x\n", encoding="utf-8")
+        monkeypatch.setenv("POLZA_ENV_FILE", str(env_file))
+        with caplog.at_level(logging.WARNING, logger="grok-critic"):
+            keys = config_mod._warn_deprecated_keys()
+        assert keys == ["POLZA_PRICE_OUTPUT_PER_1M"]
+        assert "POLZA_PRICE_OUTPUT_PER_1M" in caplog.text
+        assert "6.6456" not in caplog.text
+
+    def test_load_config_emits_warning(self, monkeypatch, caplog) -> None:
+        monkeypatch.setenv("POLZA_DAILY_BUDGET_USD", "9.8765")
+        logger = logging.getLogger("grok-critic")
+        saved_handlers, saved_level = list(logger.handlers), logger.level
+        config_mod.load_config.cache_clear()
+        try:
+            with caplog.at_level(logging.WARNING, logger="grok-critic"):
+                config_mod.load_config()
+        finally:
+            config_mod.load_config.cache_clear()
+            for handler in list(logger.handlers):
+                if handler not in saved_handlers:
+                    handler.close()
+            logger.handlers.clear()
+            logger.handlers.extend(saved_handlers)
+            logger.setLevel(saved_level)
+        records = [r for r in caplog.records if "[Config][load_config][DEPRECATED]" in r.getMessage()]
+        assert len(records) == 1
+        assert "POLZA_DAILY_BUDGET_USD" in records[0].getMessage()
+        assert "9.8765" not in caplog.text
+
+
+# END_BLOCK_DEPRECATED_KEYS

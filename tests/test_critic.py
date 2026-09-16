@@ -1,5 +1,5 @@
 # FILE: tests/test_critic.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CRITIC prompt building, review logic, followup, health_check
 #   SCOPE: _build_user_prompt, general_review, followup (+review_id), ReviewStore,
@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import SecretStr
 
-from grok_critic.api_client import CritiqueResult
+from grok_critic.api_client import CritiqueResult, ModelPricing
 from grok_critic.config import config
 from grok_critic.critic import (
     ARCHITECTURE_SYSTEM_PROMPT,
@@ -202,7 +203,7 @@ class TestGeneralReview:
             input_tokens=100,
             output_tokens=50,
             total_tokens=150,
-            cost_usd=0.001,
+            cost_rub=0.1,
             review_id="rev_abc123",
         )
         with patch("grok_critic.critic.ResponsesClient.call", new_callable=AsyncMock, return_value=mock_result):
@@ -570,6 +571,14 @@ class TestHealthCheck:
         yield
         critic_module._balance_cache = None
 
+    @pytest.fixture(autouse=True)
+    def pricing_mock(self):
+        """PRICING-RUB: тариф модели без сети — по умолчанию доступен."""
+        pricing = ModelPricing(147.35, 294.70, 23.576, 2_000_000, 1_800_000)
+        mock = AsyncMock(return_value=pricing)
+        with patch("grok_critic.critic.get_model_pricing", new=mock):
+            yield mock
+
     @pytest.fixture()
     def mock_balance(self):
         """Mock balance API to return a fake balance."""
@@ -591,8 +600,6 @@ class TestHealthCheck:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert result["status"] == "ok"
             assert result["issues"] == []
@@ -604,44 +611,48 @@ class TestHealthCheck:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert "usage_today" in result
-            assert set(result["usage_today"].keys()) == {"calls", "errors", "cost_usd", "cost_rub"}
+            assert set(result["usage_today"].keys()) == {"date", "calls", "errors", "cost_rub"}
+            assert result["usage_today"]["date"] == datetime.date.today().strftime("%d.%m.%Y")
 
     async def test_degraded_when_no_key(self) -> None:
         with patch("grok_critic.critic.config") as mock_cfg:
             mock_cfg.api_key = SecretStr("")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert result["status"] == "degraded"
             assert any("POLZA_API_KEY" in issue for issue in result["issues"])
 
-    async def test_pricing_info_when_set(self, mock_balance) -> None:
+    async def test_pricing_from_model_tariff(self, mock_balance) -> None:
+        """PRICING-RUB: тариф в ₽ из get_model_pricing, без устаревших $-полей."""
         with patch("grok_critic.critic.config") as mock_cfg:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 2.6
-            mock_cfg.price_output_per_1m = 6.6
             result = await health_check()
-            assert "pricing" in result
-            assert result["pricing"]["input_per_1m"] == 2.6
-            assert result["pricing"]["output_per_1m"] == 6.6
+            assert result["status"] == "ok"
+            assert result["pricing"] == {
+                "input_per_1m_rub": 147.35,
+                "output_per_1m_rub": 294.70,
+                "cache_read_per_1m_rub": 23.576,
+                "context_length": 2_000_000,
+                "max_output_tokens": 1_800_000,
+            }
 
-    async def test_no_pricing_when_zero(self, mock_balance) -> None:
+    async def test_tariff_unavailable_degrades(self, mock_balance, pricing_mock) -> None:
+        pricing_mock.return_value = None
         with patch("grok_critic.critic.config") as mock_cfg:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert "pricing" not in result
+            assert result["status"] == "degraded"
+            assert "Тариф модели недоступен (GET /models/x-ai/grok-4.20-multi-agent)" in result["issues"]
+            # баланс при этом всё равно получен
+            assert result["balance_rub"] == 1250.50
 
     # -- A2/TEST-05: status пересчитывается ПОСЛЕ блока Balance API -----------
 
@@ -660,8 +671,6 @@ class TestHealthCheck:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert result["status"] == "degraded"
             assert any("Balance API" in issue for issue in result["issues"])
@@ -681,8 +690,6 @@ class TestHealthCheck:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert result["status"] == "degraded"
             assert any("Balance API" in issue for issue in result["issues"])
@@ -693,8 +700,6 @@ class TestHealthCheck:
             mock_cfg.api_key = SecretStr("valid-key")
             mock_cfg.model = "x-ai/grok-4.20-multi-agent"
             mock_cfg.base_url = "https://polza.ai/api/v1"
-            mock_cfg.price_input_per_1m = 0.0
-            mock_cfg.price_output_per_1m = 0.0
             result = await health_check()
             assert result["status"] == "ok"
             assert result["issues"] == []

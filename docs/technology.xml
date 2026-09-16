@@ -1,4 +1,4 @@
-<TechnologyStack VERSION="1.11.2">
+<TechnologyStack VERSION="1.12.0">
   <Runtime>Python 3.11+</Runtime>
   <Language>Python 3.11+</Language>
   <Framework>FastMCP (mcp Python SDK) 1.6+</Framework>
@@ -28,7 +28,7 @@
   <Testing>
     <module-level>
       <command>pytest tests/test_config.py tests/test_critic.py tests/test_api_client.py tests/test_server.py tests/test_cli.py -v</command>
-      <focus>Fast deterministic unit checks with mocked API responses (322 tests total: 321 passed + 1 skipped POSIX-only on Windows)</focus>
+      <focus>Fast deterministic unit checks with mocked API responses (412 tests total: 410 passed + 2 skipped — POSIX-only permissions and a symlink test without privileges on Windows)</focus>
     </module-level>
     <wave-level>
       <command>pytest tests/ -v --timeout=30</command>

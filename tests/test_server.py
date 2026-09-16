@@ -1,5 +1,5 @@
 # FILE: tests/test_server.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-SERVER MCP tool registration and invocation
 #   SCOPE: Registration, params, delegation, sandbox denylist, file_path opt-in,
@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import logging
+import re
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,10 +25,13 @@ from pydantic import SecretStr
 from grok_critic.api_client import CritiqueResult
 from grok_critic.config import config
 from grok_critic.server import (
+    _RU_LOG_TIME_FORMAT,
     _allowed_roots,
+    _fmt_rub,
     _heartbeat,
     _is_sensitive_file,
     _is_unsafe_windows_path,
+    _localize_root_log_time,
     _parse_json_loose,
     _read_file_content,
     _run_cmd,
@@ -107,7 +113,6 @@ class TestCriticReviewTool:
             input_tokens=100,
             output_tokens=50,
             total_tokens=150,
-            cost_usd=0.0,
             review_id="rev_abc123",
         )
         with patch(
@@ -153,7 +158,7 @@ class TestCriticReviewTool:
             input_tokens=1240,
             output_tokens=870,
             total_tokens=2110,
-            cost_usd=0.0124,
+            cost_rub=53.67,
             review_id="rev_test1234",
         )
         with patch(
@@ -167,7 +172,30 @@ class TestCriticReviewTool:
             assert "input=1 240" in result
             assert "output=870" in result
             assert "rev_test1234" in result
-            assert "$0.0124" in result
+            assert "💰 Cost: 53,67 ₽" in result
+            assert "оценка" not in result
+            assert "$" not in result
+
+    async def test_estimated_cost_marked(self) -> None:
+        """PRICING-RUB: оценка по тарифу помечается «≈ … (оценка по тарифу)»."""
+        mock_result = CritiqueResult(
+            text="ok", model="m", agent_count=4, effort="low",
+            cost_rub=128760.16, cost_is_estimate=True, review_id="rev_est",
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="code")
+        assert "💰 Cost: ≈ 128 760,16 ₽ (оценка по тарифу)" in result
+        assert "$" not in result
+
+    @pytest.mark.parametrize("cost", [None, 0.0])
+    async def test_no_cost_line_when_unknown_or_zero(self, cost) -> None:
+        mock_result = CritiqueResult(
+            text="ok", model="m", agent_count=4, effort="low", cost_rub=cost, review_id="rev_nocost",
+        )
+        with patch("grok_critic.server.general_review", new_callable=AsyncMock, return_value=mock_result):
+            result = await critic_review(content="code")
+        assert "💰 Cost" not in result
+        assert "rev_nocost" in result
 
     async def test_elapsed_in_metadata(self) -> None:
         """FEAT-PROGRESS: в metadata присутствует время выполнения."""
@@ -311,7 +339,6 @@ class TestCriticFollowupTool:
             input_tokens=80,
             output_tokens=40,
             total_tokens=120,
-            cost_usd=0.0,
             review_id="rev_follow1",
         )
         with patch(
@@ -390,7 +417,7 @@ class TestHealthCheckTool:
             assert "grok-4.20-multi-agent" in result
 
     async def test_usage_today_rendered(self) -> None:
-        """FEAT-BUDGET: суточная статистика видна в выводе health_check."""
+        """FEAT-BUDGET: суточная статистика видна в выводе health_check (₽, DD.MM.YYYY)."""
         with patch(
             "grok_critic.server.health_check",
             new_callable=AsyncMock,
@@ -399,15 +426,15 @@ class TestHealthCheckTool:
                 "model": "m",
                 "base_url": "https://polza.ai/api/v1",
                 "issues": [],
-                "usage_today": {"calls": 3, "errors": 1, "cost_usd": 0.1234, "cost_rub": 45.6},
+                "usage_today": {"date": "16.09.2026", "calls": 3, "errors": 1, "cost_rub": 45.6},
             },
         ):
             result = await check_health()
-            assert "Today: 3 calls" in result
-            assert "$0.1234" in result
-            assert "45.60 ₽" in result
+            assert "📊 Today (16.09.2026): 3 calls | 45,60 ₽ (1 errors)" in result
+            assert "$" not in result
 
     async def test_with_pricing_info(self) -> None:
+        """PRICING-RUB: тариф, лимиты и баланс в ₽ — порядок строк сохранён."""
         with patch(
             "grok_critic.server.health_check",
             new_callable=AsyncMock,
@@ -416,14 +443,67 @@ class TestHealthCheckTool:
                 "model": "x-ai/grok-4.20-multi-agent",
                 "base_url": "https://polza.ai/api/v1",
                 "issues": [],
-                "pricing": {"input_per_1m": 2.6, "output_per_1m": 6.6},
+                "pricing": {
+                    "input_per_1m_rub": 147.35,
+                    "output_per_1m_rub": 294.70,
+                    "cache_read_per_1m_rub": 23.576,
+                    "context_length": 2_000_000,
+                    "max_output_tokens": 1_800_000,
+                },
+                "balance_rub": 128760.16,
+                "usage_today": {"date": "16.09.2026", "calls": 0, "errors": 0, "cost_rub": 0.0},
             },
         ):
             result = await check_health()
-            assert "Pricing" in result
-            assert "2.6" in result
-            assert "6.6" in result
-            assert "/1M" in result
+        lines = result.splitlines()
+        assert lines == [
+            "Status: ok",
+            "Model: x-ai/grok-4.20-multi-agent",
+            "Base URL: https://polza.ai/api/v1",
+            "Pricing: вход 147,35 ₽ · выход 294,70 ₽ · кэш 23,58 ₽ за 1M токенов",
+            "Limits: контекст 2 000 000 · макс. ответ 1 800 000 токенов",
+            "Balance: 128 760,16 ₽",
+            "📊 Today (16.09.2026): 0 calls | 0,00 ₽ (0 errors)",
+        ]
+        assert "$" not in result
+
+    async def test_limits_omitted_when_unknown(self) -> None:
+        with patch(
+            "grok_critic.server.health_check",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "ok",
+                "model": "m",
+                "base_url": "https://polza.ai/api/v1",
+                "issues": [],
+                "pricing": {
+                    "input_per_1m_rub": 1.0,
+                    "output_per_1m_rub": 2.0,
+                    "cache_read_per_1m_rub": 0.5,
+                    "context_length": None,
+                    "max_output_tokens": None,
+                },
+            },
+        ):
+            result = await check_health()
+        assert "Pricing: вход 1,00 ₽ · выход 2,00 ₽ · кэш 0,50 ₽ за 1M токенов" in result
+        assert "Limits" not in result
+
+    async def test_tariff_issue_rendered(self) -> None:
+        with patch(
+            "grok_critic.server.health_check",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "degraded",
+                "model": "m",
+                "base_url": "https://polza.ai/api/v1",
+                "issues": ["Тариф модели недоступен (GET /models/m)"],
+            },
+        ):
+            result = await check_health()
+        assert "Status: degraded" in result
+        assert "Issues: Тариф модели недоступен (GET /models/m)" in result
+        assert "Pricing" not in result
 
 
 # END_BLOCK_HEALTH_CHECK_TOOL
@@ -441,10 +521,8 @@ class TestReloadConfigTool:
                 "agent_count": 16,
                 "timeout_seconds": 300,
                 "log_level": "WARNING",
-                "price_input_per_1m": 2.6,
-                "price_output_per_1m": 6.6,
                 "allow_file_path": False,
-                "daily_budget_usd": 5.0,
+                "daily_budget_rub": 1500.5,
                 "max_concurrent_requests": 2,
                 "retry_deadline_seconds": 0.0,
             })(),
@@ -452,11 +530,31 @@ class TestReloadConfigTool:
             result = await reload_config_tool()
             assert "✅ Config reloaded" in result
             assert "grok-4.20-multi-agent" in result
-            assert "$2.6" in result
-            assert "$6.6" in result
             assert "y123" in result  # masked key last 4 chars
-            assert "daily_budget_usd: $5.0" in result
+            assert "daily_budget_rub: 1 500,50 ₽" in result
+            assert "price_" not in result
+            assert "daily_budget_usd" not in result
+            assert "$" not in result
             assert "(auto = timeout_seconds)" in result
+
+    async def test_reload_budget_unlimited(self) -> None:
+        with patch(
+            "grok_critic.server.reload_config",
+            return_value=type("Cfg", (), {
+                "api_key": SecretStr("pza_testkey123"),
+                "base_url": "https://polza.ai/api/v1",
+                "model": "m",
+                "agent_count": 4,
+                "timeout_seconds": 300,
+                "log_level": "WARNING",
+                "allow_file_path": False,
+                "daily_budget_rub": 0.0,
+                "max_concurrent_requests": 2,
+                "retry_deadline_seconds": 0.0,
+            })(),
+        ), patch("grok_critic.server.close_client", new_callable=AsyncMock):
+            result = await reload_config_tool()
+        assert "daily_budget_rub: без лимита" in result
 
     async def test_reload_failure(self) -> None:
         with patch(
@@ -469,6 +567,27 @@ class TestReloadConfigTool:
 
 
 # END_BLOCK_RELOAD_CONFIG_TOOL
+
+
+# START_BLOCK_FMT_RUB
+class TestFmtRub:
+    """PRICING-RUB: денежный формат ₽ — пробел тысяч, запятая, 2 знака."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0,00 ₽"),
+            (128760.16, "128 760,16 ₽"),
+            (23.576, "23,58 ₽"),
+            (1234567.891, "1 234 567,89 ₽"),
+            (53.67, "53,67 ₽"),
+        ],
+    )
+    def test_fmt_rub(self, value: float, expected: str) -> None:
+        assert _fmt_rub(value) == expected
+
+
+# END_BLOCK_FMT_RUB
 
 
 # START_BLOCK_RESTART_SERVER_TOOL
@@ -1156,7 +1275,7 @@ class TestArchitectureReviewTool:
             input_tokens=200,
             output_tokens=100,
             total_tokens=300,
-            cost_usd=0.01,
+            cost_rub=1.5,
             review_id="rev_arch1",
         )
         with patch(
@@ -1179,7 +1298,7 @@ class TestSecurityAuditTool:
             input_tokens=150,
             output_tokens=80,
             total_tokens=230,
-            cost_usd=0.008,
+            cost_rub=1.2,
             review_id="rev_sec1",
         )
         with patch(
@@ -1335,3 +1454,68 @@ class TestFilePathIntegration:
 
 
 # END_BLOCK_FILE_PATH_INTEGRATION
+
+
+# START_BLOCK_LOG_TIME_FORMAT
+class TestLogTimeFormat:
+    """Даты в stderr-логах библиотек (RichHandler от FastMCP) — DD.MM.YYYY."""
+
+    def test_root_rich_handlers_use_ru_format_after_import(self) -> None:
+        from rich.logging import RichHandler
+
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, RichHandler):
+                assert handler._log_render.time_format == _RU_LOG_TIME_FORMAT
+
+    def test_default_rich_handler_replaced_and_renders_ru_date(self) -> None:
+        from rich.console import Console
+        from rich.logging import RichHandler
+
+        root = logging.getLogger()
+        buf = io.StringIO()
+        default = RichHandler(console=Console(file=buf, width=200), rich_tracebacks=True)
+        default.setLevel(logging.WARNING)
+        root.addHandler(default)
+        try:
+            assert _localize_root_log_time() >= 1
+            assert default not in root.handlers
+            new = next(h for h in root.handlers if isinstance(h, RichHandler) and h.console.file is buf)
+            assert new.level == logging.WARNING
+            new.emit(logging.LogRecord("httpx", logging.WARNING, __file__, 1, "probe", None, None))
+            output = buf.getvalue()
+            assert re.search(r"\[\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}\]", output), output
+            assert not re.search(r"\d{2}/\d{2}/\d{2}", output), output
+        finally:
+            for handler in list(root.handlers):
+                if isinstance(handler, RichHandler) and handler.console.file is buf:
+                    root.removeHandler(handler)
+
+    def test_custom_rich_settings_preserved(self) -> None:
+        """Публичные настройки (markup, rich_tracebacks, keywords) и фильтры переносятся на замену."""
+        from rich.console import Console
+        from rich.logging import RichHandler
+
+        root = logging.getLogger()
+        buf = io.StringIO()
+        custom = RichHandler(
+            console=Console(file=buf, width=200), rich_tracebacks=False, markup=True, keywords=["PROBE"],
+        )
+        flt = logging.Filter("httpx")
+        custom.addFilter(flt)
+        root.addHandler(custom)
+        try:
+            _localize_root_log_time()
+            new = next(h for h in root.handlers if isinstance(h, RichHandler) and h.console.file is buf)
+            assert new is not custom
+            assert new.rich_tracebacks is False
+            assert new.markup is True
+            assert new.keywords == ["PROBE"]
+            assert flt in new.filters
+            assert new._log_render.time_format == _RU_LOG_TIME_FORMAT
+        finally:
+            for handler in list(root.handlers):
+                if isinstance(handler, RichHandler) and handler.console.file is buf:
+                    root.removeHandler(handler)
+
+
+# END_BLOCK_LOG_TIME_FORMAT

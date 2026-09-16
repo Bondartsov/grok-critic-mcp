@@ -1,4 +1,4 @@
-<DevelopmentPlan VERSION="1.11.2">
+<DevelopmentPlan VERSION="1.12.0">
   <ArchitectureNotes>
     <objective>Создать минимальный, надёжный MCP сервер, который транслирует запросы в grok-4.20-multi-agent Responses API через Polza.AI. 8 MCP tools для code review, architecture review, security audit, followup, health check, config reload, server restart, self-update.</objective>
     <non-goal>Не строить сложную систему — каждый компонент должен быть понятен за 5 минут чтения.</non-goal>
@@ -23,10 +23,11 @@
         </errors>
       </contract>
       <interface>
-        <export-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_. Поля: api_key (SecretStr, min_length=1), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, log_file, price_input_per_1m, price_output_per_1m, allow_self_update, allowed_read_dirs (SEC-CWD/SEC-03, os.pathsep-разделитель), max_retries (ge=0,le=10), retry_backoff_base (ge=0.0), max_content_chars (ge=1), timeout_low, timeout_mid, allow_file_path, retry_deadline_seconds (0=авто, REL-06), daily_budget_usd (0=off, FEAT-BUDGET), max_concurrent_requests (ge=1,le=16), store_path (FEAT-CLI: путь дискового ReviewStore, пусто = db/reviews)" />
+        <export-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_. Поля: api_key (SecretStr, min_length=1), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, log_file, allow_self_update, allowed_read_dirs (SEC-CWD/SEC-03, os.pathsep-разделитель), max_retries (ge=0,le=10), retry_backoff_base (ge=0.0), max_content_chars (ge=1), timeout_low, timeout_mid, allow_file_path, retry_deadline_seconds (0=авто, REL-06), daily_budget_rub (0=off, FEAT-BUDGET/PRICING-RUB — лимит по фактической cost_rub), max_concurrent_requests (ge=1,le=16), store_path (FEAT-CLI: путь дискового ReviewStore, пусто = db/reviews). price_input_per_1m/price_output_per_1m/daily_budget_usd удалены в 1.12.0 — цены берутся из тарифа Polza.AI (M-API get_model_pricing)" />
         <export-load_config PURPOSE="Load and validate config singleton" />
         <export-reload_config PURPOSE="Hot reload from .env without restart" />
-        <export-_setup_logging PURPOSE="Configure Python logging (private); закрывает и close()-ит прежние handler'ы root-логгера перед reload_config" />
+        <export-_setup_logging PURPOSE="Configure Python logging (private); datefmt DD.MM.YYYY; закрывает и close()-ит прежние handler'ы root-логгера перед reload_config" />
+        <export-DEPRECATED_ENV_KEYS PURPOSE="PRICING-RUB: POLZA_PRICE_INPUT_PER_1M/POLZA_PRICE_OUTPUT_PER_1M/POLZA_DAILY_BUDGET_USD — удалённые в 1.12.0 ключи; их наличие в env/.env даёт один DEPRECATED-warning (имена без значений), запуск не ломает" />
         <export-config PURPOSE="Module-level config instance" />
       </interface>
       <depends>none</depends>
@@ -60,12 +61,14 @@
         </errors>
       </contract>
       <interface>
-        <export-CritiqueResult PURPOSE="Dataclass for structured API response: text, model, agent_count, effort, input_tokens, output_tokens, total_tokens, cost_usd, cost_rub, cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
+        <export-CritiqueResult PURPOSE="Dataclass for structured API response: text, model, agent_count, effort, input_tokens, output_tokens, total_tokens, cost_rub (from API or tariff estimate), cost_is_estimate, cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
         <export-ResponsesClient PURPOSE="Async HTTP client wrapper" />
         <export-ResponsesClient.call PURPOSE="Send request with retry (max 2 on 429/5xx) and dynamic timeout" />
         <export-get_client PURPOSE="Singleton factory for persistent AsyncClient" />
         <export-close_client PURPOSE="Graceful shutdown of persistent AsyncClient" />
         <export-MAX_CONTENT_CHARS PURPOSE="100000 — content size limit" />
+        <export-ModelPricing PURPOSE="PRICING-RUB: frozen dataclass тарифа модели в ₽ (input/output/cache_read_per_1m_rub, context_length, max_output_tokens)" />
+        <export-get_model_pricing PURPOSE="PRICING-RUB/PRICING-CACHE: тариф модели из GET {base_url}/models/{model}; кэш успеха 3600с, кэш неудачи 60с (PRICING_FAILURE_TTL_SECONDS), force=True обходит оба; никогда не бросает исключение" />
       </interface>
       <depends>M-CONFIG</depends>
       <target>
@@ -287,8 +290,21 @@
       <step-14 module="M-API" status="complete">DEDUP-SEM/BUDGET-SOFT: fn-_guarded_request — слот semaphore держит только общая задача; fn-_budget_exceeded_result проверяется внутри неё после слота и до HTTP, присоединившиеся (joiner) эту проверку не проходят; POLZA_DAILY_BUDGET_USD документирован как soft limit (перерасход не более чем на max_concurrent_requests одновременных запросов)</step-14>
       <step-15 module="M-CRITIC" status="complete">STORE-TMP-0600/STORE-TMP-UNIQUE: ReviewStore._atomic_write — на POSIX tmp создаётся через os.open(O_WRONLY|O_CREAT|O_EXCL, 0o600) без окна с правами по umask; имя tmp уникально на вызов (pid + uuid4) — параллельные писатели одного review_id не сталкиваются</step-15>
       <step-16 status="complete">Тесты второй волны критика: 36 новых тестов (322 → 358) — test_server 124→149, test_api_client 64→71, test_critic 56→60; ruff чистый, mypy без новых ошибок</step-16>
-      <step-17 status="complete">Контрольное ревью критика: rev_f27c1ca3d751 (корректность патча конкурентности), rev_34169f2fcd5e (security-аудит sandbox), rev_4dbf16f4295f (согласование понижений); ручной smoke-test check_health против реального Polza.AI выполнен 2026-09-16 (Status ok, баланс получен)</step-17>
+      <step-17 status="complete">Контрольное ревью критика: rev_f27c1ca3d751 (корректность патча конкурентности), rev_34169f2fcd5e (security-аудит sandbox), rev_4dbf16f4295f (согласование понижений); ручной smoke-test check_health против реального Polza.AI выполнен 16.09.2026 (Status ok, баланс получен)</step-17>
     </Phase-9>
+
+    <Phase-10 name="v1.12.0 — PRICING-RUB" status="complete">
+      <goal>Убрать ручные $-цены из конфига и денежный вывод: стоимость и дневной бюджет — только в ₽, по реальному тарифу модели из Polza.AI; логи и человекочитаемые даты — DD.MM.YYYY</goal>
+      <step-1 module="M-CONFIG" status="complete">Удалены price_input_per_1m/price_output_per_1m/daily_budget_usd; добавлен daily_budget_rub (0=off); DEPRECATED_ENV_KEYS + fn-_find_deprecated_keys/fn-_warn_deprecated_keys — один warning с именами устаревших ключей (POLZA_PRICE_*, POLZA_DAILY_BUDGET_USD), запуск не ломается; datefmt логов "%d.%m.%Y %H:%M:%S"</step-1>
+      <step-2 module="M-API" status="complete">type-ModelPricing (input/output/cache_read_per_1m_rub, context_length, max_output_tokens); fn-get_model_pricing — GET {base_url}/models/{model} с кэшем успеха 3600с (ключ base_url|model); fn-estimate_cost_rub — оценка по тарифу, когда API не вернул cost_rub, с флагом cost_is_estimate; CritiqueResult.cost_usd и fn-_calculate_cost удалены; fn-format_rub — единый формат «128 760,16 ₽»</step-2>
+      <step-3 module="M-API" status="complete">PRICING-CACHE: fn-get_model_pricing дополнительно кэширует НЕУДАЧУ на PRICING_FAILURE_TTL_SECONDS=60с (_pricing_failure, тот же ключ) — без него недоступный /models давал новый GET до 10с на каждый ответ без cost_rub; force=True обходит оба кэша; успешный запрос сбрасывает отметку неудачи</step-3>
+      <step-4 module="M-API" status="complete">fn-_budget_exceeded_result и суточная статистика (fn-get_usage_stats) переведены на daily_budget_rub/cost_rub; get_usage_stats()["date"] отдаётся в DD.MM.YYYY (внутренний ключ хранения остаётся ISO для сравнения при rollover)</step-4>
+      <step-5 module="M-CRITIC" status="complete">fn-health_check: result["pricing"] из get_model_pricing() вместо статичных config.price_*; тариф недоступен → issue + status пересчитывается в degraded; usage_today с date DD.MM.YYYY, cost_usd удалён</step-5>
+      <step-6 module="M-SERVER" status="complete">Весь денежный вывод — только ₽ (_fmt_rub); metadata footer «💰 Cost: 53,67 ₽» / «≈ … (оценка по тарифу)» при cost_is_estimate; check_health — новые fn-_format_pricing_lines/fn-_format_usage_today; reload_config_tool показывает daily_budget_rub (fn-_fmt_budget_rub: 0 → "без лимита")</step-6>
+      <step-7 module="M-SERVER" status="complete">LOG-TIME-RU: fn-_localize_root_log_time() — FastMCP при создании server ставит root RichHandler с временем по локали ОС; функция подменяет такие handler'ы (через публичный конструктор) на RichHandler с log_time_format="[%d.%m.%Y %H:%M:%S]", перенося console/level/formatter/filters и публичные rich-настройки (_RICH_HANDLER_ATTRS: markup, rich_tracebacks, keywords и др.); вызывается сразу после server = FastMCP("grok-critic")</step-7>
+      <step-8 module="M-CLI" status="complete">--json review/followup без cost_usd, с cost_is_estimate; health --ping печатает pricing (fn-_format_pricing_lines) и usage_today через fn-_format_usage_today; config — daily_budget_rub (текстовый вывод — человекочитаемо через fn-_fmt_budget_rub, --json остаётся числом)</step-8>
+      <step-9 status="complete">Тесты: 412 (410 passed + 2 skipped — было 358 в v1.11.2/development-plan): новые TestEstimateCostRub, TestGetModelPricing (включая test_failure_cached_briefly, test_failure_window_expires, test_network_exception_cached_briefly, test_failure_for_other_model_does_not_block), TestFormatRub в test_api_client.py; TestLogTimeFormat (3 теста) в test_server.py; ruff чистый; mypy — 6 предсуществующих ошибок, новых нет</step-9>
+    </Phase-10>
   </ImplementationOrder>
 
   <ExecutionPolicy>

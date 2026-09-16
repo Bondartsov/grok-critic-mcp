@@ -1,8 +1,8 @@
-<VerificationPlan VERSION="1.11.2">
+<VerificationPlan VERSION="1.12.0">
   <GlobalPolicy>
     <log-format>[Module][function][BLOCK_NAME] message</log-format>
     <deterministic-first>true</deterministic-first>
-    <module-level-focus>Fast deterministic checks with mocked HTTP responses (358 tests total: 356 passed + 2 skipped — POSIX-only permissions and a symlink test without privileges on Windows — test_server 149, test_api_client 71, test_critic 60, test_config 49, test_cli 26, test_package 3)</module-level-focus>
+    <module-level-focus>Fast deterministic checks with mocked HTTP responses (412 tests total: 410 passed + 2 skipped — POSIX-only permissions and a symlink test without privileges on Windows — test_server 163, test_api_client 101, test_critic 60, test_config 53, test_cli 32, test_package 3)</module-level-focus>
     <wave-level-focus>Integration between modules with realistic mock data</wave-level-focus>
     <phase-level-focus>Full pipeline from MCP tool call to response, including edge cases</phase-level-focus>
     <redaction>Never log API keys or full request/response payloads.</redaction>
@@ -144,13 +144,23 @@
 
     <VF-025 NAME="JoinerNotRejectedByBudget" PRIORITY="high">
       <scenario>BUDGET-SOFT: дневной бюджет исчерпан ПОСЛЕ того, как общая задача уже прошла _budget_exceeded_result и начала HTTP-запрос; новый вызов с тем же ключом присоединяется как joiner</scenario>
-      <expected-outcome>Joiner не проходит повторную проверку бюджета (она только внутри _guarded_request владельца) и получает результат общего запроса; POLZA_DAILY_BUDGET_USD документирован как soft limit с возможным перерасходом на max_concurrent_requests одновременных запросов</expected-outcome>
+      <expected-outcome>Joiner не проходит повторную проверку бюджета (она только внутри _guarded_request владельца) и получает результат общего запроса; POLZA_DAILY_BUDGET_RUB документирован как soft limit в ₽ с возможным перерасходом на max_concurrent_requests одновременных запросов</expected-outcome>
     </VF-025>
 
     <VF-026 NAME="StoreTmpExclusiveAndUnique" PRIORITY="medium">
       <scenario>STORE-TMP-0600/STORE-TMP-UNIQUE: два процесса (MCP-сессия + CLI, либо параллельные followup) одновременно вызывают ReviewStore._atomic_write для одного review_id на POSIX</scenario>
       <expected-outcome>Каждый вызов создаёт tmp с уникальным именем (.{имя}.{pid}.{uuid4}.tmp) через os.open(O_WRONLY|O_CREAT|O_EXCL, 0o600) — без коллизий и без окна с правами по umask; os.replace атомарно заменяет целевой файл; осиротевший tmp не подхватывается glob('rev_*.json')</expected-outcome>
     </VF-026>
+
+    <VF-027 NAME="PricingFailureCachedBriefly" PRIORITY="high">
+      <scenario>PRICING-CACHE: GET {base_url}/models/{model} возвращает ошибку (HTTP != 200, сетевое исключение, или payload без валидного RUB-тарифа); в течение PRICING_FAILURE_TTL_SECONDS=60с повторный get_model_pricing() для того же base_url|model вызывается без нового HTTP-запроса</scenario>
+      <expected-outcome>Второй вызов возвращает None из кэша неудачи (_pricing_failure) без похода в сеть; по истечении 60с (или force=True) — новый GET; успешный ответ сбрасывает _pricing_failure; неудача по одной модели не блокирует запрос тарифа для другой (разный ключ base_url|model)</expected-outcome>
+    </VF-027>
+
+    <VF-028 NAME="LogTimeLocalizedToRu" PRIORITY="medium">
+      <scenario>LOG-TIME-RU: server = FastMCP("grok-critic") ставит на root-логгер RichHandler с временем по локали ОС (в т.ч. с кастомными rich_tracebacks/markup/keywords/фильтрами); сразу после этого вызывается _localize_root_log_time()</scenario>
+      <expected-outcome>Каждый RichHandler root-логгера заменён (через публичный конструктор) на новый RichHandler с log_time_format="[%d.%m.%Y %H:%M:%S]"; console/level/formatter/filters и публичные rich-настройки (_RICH_HANDLER_ATTRS: markup, rich_tracebacks, keywords и др.) перенесены на замену без изменений; реально отрендеренная строка лога содержит DD.MM.YYYY и не содержит формат по локали ОС (MM/DD/YY); без установленного rich (ImportError) функция возвращает 0 и ничего не меняет</expected-outcome>
+    </VF-028>
   </CriticalFlows>
 
   <ModuleVerification>
@@ -166,7 +176,7 @@
         <scenario-2 kind="failure">Missing API key raises clear error</scenario-2>
         <scenario-3 kind="success">Default values applied correctly (agent_count=16, timeout=180, log_level=WARNING)</scenario-3>
         <scenario-4 kind="success">reload_config picks up new .env values</scenario-4>
-        <scenario-5 kind="success">Price fields loaded from POLZA_PRICE_INPUT_PER_1M / POLZA_PRICE_OUTPUT_PER_1M</scenario-5>
+        <scenario-5 kind="success">PRICING-RUB: POLZA_PRICE_INPUT_PER_1M / POLZA_PRICE_OUTPUT_PER_1M / POLZA_DAILY_BUDGET_USD, заданные в env или .env, не ломают запуск (extra="ignore") и дают ровно один DEPRECATED-warning со списком имён ключей (без значений); daily_budget_rub грузится из POLZA_DAILY_BUDGET_RUB</scenario-5>
         <scenario-6 kind="failure">api_key is SecretStr — empty string rejected (min_length=1)</scenario-6>
         <scenario-7 kind="failure">agent_count=0 rejected (ge=1)</scenario-7>
         <scenario-8 kind="failure">agent_count=65 rejected (le=64)</scenario-8>
@@ -192,9 +202,13 @@
         <scenario-7 kind="success">Retry on 5xx (up to 2 retries)</scenario-7>
         <scenario-8 kind="success">Dynamic timeout: 4 agents → 90s, 16 agents → config timeout</scenario-8>
         <scenario-9 kind="success">MAX_CONTENT_CHARS truncation applied</scenario-9>
-        <scenario-10 kind="success">Cost calculation: tokens × price_per_1m</scenario-10>
-        <scenario-11 kind="success">CritiqueResult dataclass fields populated correctly</scenario-11>
+        <scenario-10 kind="success">PRICING-RUB: cost_rub из ответа API используется как есть; при его отсутствии — estimate_cost_rub() по тарифу get_model_pricing() с cost_is_estimate=True</scenario-10>
+        <scenario-11 kind="success">CritiqueResult dataclass fields populated correctly (cost_rub, cost_is_estimate)</scenario-11>
         <scenario-12 kind="success">Persistent AsyncClient via get_client()</scenario-12>
+        <scenario-13 kind="success">get_model_pricing(): парсинг top_provider.pricing и fallback providers[0].pricing, currency != RUB → None + warning</scenario-13>
+        <scenario-14 kind="success">get_model_pricing(): кэш успеха 3600с по ключу base_url|model, force=True обходит кэш</scenario-14>
+        <scenario-15 kind="failure">PRICING-CACHE: HTTP-ошибка/сетевое исключение/невалидный payload → _pricing_failure кэшируется на 60с (test_failure_cached_briefly, test_network_exception_cached_briefly); по истечении окна — новый запрос (test_failure_window_expires); неудача по одной модели не блокирует другую (test_failure_for_other_model_does_not_block)</scenario-15>
+        <scenario-16 kind="success">format_rub(): «128760.16 → 128 760,16 ₽» (пробел-тысячи, запятая-десятичный)</scenario-16>
       </scenarios>
     </V-M-API>
 
@@ -213,7 +227,8 @@
         <scenario-5 kind="success">do_architecture_review uses ARCHITECTURE_SYSTEM_PROMPT</scenario-5>
         <scenario-6 kind="success">do_security_audit uses SECURITY_SYSTEM_PROMPT</scenario-6>
         <scenario-7 kind="success">followup includes previous_review context</scenario-7>
-        <scenario-8 kind="success">health_check returns config and pricing info</scenario-8>
+        <scenario-8 kind="success">health_check returns config and pricing info (PRICING-RUB: pricing из get_model_pricing() в ₽)</scenario-8>
+        <scenario-9 kind="failure">PRICING-RUB: тариф модели недоступен (get_model_pricing() → None) — health_check добавляет issue и итоговый status = degraded</scenario-9>
       </scenarios>
     </V-M-CRITIC>
 
@@ -238,7 +253,9 @@
         <scenario-11 kind="success">_review_tool decorator catches exceptions and returns user-friendly errors</scenario-11>
         <scenario-12 kind="success">_validate_agent_count clamps: 0→1, -5→1, 100→64</scenario-12>
         <scenario-13 kind="success">_read_file_content handles missing/empty/directory paths</scenario-13>
-        <scenario-14 kind="success">reload_config_tool uses get_secret_value() for masked display</scenario-14>
+        <scenario-14 kind="success">reload_config_tool uses get_secret_value() for masked display (daily_budget_rub вместо price_*/daily_budget_usd)</scenario-14>
+        <scenario-15 kind="success">PRICING-RUB: metadata footer показывает «💰 Cost: X ₽» для cost_rub из API и «≈ X ₽ (оценка по тарифу)» для cost_is_estimate=True; при cost_rub None/0 строка Cost отсутствует</scenario-15>
+        <scenario-16 kind="success">LOG-TIME-RU: _localize_root_log_time() заменяет RichHandler root-логгера на формат DD.MM.YYYY, перенося console/level/formatter/filters и публичные rich-настройки (markup, rich_tracebacks, keywords); без rich — no-op (0)</scenario-16>
       </scenarios>
     </V-M-SERVER>
     <V-M-CLI MODULE="M-CLI" PRIORITY="high">
@@ -260,6 +277,7 @@
         <scenario-9 kind="success">doctor проверяет Python, версию vs git HEAD, шим CLI, .env, ключ, TCP base_url+proxy, store writable, лог</scenario-9>
         <scenario-10 kind="success">Без подкоманды CLI эквивалентен serve (совместимость с конфигами MCP-клиентов)</scenario-10>
         <scenario-11 kind="success">Exit codes: 0 ok / 1 warning / 2 error согласованы по всем командам</scenario-11>
+        <scenario-12 kind="success">PRICING-RUB: review/followup --json без cost_usd, с cost_is_estimate; health --ping --json включает pricing (₽); config/config --json — daily_budget_rub (текстовый режим — через _fmt_budget_rub, "без лимита" при 0)</scenario-12>
       </scenarios>
     </V-M-CLI>
   </ModuleVerification>
@@ -351,6 +369,20 @@
         <evidence-3>mypy — только 6 предсуществующих ошибок, новых нет</evidence-3>
       </required-evidence>
     </Gate-Phase-9>
+    <Gate-Phase-10 PHASE="Phase-10">
+      <goal>v1.12.0 PRICING-RUB validated: денежный вывод и дневной бюджет только в ₽ по реальному тарифу Polza.AI, кэш неудачи тарифа, логи и даты DD.MM.YYYY</goal>
+      <commands>
+        <command-1>pytest tests/ -v</command-1>
+        <command-2>ruff check src tests</command-2>
+        <command-3>mypy src</command-3>
+      </commands>
+      <required-evidence>
+        <evidence-1>412 tests pass (410 passed + 2 skipped — POSIX-only permissions and a symlink test without privileges on Windows)</evidence-1>
+        <evidence-2>ruff чистый (0 находок)</evidence-2>
+        <evidence-3>mypy — только 6 предсуществующих ошибок, новых нет</evidence-3>
+        <evidence-4>grep по "1.11.2"/USD-ценам/ISO-датам в pyproject.toml, src, tests, docs/*.xml не даёт новых расхождений</evidence-4>
+      </required-evidence>
+    </Gate-Phase-10>
   </PhaseGates>
 
   <FailurePackets>

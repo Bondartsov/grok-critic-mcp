@@ -1,5 +1,5 @@
 # FILE: tests/test_cli.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Tests for M-CLI terminal interface (serve/health/doctor/review/followup/logs/config)
 #   SCOPE: argparse wiring, exit codes, mocked API calls, store interaction, output formats
@@ -31,12 +31,20 @@ def _ok_result(**overrides) -> CritiqueResult:
         input_tokens=100,
         output_tokens=50,
         total_tokens=150,
-        cost_usd=0.001,
         cost_rub=0.1,
         review_id="rev_cli0001",
     )
     defaults.update(overrides)
     return CritiqueResult(**defaults)
+
+
+_PRICING = {
+    "input_per_1m_rub": 147.35,
+    "output_per_1m_rub": 294.70,
+    "cache_read_per_1m_rub": 23.576,
+    "context_length": 2_000_000,
+    "max_output_tokens": 1_800_000,
+}
 
 
 def _args(**kwargs) -> argparse.Namespace:
@@ -92,7 +100,8 @@ class TestHealthCommand:
             "base_url": "https://x",
             "issues": [],
             "balance_rub": 100.5,
-            "usage_today": {"calls": 2, "errors": 0, "cost_usd": 0.1, "cost_rub": 3.0},
+            "pricing": dict(_PRICING),
+            "usage_today": {"date": "16.09.2026", "calls": 2, "errors": 0, "cost_rub": 3.0},
         }
         with patch("grok_critic.cli.health_check", new_callable=AsyncMock, return_value=fake):
             rc = cli.cmd_health(_args(ping=True, json=True))
@@ -100,6 +109,44 @@ class TestHealthCommand:
         payload = json.loads(capsys.readouterr().out)
         assert payload["balance_rub"] == 100.5
         assert payload["usage_today"]["calls"] == 2
+        assert payload["usage_today"]["date"] == "16.09.2026"
+        assert "cost_usd" not in payload["usage_today"]
+        # PRICING-RUB: в JSON суммы — числа, без форматирования
+        assert payload["pricing"] == _PRICING
+
+    def test_ping_text_rub_and_limits(self, capsys) -> None:
+        fake = {
+            "status": "ok",
+            "model": "m",
+            "base_url": "https://x",
+            "issues": [],
+            "balance_rub": 128760.16,
+            "pricing": dict(_PRICING),
+            "usage_today": {"date": "16.09.2026", "calls": 2, "errors": 1, "cost_rub": 53.67},
+        }
+        with patch("grok_critic.cli.health_check", new_callable=AsyncMock, return_value=fake):
+            rc = cli.cmd_health(_args(ping=True, json=False))
+        out = capsys.readouterr().out
+        assert rc == cli.EXIT_OK
+        assert "Pricing: вход 147,35 ₽ · выход 294,70 ₽ · кэш 23,58 ₽ за 1M токенов" in out
+        assert "Limits: контекст 2 000 000 · макс. ответ 1 800 000 токенов" in out
+        assert "Balance: 128 760,16 ₽" in out
+        assert "Today (16.09.2026): 2 calls | 53,67 ₽ (1 errors)" in out
+        assert "$" not in out
+
+    def test_ping_json_without_tariff(self, capsys) -> None:
+        fake = {
+            "status": "degraded",
+            "model": "m",
+            "base_url": "https://x",
+            "issues": ["Тариф модели недоступен (GET /models/m)"],
+            "usage_today": {"date": "16.09.2026", "calls": 0, "errors": 0, "cost_rub": 0.0},
+        }
+        with patch("grok_critic.cli.health_check", new_callable=AsyncMock, return_value=fake):
+            rc = cli.cmd_health(_args(ping=True, json=True))
+        assert rc == cli.EXIT_WARN
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["pricing"] is None
 
     def test_ping_degraded(self, capsys) -> None:
         fake = {
@@ -107,7 +154,7 @@ class TestHealthCommand:
             "model": "m",
             "base_url": "https://x",
             "issues": ["Balance API returned 500"],
-            "usage_today": {"calls": 0, "errors": 1, "cost_usd": 0.0, "cost_rub": 0.0},
+            "usage_today": {"date": "16.09.2026", "calls": 0, "errors": 1, "cost_rub": 0.0},
         }
         with patch("grok_critic.cli.health_check", new_callable=AsyncMock, return_value=fake):
             rc = cli.cmd_health(_args(ping=True, json=False))
@@ -175,6 +222,19 @@ class TestReviewCommand:
         assert payload["success"] is True
         assert payload["review_id"] == "rev_cli0001"
         assert payload["total_tokens"] == 150
+        assert "cost_usd" not in payload
+        assert payload["cost_rub"] == 0.1
+        assert payload["cost_is_estimate"] is False
+
+    def test_review_json_payload_estimate_flag(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(cli.sys, "stdin", io.StringIO("code"))
+        result = _ok_result(cost_rub=53.67, cost_is_estimate=True)
+        with patch("grok_critic.cli.general_review", new_callable=AsyncMock, return_value=result):
+            rc = cli.cmd_review(_args(path="-", context=None, agents=4, focus=None, json=True, json_output=False))
+        assert rc == cli.EXIT_OK
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["cost_rub"] == 53.67
+        assert payload["cost_is_estimate"] is True
 
 
 # END_BLOCK_REVIEW_TESTS
@@ -273,6 +333,20 @@ class TestConfigCommand:
         assert rc == cli.EXIT_OK
         assert payload["model"]
         assert "entries" not in payload  # это конфиг, не дамп store
+        # PRICING-RUB: устаревшие $-поля удалены, бюджет — число в ₽
+        for removed in ("price_input_per_1m", "price_output_per_1m", "daily_budget_usd"):
+            assert removed not in payload
+        assert isinstance(payload["daily_budget_rub"], float)
+
+    def test_text_budget_human_readable(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(cli.config, "daily_budget_rub", 0.0)
+        cli.cmd_config(_args(json=False))
+        assert "daily_budget_rub: без лимита" in capsys.readouterr().out
+        monkeypatch.setattr(cli.config, "daily_budget_rub", 1500.0)
+        cli.cmd_config(_args(json=False))
+        out = capsys.readouterr().out
+        assert "daily_budget_rub: 1 500,00 ₽" in out
+        assert "price_" not in out
 
 
 class TestDoctorCommand:

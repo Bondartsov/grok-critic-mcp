@@ -1,11 +1,23 @@
 # FILE: src/grok_critic/server.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: FastMCP server exposing 8 tools for code review, architecture, security, admin
 #   SCOPE: Register MCP tools, handle parameter parsing, format metadata, run server
 #   DEPENDS: M-CRITIC, M-CONFIG, mcp
 #   LINKS: M-SERVER
 # END_MODULE_CONTRACT
+# START_CHANGE_SUMMARY
+#   PRICING-RUB: весь денежный вывод — только ₽ в формате «128 760,16 ₽» (_fmt_rub),
+#     доллары удалены. Footer: «💰 Cost: 53,67 ₽» / «≈ … (оценка по тарифу)».
+#     check_health: Pricing/Limits из тарифа Polza.AI, Today (DD.MM.YYYY).
+#     reload_config_tool: daily_budget_rub вместо price_* / daily_budget_usd.
+#   LOG-TIME-RU: _localize_root_log_time() — FastMCP при создании server = FastMCP(...)
+#     ставит на root-логгер RichHandler с временем по локали ОС ([09/16/26 ...]);
+#     функция заменяет такие handler'ы на RichHandler с log_time_format=
+#     _RU_LOG_TIME_FORMAT ("[%d.%m.%Y %H:%M:%S]"), сохраняя console/level/formatter/
+#     filters и публичные настройки rich (_RICH_HANDLER_ATTRS: markup, rich_tracebacks,
+#     keywords и др.) через публичный конструктор; вызывается сразу после создания server.
+# END_CHANGE_SUMMARY
 
 from __future__ import annotations
 
@@ -24,6 +36,7 @@ from typing import Any
 from mcp.server.fastmcp import Context, FastMCP
 
 from grok_critic.api_client import close_client
+from grok_critic.api_client import format_rub as _fmt_rub
 from grok_critic.config import config, reload_config
 from grok_critic.critic import (
     do_architecture_review,
@@ -57,15 +70,41 @@ def _format_metadata(result, elapsed_sec: float | None = None) -> str:
     if result.cached_tokens > 0:
         pct = (result.cached_tokens / result.input_tokens * 100) if result.input_tokens > 0 else 0
         lines.append(f"💾 Cached: {_fmt(result.cached_tokens)}/{_fmt(result.input_tokens)} ({pct:.0f}%)")
-    cost_parts: list[str] = []
+    # PRICING-RUB: только ₽; оценка по тарифу помечается явно; None/0 — без строки.
     if result.cost_rub is not None and result.cost_rub > 0:
-        cost_parts.append(f"{result.cost_rub:.2f} ₽")
-    if result.cost_usd > 0:
-        cost_parts.append(f"${result.cost_usd:.4f}")
-    if cost_parts:
-        lines.append(f"💰 Cost: {' | '.join(cost_parts)}")
+        if getattr(result, "cost_is_estimate", False):
+            lines.append(f"💰 Cost: ≈ {_fmt_rub(result.cost_rub)} (оценка по тарифу)")
+        else:
+            lines.append(f"💰 Cost: {_fmt_rub(result.cost_rub)}")
     lines.append(f"🏷️ Review ID: {result.review_id}")
     return "\n".join(lines)
+
+
+def _format_pricing_lines(pricing: dict[str, Any]) -> list[str]:
+    """Строки тарифа модели в ₽ (+ лимиты, если известны) для check_health и CLI."""
+    lines = [
+        f"Pricing: вход {_fmt_rub(pricing['input_per_1m_rub'])} · "
+        f"выход {_fmt_rub(pricing['output_per_1m_rub'])} · "
+        f"кэш {_fmt_rub(pricing['cache_read_per_1m_rub'])} за 1M токенов"
+    ]
+    limit_parts: list[str] = []
+    if pricing.get("context_length") is not None:
+        limit_parts.append(f"контекст {_fmt(int(pricing['context_length']))}")
+    if pricing.get("max_output_tokens") is not None:
+        limit_parts.append(f"макс. ответ {_fmt(int(pricing['max_output_tokens']))}")
+    if limit_parts:
+        lines.append(f"Limits: {' · '.join(limit_parts)} токенов")
+    return lines
+
+
+def _format_usage_today(usage: dict[str, Any]) -> str:
+    """«Today (16.09.2026): 3 calls | 45,60 ₽ (1 errors)» — дата уже в DD.MM.YYYY."""
+    date = usage.get("date")
+    label = f"Today ({date})" if date else "Today"
+    return (
+        f"{label}: {usage.get('calls', 0)} calls | "
+        f"{_fmt_rub(usage.get('cost_rub', 0.0))} ({usage.get('errors', 0)} errors)"
+    )
 
 
 def _format_result(result, elapsed_sec: float | None = None) -> str:
@@ -432,7 +471,58 @@ def _review_tool(tool_name: str, *, allow_file_path: bool = True) -> Callable:
 
 
 # START_BLOCK_SERVER_INIT
+_RU_LOG_TIME_FORMAT = "[%d.%m.%Y %H:%M:%S]"
+# Публичные атрибуты RichHandler, которые переносятся на замену (formatting/tracebacks).
+# hasattr-проверка ниже переживает переименования в будущих версиях rich.
+_RICH_HANDLER_ATTRS: tuple[str, ...] = (
+    "highlighter", "markup", "enable_link_path", "keywords", "rich_tracebacks",
+    "tracebacks_width", "tracebacks_code_width", "tracebacks_extra_lines", "tracebacks_theme",
+    "tracebacks_word_wrap", "tracebacks_show_locals", "tracebacks_suppress", "tracebacks_max_frames",
+    "locals_max_length", "locals_max_string",
+)
+
+
+def _localize_root_log_time() -> int:
+    """Даты в stderr-логах библиотек (httpx, mcp) — в формате DD.MM.YYYY.
+
+    FastMCP при создании вызывает logging.basicConfig с RichHandler, у которого
+    время по умолчанию берётся из локали ОС («[09/16/26 12:01:30]»). Заменяем такие
+    обработчики корневого логгера на RichHandler с форматом DD.MM.YYYY, сохраняя
+    консоль, уровень, форматтер, фильтры и публичные настройки (_RICH_HANDLER_ATTRS).
+    Замена через публичный конструктор, а не правка приватного _log_render.
+    close() старого безопасен: RichHandler его не переопределяет, консоль не трогается.
+    Возвращает число заменённых обработчиков.
+    """
+    try:
+        from rich.logging import RichHandler
+    except ImportError:  # без rich basicConfig ставит StreamHandler — менять нечего
+        return 0
+    root = logging.getLogger()
+    replaced = 0
+    for old in list(root.handlers):
+        if not isinstance(old, RichHandler):
+            continue
+        new = RichHandler(console=old.console, log_time_format=_RU_LOG_TIME_FORMAT)
+        for attr in _RICH_HANDLER_ATTRS:
+            if hasattr(old, attr):
+                setattr(new, attr, getattr(old, attr))
+        new.setLevel(old.level)
+        new.setFormatter(old.formatter)
+        for flt in old.filters:
+            new.addFilter(flt)
+        root.removeHandler(old)
+        old.close()
+        root.addHandler(new)
+        replaced += 1
+    if replaced:
+        logger.debug(
+            "[Server][_localize_root_log_time][LOG_TIME] replaced=%d format=%s", replaced, _RU_LOG_TIME_FORMAT
+        )
+    return replaced
+
+
 server = FastMCP("grok-critic")
+_localize_root_log_time()
 
 
 # END_BLOCK_SERVER_INIT
@@ -522,7 +612,11 @@ async def critic_followup(
 # START_BLOCK_TOOL_HEALTH_CHECK
 @server.tool()
 async def check_health() -> str:
-    """Check the health of the grok-critic MCP server and configuration."""
+    """Check the health of the grok-critic MCP server and configuration.
+
+    Shows status, model tariff in ₽ (input/output/cache per 1M tokens, from Polza.AI
+    GET /models/{model}), model limits, balance in ₽ and today's usage (DD.MM.YYYY).
+    """
     logger.info("[Server][check_health][TOOL_CALL] Health check requested")
     try:
         result = await health_check()
@@ -531,18 +625,12 @@ async def check_health() -> str:
         lines.append(f"Base URL: {result['base_url']}")
         if result["issues"]:
             lines.append(f"Issues: {', '.join(result['issues'])}")
-        if "pricing" in result:
-            pricing = result["pricing"]
-            lines.append(f"Pricing: input=${pricing['input_per_1m']}/1M output=${pricing['output_per_1m']}/1M")
+        if result.get("pricing"):
+            lines.extend(_format_pricing_lines(result["pricing"]))
         if "balance_rub" in result:
-            lines.append(f"Balance: {result['balance_rub']:.2f} ₽")
+            lines.append(f"Balance: {_fmt_rub(result['balance_rub'])}")
         if "usage_today" in result:
-            usage = result["usage_today"]
-            lines.append(
-                f"📊 Today: {usage['calls']} calls | "
-                f"${usage['cost_usd']:.4f} | {usage['cost_rub']:.2f} ₽"
-                f" ({usage['errors']} errors)"
-            )
+            lines.append(f"📊 {_format_usage_today(result['usage_today'])}")
         return "\n".join(lines)
     except Exception as exc:
         logger.exception("[Server][check_health][ERROR]")
@@ -615,11 +703,16 @@ async def security_audit(
 
 
 # START_BLOCK_TOOL_RELOAD_CONFIG
+def _fmt_budget_rub(value: float) -> str:
+    """Дневной бюджет для человека: 0 → «без лимита», иначе сумма в ₽."""
+    return "без лимита" if not value else _fmt_rub(value)
+
+
 @server.tool()
 async def reload_config_tool() -> str:
     """Hot-reload configuration from .env without restarting the server.
 
-    Use when you change POLZA_* env vars (API key, prices, timeout, etc.)
+    Use when you change POLZA_* env vars (API key, daily budget in ₽, timeout, etc.)
     and want the server to pick up new values immediately.
     """
     logger.info("[Server][reload_config_tool][TOOL_CALL] Reloading config")
@@ -637,10 +730,8 @@ async def reload_config_tool() -> str:
             f"  agent_count: {new_cfg.agent_count}",
             f"  timeout_seconds: {new_cfg.timeout_seconds}",
             f"  log_level: {new_cfg.log_level}",
-            f"  price_input_per_1m: ${new_cfg.price_input_per_1m}",
-            f"  price_output_per_1m: ${new_cfg.price_output_per_1m}",
             f"  allow_file_path: {new_cfg.allow_file_path}",
-            f"  daily_budget_usd: ${new_cfg.daily_budget_usd}",
+            f"  daily_budget_rub: {_fmt_budget_rub(new_cfg.daily_budget_rub)}",
             f"  max_concurrent_requests: {new_cfg.max_concurrent_requests}",
             f"  retry_deadline_seconds: {new_cfg.retry_deadline_seconds or '(auto = timeout_seconds)'}",
         ]

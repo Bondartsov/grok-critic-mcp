@@ -1,47 +1,54 @@
 <KnowledgeGraph>
-  <Project NAME="grok-critic-mcp" VERSION="1.11.2">
-    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP, prompt caching, self-update, SecretStr, decorator, retry deadline, in-flight dedup, daily budget, review store, prompt injection guard, CLI, disk store</keywords>
-    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 8 MCP tools + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) для агентов — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет (FEAT-BUDGET), followup по review_id через пер-файловый дисковый ReviewStore (db/reviews/, переживает рестарты, race-free), JSON-режим, injection-guard. Используется как субагент "Критик" в Kilo Code через skill.</annotation>
+  <Project NAME="grok-critic-mcp" VERSION="1.12.0">
+    <keywords>MCP, grok, multi-agent, critic, xAI, Polza.AI, code review, architecture review, security audit, Responses API, FastMCP, prompt caching, self-update, SecretStr, decorator, retry deadline, in-flight dedup, daily budget, review store, prompt injection guard, CLI, disk store, RUB pricing, model tariff</keywords>
+    <annotation>MCP сервер-обёртка для grok-4.20-multi-agent через Polza.AI. 8 MCP tools + терминальный CLI (grok-critic: serve/health/doctor/review/followup/logs/config) для агентов — ревью и диагностика работают из Bash даже при отвалившемся MCP. file_path sandbox — opt-in POLZA_ALLOW_FILE_PATH + glob-denylist секретов (SEC-02/03). Retry с общим дедлайном (REL-06), in-flight dedup, semaphore и дневной бюджет в ₽ (FEAT-BUDGET/PRICING-RUB), followup по review_id через пер-файловый дисковый ReviewStore (db/reviews/, переживает рестарты, race-free), JSON-режим, injection-guard. Стоимость — только в ₽: реальный тариф модели из Polza.AI (GET /models/{model}, кэш успеха 1ч / неудачи 60с) или оценка по нему (cost_is_estimate); даты в человекочитаемом выводе — DD.MM.YYYY. Используется как субагент "Критик" в Kilo Code через skill.</annotation>
 
     <M-CONFIG NAME="Config" TYPE="UTILITY" STATUS="complete">
-      <purpose>Загрузка и валидация конфигурации через pydantic-settings: API ключ (SecretStr), base URL, timeout, agent_count, цены, логирование, безопасность (allow_file_path, allowed_read_dirs), надёжность (max_retries, retry_deadline_seconds), бюджет (daily_budget_usd, max_concurrent_requests). Hot reload без рестарта. Валидации: api_key min_length=1, agent_count ge=1 le=64, timeout_seconds ge=1, max_concurrent_requests ge=1 le=16.</purpose>
+      <purpose>Загрузка и валидация конфигурации через pydantic-settings: API ключ (SecretStr), base URL, timeout, agent_count, логирование (datefmt DD.MM.YYYY), безопасность (allow_file_path, allowed_read_dirs), надёжность (max_retries, retry_deadline_seconds), бюджет в ₽ (daily_budget_rub, max_concurrent_requests — PRICING-RUB). Цены больше не конфигурируются — берутся из тарифа Polza.AI (M-API get_model_pricing); устаревшие POLZA_PRICE_*/POLZA_DAILY_BUDGET_USD не ломают запуск, дают один DEPRECATED-warning с именами ключей. Hot reload без рестарта. Валидации: api_key min_length=1, agent_count ge=1 le=64, timeout_seconds ge=1, max_concurrent_requests ge=1 le=16.</purpose>
       <path>src/grok_critic/config.py</path>
       <depends>none</depends>
       <verification-ref>V-M-CONFIG</verification-ref>
       <annotations>
-        <type-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_, fields: api_key (SecretStr), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, log_file, price_input_per_1m, price_output_per_1m, allow_self_update, allowed_read_dirs (sandbox roots, действует при allow_file_path=true — SEC-03), allow_file_path (opt-in file_path), max_retries, retry_backoff_base, retry_deadline_seconds (0=auto, REL-06), max_content_chars, timeout_low, timeout_mid, daily_budget_usd (0=off, FEAT-BUDGET), max_concurrent_requests, store_path (FEAT-CLI: файл дискового ReviewStore, пусто = repo db/reviews.json)" />
+        <type-AppConfig PURPOSE="Pydantic Settings model with env_prefix=POLZA_, fields: api_key (SecretStr), base_url, model, agent_count (ge=1,le=64), timeout_seconds (ge=1), log_level, log_file, allow_self_update, allowed_read_dirs (sandbox roots, действует при allow_file_path=true — SEC-03), allow_file_path (opt-in file_path), max_retries, retry_backoff_base, retry_deadline_seconds (0=auto, REL-06), max_content_chars, timeout_low, timeout_mid, daily_budget_rub (0=off, FEAT-BUDGET/PRICING-RUB — лимит по фактической cost_rub), max_concurrent_requests, store_path (FEAT-CLI: файл дискового ReviewStore, пусто = repo db/reviews.json). price_input_per_1m/price_output_per_1m/daily_budget_usd удалены в 1.12.0 (PRICING-RUB)" />
         <fn-_resolve_env_file PURPOSE="FIX-ENV-PATH: путь к .env — POLZA_ENV_FILE → cwd/.env → legacy рядом с пакетом (pip install -e .)" />
-        <fn-load_config PURPOSE="Load config from env vars and .env file" />
+        <fn-load_config PURPOSE="Load config from env vars and .env file; вызывает _warn_deprecated_keys()" />
         <fn-reload_config PURPOSE="Hot reload config from .env without process restart" />
-        <fn-_setup_logging PURPOSE="Configure Python logging with level from env (private); закрывает и close()-ит прежние handler'ы root-логгера перед добавлением новых — reload_config не копит файловые дескрипторы" />
+        <fn-_setup_logging PURPOSE="Configure Python logging with level from env (private); datefmt DD.MM.YYYY; закрывает и close()-ит прежние handler'ы root-логгера перед добавлением новых — reload_config не копит файловые дескрипторы" />
+        <const-DEPRECATED_ENV_KEYS PURPOSE="PRICING-RUB: кортеж удалённых в 1.12.0 ключей — POLZA_PRICE_INPUT_PER_1M, POLZA_PRICE_OUTPUT_PER_1M, POLZA_DAILY_BUDGET_USD" />
+        <fn-_find_deprecated_keys PURPOSE="Имена DEPRECATED_ENV_KEYS, заданных в os.environ или в разрешённом .env (только имена, значения не читаются в результат); ошибка чтения .env не ломает загрузку конфига" />
+        <fn-_warn_deprecated_keys PURPOSE="Один logger.warning со списком найденных устаревших ключей (без значений) и подсказкой — цены из тарифа Polza.AI, бюджет через POLZA_DAILY_BUDGET_RUB" />
         <export-config PURPOSE="Module-level config singleton" />
       </annotations>
     </M-CONFIG>
 
     <M-API NAME="APIClient" TYPE="INTEGRATION" STATUS="complete">
-      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff (TimeoutException + все httpx.TransportError, с пересозданием клиента) и общим дедлайном (REL-06), cancel-safe in-flight dedup параллельных одинаковых запросов (DEDUP-CANCEL), semaphore одновременных запросов держит только общая задача (DEDUP-SEM), суточная статистика и soft budget-guard (BUDGET-SOFT: возможен перерасход не более чем на max_concurrent_requests одновременно выполняющихся запросов), динамический timeout, расчёт стоимости, сообщения об ошибках на русском. Поддержка полного диалога через messages-override (FEAT-FOLLOWUP-ID).</purpose>
+      <purpose>Async HTTP клиент для Polza.AI Responses API. Persistent AsyncClient, retry с backoff (TimeoutException + все httpx.TransportError, с пересозданием клиента) и общим дедлайном (REL-06), cancel-safe in-flight dedup параллельных одинаковых запросов (DEDUP-CANCEL), semaphore одновременных запросов держит только общая задача (DEDUP-SEM), суточная статистика в ₽ и soft budget-guard (BUDGET-SOFT: возможен перерасход не более чем на max_concurrent_requests одновременно выполняющихся запросов), динамический timeout, сообщения об ошибках на русском. PRICING-RUB: стоимость — cost_rub из ответа API, иначе оценка estimate_cost_rub() по тарифу get_model_pricing() (GET {base_url}/models/{model}, кэш успеха 1ч / неудачи 60с — PRICING-CACHE) с флагом cost_is_estimate; format_rub() — единый денежный формат «128 760,16 ₽». Поддержка полного диалога через messages-override (FEAT-FOLLOWUP-ID).</purpose>
       <path>src/grok_critic/api_client.py</path>
       <depends>M-CONFIG</depends>
       <verification-ref>V-M-API</verification-ref>
       <annotations>
-        <type-CritiqueResult PURPOSE="Dataclass: text, model, agent_count, effort, input/output/total_tokens, cost_usd, cost_rub (from API), cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
+        <type-CritiqueResult PURPOSE="Dataclass: text, model, agent_count, effort, input/output/total_tokens, cost_rub (from API or tariff estimate), cost_is_estimate, cached_tokens, reasoning_tokens, review_id, error; property success = not error" />
         <type-ResponsesClient PURPOSE="Async HTTP client wrapper: call() = in-flight dedup join (asyncio.shield) → общая задача _guarded_request (semaphore → budget-guard → _perform_request → _request_once); все ожидающие, включая создателя, — только shield над общей задачей" />
         <fn-call PURPOSE="Public entry: dedup-ключ → join существующей задачи ИЛИ создание новой asyncio.Task(_guarded_request) с done-callback _inflight_discard, зарегистрированным синхронно до await — все вызывающие ждут через asyncio.shield" />
         <fn-_guarded_request PURPOSE="DEDUP-SEM: тело общей in-flight задачи — слот semaphore держит только она (I4); внутри слота — BUDGET-SOFT: _budget_exceeded_result() после слота и до HTTP, присоединившиеся (joiner) эту проверку не проходят; затем _perform_request" />
-        <fn-_budget_exceeded_result PURPOSE="BUDGET-SOFT: CritiqueResult-отказ, если daily_budget_usd задан и потрачено >= него, иначе None; POLZA_DAILY_BUDGET_USD — soft limit (перерасход возможен, т.к. стоимость multi-agent запроса известна только по завершении)" />
+        <fn-_budget_exceeded_result PURPOSE="BUDGET-SOFT/PRICING-RUB: CritiqueResult-отказ, если daily_budget_rub задан и потрачено (cost_rub) >= него, иначе None; POLZA_DAILY_BUDGET_RUB — soft limit в ₽ (перерасход возможен, т.к. стоимость multi-agent запроса известна только по завершении)" />
         <fn-_inflight_discard PURPOSE="DEDUP-CANCEL: done-callback общей задачи — удаляет запись _inflight только если она всё ещё указывает на эту задачу (identity, I3); отмена задачи создателем/joiner'ом саму задачу и слот НЕ отменяет и запись раньше времени не удаляет; логирует cancelled/exception (помечает exception как retrieved)" />
         <fn-_perform_request PURPOSE="Transport + single _record_result() accounting per real request" />
         <fn-_request_once PURPOSE="Build body (model, reasoning.effort, input, prompt_cache_key), retry loop with per-attempt timeout capped by REL-06 deadline, RU error mapping" />
         <fn-_dedup_key PURPOSE="sha256 key от {m: input_messages, a: agent_count, model}, где input_messages — ФАКТИЧЕСКИЙ список сообщений из _build_input_messages (включая followup-историю и effective system prompt); параллельные followup по разным review_id больше не склеиваются" />
         <fn-_build_input_messages PURPOSE="Строит итоговый список input-сообщений (system + история диалога/messages-override + prompt), который уходит и в тело запроса, и в _dedup_key — единый источник правды" />
-        <fn-get_usage_stats PURPOSE="Суточная статистика: calls/errors/cost_usd/cost_rub, сброс по смене даты (FEAT-BUDGET)" />
+        <fn-get_usage_stats PURPOSE="PRICING-RUB: суточная статистика: date (DD.MM.YYYY), calls/errors/cost_rub, сброс по смене даты (FEAT-BUDGET); внутренний ключ хранения — ISO, наружу отдаётся DD.MM.YYYY" />
         <fn-_record_result PURPOSE="Учёт результата запроса в _usage_stats" />
         <fn-_get_semaphore PURPOSE="asyncio.Semaphore по config.max_concurrent_requests, пересоздаётся при смене лимита" />
         <fn-get_client PURPOSE="Singleton factory for persistent AsyncClient (follow_redirects=True)" />
         <fn-close_client PURPOSE="Gracefully close persistent AsyncClient" />
         <fn-_extract_usage PURPOSE="Extract tokens, cost_rub, cached_tokens from usage payload" />
         <fn-_extract_text PURPOSE="Extract output_text from Responses API payload" />
-        <fn-_calculate_cost PURPOSE="Calculate estimated USD cost from token counts and per-1M prices" />
+        <type-ModelPricing PURPOSE="PRICING-RUB: frozen dataclass — input_per_1m_rub, output_per_1m_rub, cache_read_per_1m_rub, context_length, max_output_tokens" />
+        <fn-_parse_model_pricing PURPOSE="Разбор ответа GET /models/{model}: top_provider.pricing → fallback providers[0].pricing; currency must be RUB, иначе None + warning" />
+        <fn-get_model_pricing PURPOSE="PRICING-RUB/PRICING-CACHE: тариф текущей модели из Polza.AI; кэш успеха PRICING_CACHE_TTL_SECONDS=3600с и кэш неудачи PRICING_FAILURE_TTL_SECONDS=60с (оба по ключу base_url|model, force=True обходит); никогда не бросает исключение — ошибка → None + warning, ключ API в лог не попадает" />
+        <fn-estimate_cost_rub PURPOSE="PRICING-RUB: оценка стоимости в ₽ по ModelPricing, если cost_rub не пришёл из API — некэшированный вход × input + кэшированный × cache_read + выход × output" />
+        <fn-format_rub PURPOSE="PRICING-RUB: единый денежный формат «128 760,16 ₽» (пробел — тысячи, запятая — десятичный); переиспользуется в server.py/cli.py" />
         <const-MAX_CONTENT_CHARS PURPOSE="100000 — backward-compat alias; канонично config.max_content_chars (DoS protection)" />
         <fn-_resolve_effort PURPOSE="Map agent_count to reasoning.effort: &lt;=4 → 'low', else 'high'" />
       </annotations>
@@ -49,7 +56,7 @@
     </M-API>
 
     <M-CRITIC NAME="CriticLogic" TYPE="CORE_LOGIC" STATUS="complete">
-      <purpose>Промпт-инжиниринг и оркестрация ревью. 3 специализированных system prompt (general, architecture, security) + INJECTION_GUARD ко всем + JSON_OUTPUT_INSTRUCTION для output_format=json. DRY через _perform_review() с сохранением диалога в ReviewStore. followup по review_id (FEAT-FOLLOWUP-ID) или полному тексту. Health check с balance API (кэш 60с) и usage_today.</purpose>
+      <purpose>Промпт-инжиниринг и оркестрация ревью. 3 специализированных system prompt (general, architecture, security) + INJECTION_GUARD ко всем + JSON_OUTPUT_INSTRUCTION для output_format=json. DRY через _perform_review() с сохранением диалога в ReviewStore. followup по review_id (FEAT-FOLLOWUP-ID) или полному тексту. Health check с тарифом модели в ₽ (get_model_pricing, PRICING-RUB — недоступность тарифа добавляет issue и переводит status в degraded), balance API (кэш 60с) и usage_today (date DD.MM.YYYY, calls, errors, cost_rub).</purpose>
       <path>src/grok_critic/critic.py</path>
       <depends>M-API, M-CONFIG</depends>
       <verification-ref>V-M-CRITIC</verification-ref>
@@ -69,7 +76,7 @@
         <fn-do_architecture_review PURPOSE="Architecture-specific review pipeline" />
         <fn-do_security_audit PURPOSE="Security-specific audit pipeline" />
         <fn-followup PURPOSE="Followup по review_id (диалог из store) ИЛИ по previous_review; guard только на новый контент" />
-        <fn-health_check PURPOSE="Config/pricing status + usage_today (FEAT-BUDGET) + balance_rub с кэшем 60с; итоговый status пересчитывается ПОСЛЕ запроса Balance API — ошибка баланса переводит status в degraded (A2, раньше ошибочно оставался ok)" />
+        <fn-health_check PURPOSE="PRICING-RUB: result['pricing'] из get_model_pricing() (input/output/cache_read_per_1m_rub, context_length, max_output_tokens); тариф недоступен → issue 'Тариф модели недоступен' + degraded. usage_today (FEAT-BUDGET, date DD.MM.YYYY) + balance_rub с кэшем 60с; итоговый status пересчитывается ПОСЛЕ запроса тарифа и Balance API — любая ошибка переводит status в degraded (A2, раньше ошибочно оставался ok)" />
         <fn-_resolve_effort_local PURPOSE="Локальный маппинг effort для error-результатов" />
       </annotations>
       <CrossLink from="M-CRITIC" to="M-API" relation="calls-responses-api-reads-usage-stats" />
@@ -77,7 +84,7 @@
     </M-CRITIC>
 
     <M-SERVER NAME="MCPServer" TYPE="ENTRY_POINT" STATUS="complete">
-      <purpose>FastMCP MCP сервер. 8 зарегистрированных tools. Декоратор _review_tool (DRY, try/except, agent_count clamp, opt-in file_path, heartbeat-уведомления FEAT-PROGRESS, elapsed в metadata). _read_file_content с sandbox: opt-in POLZA_ALLOW_FILE_PATH (SEC-03), проверки строго по порядку — форма пути → (Windows) ADS/хвостовые формы (SEC-ADS) → glob-denylist секретов (SEC-02) → allowed roots = cwd + POLZA_ALLOWED_READ_DIRS → exists/is_file → размер (лимит 1MB) → чтение в to_thread (REL-02); отказ одинаков для существующего и несуществующего файла и не раскрывает resolved-путь (SEC-ORACLE). _parse_json_loose для JSON-режима. self_update требует git-клона. Metadata footer: ⏱ Elapsed, ₽/$, cached_tokens.</purpose>
+      <purpose>FastMCP MCP сервер. 8 зарегистрированных tools. Декоратор _review_tool (DRY, try/except, agent_count clamp, opt-in file_path, heartbeat-уведомления FEAT-PROGRESS, elapsed в metadata). _read_file_content с sandbox: opt-in POLZA_ALLOW_FILE_PATH (SEC-03), проверки строго по порядку — форма пути → (Windows) ADS/хвостовые формы (SEC-ADS) → glob-denylist секретов (SEC-02) → allowed roots = cwd + POLZA_ALLOWED_READ_DIRS → exists/is_file → размер (лимит 1MB) → чтение в to_thread (REL-02); отказ одинаков для существующего и несуществующего файла и не раскрывает resolved-путь (SEC-ORACLE). _parse_json_loose для JSON-режима. self_update требует git-клона. PRICING-RUB: весь денежный вывод только в ₽ (_fmt_rub); metadata footer «💰 Cost: 53,67 ₽» / «≈ … (оценка по тарифу)» + ⏱ Elapsed + cached_tokens; check_health показывает Pricing/Limits тарифа и Today (DD.MM.YYYY). LOG-TIME-RU: _localize_root_log_time() при старте сервера переводит root RichHandler (FastMCP/httpx/mcp) на формат времени DD.MM.YYYY.</purpose>
       <path>src/grok_critic/server.py</path>
       <depends>M-CRITIC, M-CONFIG</depends>
       <verification-ref>V-M-SERVER</verification-ref>
@@ -86,8 +93,8 @@
         <tool-architecture_review PURPOSE="A1: та же схема file_path/content, что у critic_review. Specialized architecture review (content, context, agent_count)" />
         <tool-security_audit PURPOSE="A1: та же схема file_path/content, что у critic_review. Specialized security audit with severity classification (content, context, agent_count)" />
         <tool-critic_followup PURPOSE="file_path в схеме НЕТ (FastMCP отбрасывает лишний kwarg). Followup (question required; previous_review | review_id, agent_count)" />
-        <tool-check_health PURPOSE="Server health: config status, pricing, usage_today (FEAT-BUDGET), balance in ₽" />
-        <tool-reload_config_tool PURPOSE="Hot reload .env without process restart (SecretStr-aware, показывает новые поля)" />
+        <tool-check_health PURPOSE="Server health: config status, тариф модели в ₽ (pricing: input/output/cache_read_per_1m_rub + limits), usage_today (FEAT-BUDGET, DD.MM.YYYY), balance in ₽" />
+        <tool-reload_config_tool PURPOSE="Hot reload .env without process restart (SecretStr-aware, показывает daily_budget_rub вместо price_*/daily_budget_usd)" />
         <tool-restart_server PURPOSE="Full process exit via os._exit(0), MCP client auto-restarts" />
         <tool-self_update PURPOSE="Auto-update from GitHub: git pull + pip install + restart; отказ если не git-клон (FIX-ENV-PATH); 'уже актуально' определяется сравнением git rev-parse HEAD до/после pull (не текстом вывода — работает с локализованным git); pip запускается как sys.executable -m pip; по таймауту git/pip процесс убивается через _run_cmd" />
         <fn-_review_tool PURPOSE="Decorator: agent_count clamp + opt-in file_path (SEC-03) + heartbeat (FEAT-PROGRESS) + elapsed + try/except + _format_result" />
@@ -102,6 +109,10 @@
         <fn-_parse_json_loose PURPOSE="FEAT-JSON: парсинг JSON из ответа модели (чистый, ```json-блок, объект в тексте)" />
         <fn-_format_result PURPOSE="DRY: unified formatting for success (with metadata footer + elapsed) and error results" />
         <fn-_fmt PURPOSE="Format numbers with space thousands separator" />
+        <fn-_format_pricing_lines PURPOSE="PRICING-RUB: строки тарифа модели в ₽ (вход/выход/кэш за 1M) + Limits (контекст/макс. ответ, если известны) — переиспользуется check_health и cli.py cmd_health" />
+        <fn-_format_usage_today PURPOSE="PRICING-RUB: «Today (DD.MM.YYYY): N calls | X ₽ (M errors)» — дата уже в DD.MM.YYYY из get_usage_stats()" />
+        <fn-_fmt_budget_rub PURPOSE="PRICING-RUB: дневной бюджет для человека — 0 → 'без лимита', иначе сумма через _fmt_rub" />
+        <fn-_localize_root_log_time PURPOSE="LOG-TIME-RU: заменяет RichHandler'ы root-логгера (поставленные FastMCP при создании server, время по локали ОС) на RichHandler с log_time_format=_RU_LOG_TIME_FORMAT ('[%d.%m.%Y %H:%M:%S]'), сохраняя console/level/formatter/filters и публичные rich-настройки из _RICH_HANDLER_ATTRS (markup, rich_tracebacks, keywords, tracebacks_*, locals_max_*) через публичный конструктор; без rich (ImportError) — no-op, возвращает 0; вызывается сразу после server = FastMCP(...)" />
         <fn-main PURPOSE="Entry point: create FastMCP server and run stdio" />
         <fn-_run_cmd PURPOSE="Async-обёртка над subprocess для self_update (git/pip): decode(errors='replace') — локализованный/не-UTF-8 вывод не роняет self_update; по истечении timeout процесс убивается (kill) и дожидается reap, а не подвисает" />
       </annotations>
@@ -116,12 +127,12 @@
       <verification-ref>V-M-CLI</verification-ref>
       <annotations>
         <cmd-serve PURPOSE="Запуск MCP stdio-сервера (дефолт без подкоманды — совместимость клиентов)" />
-        <cmd-health PURPOSE="Статус конфига/store без сети; --ping — реальный запрос health_check (баланс, usage_today)" />
+        <cmd-health PURPOSE="Статус конфига/store без сети (--json → {status, mode: offline, issues}); --ping — реальный запрос health_check (тариф в ₽, баланс, usage_today DD.MM.YYYY)" />
         <cmd-doctor PURPOSE="Диагностика сбоев: Python, версия vs git HEAD, шим CLI (включая pip user-install путь), .env, ключ, TCP base_url+proxy, store writable, лог; подсказки про кэш схемы MCP и CLI-fallback" />
-        <cmd-review PURPOSE="One-shot ревью файла или stdin ('-') в обход MCP; clamp agents; warning на sensitive-имена; --json / --json-output" />
+        <cmd-review PURPOSE="One-shot ревью файла или stdin ('-') в обход MCP; clamp agents; warning на sensitive-имена; --json / --json-output (PRICING-RUB: cost_usd удалён, добавлен cost_is_estimate)" />
         <cmd-followup PURPOSE="Followup из терминала: --review-id (дисковый store) ИЛИ --from файл|stdin" />
         <cmd-logs PURPOSE="Хвост лога сервера (config.log_file); подсказка при stderr-режиме" />
-        <cmd-config PURPOSE="Конфиг с маскированным ключом + env_file + store_path" />
+        <cmd-config PURPOSE="Конфиг с маскированным ключом + env_file + store_path; daily_budget_rub вместо price_*/daily_budget_usd (текстовый режим — человекочитаемо через _fmt_budget_rub)" />
         <fn-_store_writable PURPOSE="Probe-запись рядом со store для проверки прав" />
         <fn-_result_payload PURPOSE="Машиночитаемый словарь CritiqueResult для --json" />
       </annotations>

@@ -1,11 +1,17 @@
 # FILE: src/grok_critic/cli.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Terminal CLI over critic/api_client — agents can use/fix the critic via Bash when MCP is down
 #   SCOPE: serve (stdio MCP), health, doctor, review, followup, logs, config; exit codes; --json
 #   DEPENDS: M-CRITIC, M-CONFIG, M-API, M-SERVER (formatting + serve entry)
 #   LINKS: M-CLI
 # END_MODULE_CONTRACT
+# START_CHANGE_SUMMARY
+#   PRICING-RUB: --json review/followup — cost_usd удалён, добавлен cost_is_estimate;
+#     health --ping — тариф/лимиты модели в ₽ (JSON-ключ pricing), usage_today.date
+#     DD.MM.YYYY; config — daily_budget_rub вместо price_* / daily_budget_usd.
+#     Денежный формат — общий _fmt_rub из server.
+# END_CHANGE_SUMMARY
 
 from __future__ import annotations
 
@@ -28,7 +34,14 @@ from urllib.parse import urlsplit
 from grok_critic.config import _resolve_env_file, config
 from grok_critic.critic import followup as critic_followup_fn
 from grok_critic.critic import general_review, health_check, review_store
-from grok_critic.server import _format_result, _is_sensitive_file
+from grok_critic.server import (
+    _fmt_budget_rub,
+    _fmt_rub,
+    _format_pricing_lines,
+    _format_result,
+    _format_usage_today,
+    _is_sensitive_file,
+)
 from grok_critic.server import main as _server_main
 
 logger = logging.getLogger("grok-critic.cli")
@@ -73,8 +86,8 @@ def _result_payload(result) -> dict[str, Any]:
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
         "total_tokens": result.total_tokens,
-        "cost_usd": result.cost_usd,
         "cost_rub": result.cost_rub,
+        "cost_is_estimate": result.cost_is_estimate,
         "cached_tokens": result.cached_tokens,
         "reasoning_tokens": result.reasoning_tokens,
     }
@@ -98,6 +111,7 @@ def cmd_health(args: argparse.Namespace) -> int:
             "model": result["model"],
             "base_url": result["base_url"],
             "issues": result["issues"],
+            "pricing": result.get("pricing"),
             "balance_rub": result.get("balance_rub"),
             "usage_today": usage,
         }
@@ -107,12 +121,12 @@ def cmd_health(args: argparse.Namespace) -> int:
             print(f"Status: {payload['status']}")
             print(f"Model: {payload['model']}")
             print(f"Base URL: {payload['base_url']}")
+            if payload["pricing"]:
+                for line in _format_pricing_lines(payload["pricing"]):
+                    print(line)
             if payload["balance_rub"] is not None:
-                print(f"Balance: {payload['balance_rub']:.2f} ₽")
-            print(
-                f"Today: {usage.get('calls', 0)} calls | "
-                f"${usage.get('cost_usd', 0.0):.4f} | {usage.get('cost_rub', 0.0):.2f} ₽"
-            )
+                print(f"Balance: {_fmt_rub(payload['balance_rub'])}")
+            print(_format_usage_today(usage))
             for issue in payload["issues"]:
                 print(f"Issue: {issue}")
         return EXIT_OK if payload["status"] == "ok" else EXIT_WARN
@@ -367,12 +381,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         "timeout_seconds": config.timeout_seconds,
         "log_level": config.log_level,
         "log_file": config.log_file,
-        "price_input_per_1m": config.price_input_per_1m,
-        "price_output_per_1m": config.price_output_per_1m,
         "allow_file_path": config.allow_file_path,
         "allowed_read_dirs": config.allowed_read_dirs,
         "allow_self_update": config.allow_self_update,
-        "daily_budget_usd": config.daily_budget_usd,
+        "daily_budget_rub": config.daily_budget_rub,
         "max_concurrent_requests": config.max_concurrent_requests,
         "retry_deadline_seconds": config.retry_deadline_seconds,
         "store_path": str(review_store._dir),
@@ -382,6 +394,9 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return EXIT_OK
     for key, value in payload.items():
+        if key == "daily_budget_rub":
+            # человекочитаемо: «без лимита» / «500,00 ₽» (в --json остаётся числом)
+            value = _fmt_budget_rub(config.daily_budget_rub)
         print(f"{key}: {value}")
     return EXIT_OK
 

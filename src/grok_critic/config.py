@@ -1,11 +1,17 @@
 # FILE: src/grok_critic/config.py
-# VERSION: 1.11.2
+# VERSION: 1.12.0
 # START_MODULE_CONTRACT
 #   PURPOSE: Configuration management via pydantic-settings with env vars
 #   SCOPE: Load and validate API key, model, timeout, agent settings, logging
 #   DEPENDS: pydantic-settings, python-dotenv
 #   LINKS: M-CONFIG
 # END_MODULE_CONTRACT
+# START_CHANGE_SUMMARY
+#   PRICING-RUB: удалены price_input_per_1m / price_output_per_1m / daily_budget_usd
+#     (цены берутся из тарифа Polza.AI GET /models/{model}); добавлен daily_budget_rub.
+#     Устаревшие POLZA_PRICE_* / POLZA_DAILY_BUDGET_USD не ломают запуск — один
+#     DEPRECATED-warning с именами ключей (значения не логируются). datefmt логов — DD.MM.YYYY.
+# END_CHANGE_SUMMARY
 
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import dotenv_values
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -58,8 +65,6 @@ class AppConfig(BaseSettings):
     timeout_seconds: int = Field(default=180, ge=1)
     log_level: str = Field(default="WARNING")
     log_file: str = Field(default="")  # пустой = stderr (MCP stdio не занимается)
-    price_input_per_1m: float = Field(default=0.0)
-    price_output_per_1m: float = Field(default=0.0)
     allow_self_update: bool = Field(default=False)
     # Дополнительные директории, откуда разрешено читать файлы через file_path.
     # Разделитель — os.pathsep (';' на Windows, ':' на Unix).
@@ -78,9 +83,10 @@ class AppConfig(BaseSettings):
     # суммарное время попыток не должно превышать таймаут MCP-клиента,
     # иначе клиент отваливается и платно ретраит поверх живого запроса.
     retry_deadline_seconds: float = Field(default=0.0, ge=0.0)
-    # FEAT-BUDGET: дневной лимит расходов в $ по расчётной стоимости (cost_usd).
-    # 0 = без лимита. Превышение → ошибка ДО обращения к платному API.
-    daily_budget_usd: float = Field(default=0.0, ge=0.0)
+    # FEAT-BUDGET / PRICING-RUB: дневной лимит расходов в ₽ по ФАКТИЧЕСКОЙ cost_rub
+    # (из ответа API, либо оценка по тарифу модели). 0 = без лимита.
+    # Превышение → ошибка ДО обращения к платному API.
+    daily_budget_rub: float = Field(default=0.0, ge=0.0)
     # FEAT-BUDGET: максимум одновременных платных запросов к API (semaphore).
     max_concurrent_requests: int = Field(default=2, ge=1, le=16)
     # FEAT-CLI: файл store'а диалогов (review_id переживает рестарты, работает из CLI).
@@ -113,7 +119,7 @@ def _setup_logging(cfg: AppConfig) -> None:
 
     formatter = logging.Formatter(
         "[%(asctime)s] %(name)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        datefmt="%d.%m.%Y %H:%M:%S",
     )
 
     if cfg.log_file:
@@ -130,11 +136,54 @@ def _setup_logging(cfg: AppConfig) -> None:
 # END_BLOCK_SETUP_LOGGING
 
 
+# START_BLOCK_DEPRECATED_KEYS
+# PRICING-RUB: ключи, удалённые в 1.12.0. extra="ignore" уже не даёт им сломать
+# запуск; здесь — только понятное предупреждение для владельца конфига.
+DEPRECATED_ENV_KEYS: tuple[str, ...] = (
+    "POLZA_PRICE_INPUT_PER_1M",
+    "POLZA_PRICE_OUTPUT_PER_1M",
+    "POLZA_DAILY_BUDGET_USD",
+)
+
+
+def _find_deprecated_keys() -> list[str]:
+    """Имена устаревших ключей, заданных в os.environ или в разрешённом .env.
+
+    Возвращает ТОЛЬКО имена — значения не читаются в результат и не логируются.
+    Ошибка чтения .env не ломает загрузку конфига.
+    """
+    found: set[str] = {key for key in DEPRECATED_ENV_KEYS if key in os.environ}
+    env_path = Path(_resolve_env_file())
+    try:
+        if env_path.is_file():
+            file_keys = {str(k).upper() for k in dotenv_values(env_path)}
+            found.update(key for key in DEPRECATED_ENV_KEYS if key in file_keys)
+    except Exception as exc:  # битый/недоступный .env — не повод падать
+        logger.debug("[Config][_find_deprecated_keys][DEPRECATED] .env scan failed: %s", type(exc).__name__)
+    return [key for key in DEPRECATED_ENV_KEYS if key in found]
+
+
+def _warn_deprecated_keys() -> list[str]:
+    """Один warning со списком имён устаревших ключей (без значений)."""
+    keys = _find_deprecated_keys()
+    if keys:
+        logger.warning(
+            "[Config][load_config][DEPRECATED] ignored keys: %s — цены берутся из тарифа "
+            "Polza.AI (GET /models/{model}), дневной бюджет задаётся POLZA_DAILY_BUDGET_RUB",
+            ", ".join(keys),
+        )
+    return keys
+
+
+# END_BLOCK_DEPRECATED_KEYS
+
+
 # START_BLOCK_LOAD_CONFIG
 @lru_cache(maxsize=1)
 def load_config() -> AppConfig:
     cfg = AppConfig()
     _setup_logging(cfg)
+    _warn_deprecated_keys()
     logger.info("[Config][load_config][LOAD_CONFIG] model=%s timeout=%ds log_level=%s", cfg.model, cfg.timeout_seconds, cfg.log_level)
     return cfg
 
@@ -159,9 +208,8 @@ def reload_config() -> AppConfig:
     # Also update the module-level binding for late importers.
     config = new_cfg
     logger.info(
-        "[Config][reload_config][RELOAD] model=%s timeout=%ds prices=$%.2f/$%.2f per 1M",
-        config.model, config.timeout_seconds,
-        config.price_input_per_1m, config.price_output_per_1m,
+        "[Config][reload_config][RELOAD] model=%s timeout=%ds daily_budget_rub=%.2f",
+        config.model, config.timeout_seconds, config.daily_budget_rub,
     )
     return config
 
